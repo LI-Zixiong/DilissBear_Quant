@@ -68,7 +68,7 @@ class ExperimentConfig:
     meta_cols: Sequence[str] = ("industry_csrc_2012", "list_date")
 
     model_names: Sequence[str] = (
-        "lightgbm", "xgboost",
+        "LightGBM", "XGBoost",
     )
 
     train_end: str = ""
@@ -87,8 +87,8 @@ class ExperimentConfig:
     torch_device: str = "auto"
 
     model_params: dict = dataclasses.field(default_factory=lambda: {
-        "dlinear":      {"seq_len": 15, "epochs": 10, "lr": 7.5e-4,   "wd": 0.0, "patience": 2},
-        "itransformer": {"seq_len": 40, "epochs": 5,  "lr": 5e-4,   "wd": 0.0},
+        "dlinear":      {"seq_len": 15, "epochs": 15, "lr": 7.5e-4,   "wd": 0.0, "patience": 2},
+        "itransformer": {"seq_len": 40, "epochs": 5,  "lr": 2e-4,   "wd": 0.0},
         "tsmixer":      {"seq_len": 40, "epochs": 15, "lr": 4e-3,   "wd": 0.0, "patience": 2},
     })
     predict_batch_size: int = 8192
@@ -282,7 +282,7 @@ def build_experiment_model(
         return build_lightgbm_model(
             LightGBMConfig(
                 n_estimators=500,
-                learning_rate=0.03,
+                learning_rate=0.01,
                 num_leaves=31,
                 early_stopping_rounds=50,
                 verbose_eval=False,
