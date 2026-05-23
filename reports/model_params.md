@@ -112,6 +112,32 @@ ST filter flipped the leaderboard: XGB (2.03 standalone) now beats LGBM (1.86).
 ### LightGBM update
 lr tuned from 0.03 → **0.01** on new pool, Sharpe 2.39 (standalone, full 405 dates).
 
+---
+
+## Strategy V0 (2026-05-22)
+
+3-day rolling prediction smoothing + transaction costs (buy 0.03%, sell 0.08%).
+
+| Method | Sharpe | MaxDD | Turnover | NAV |
+|---|---|---|---|---|
+| Raw (1d, no cost) | 1.96 | 16.6% | 81.6% | 1.91 |
+| **3d smooth + cost** | **1.80** | 17.1% | **47.0%** | 1.82 |
+| 5d smooth + cost | 1.59 | 19.2% | 36.0% | 1.69 |
+
+Smoothing selected on valid (rolling_3d best valid Sharpe), confirmed on test.
+Weight re-fitting on 3d/5d vs 1d showed negligible difference — output smoothing
+is sufficient, per-model weights don't need retraining.
+
+### Bull/Bear dynamic sizing
+HS300 60d rolling return: bull=top-50, bear=top-N. Swept bear_n=[20,30,40,50].
+Valid selected bear_n=50 (model alpha strong in all regimes). Dynamic sizing
+not needed — fixed top-50 optimal.
+
+### Buffer zone
+in=[1-6%], out=[3-18%] of 1500 stocks. Valid-selected in=1%(15) out=3%(45).
+Test Sharpe 1.59 vs V0 1.80. Buffer does not beat fixed top-50 on large universe.
+Conclusion: 1500 stocks, top-50 daily rebalance with 3d smoothing is sufficient.
+
 ### Normalization test
 
 Per-date z-score or rank-percentile normalization before combination
