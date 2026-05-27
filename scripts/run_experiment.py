@@ -13,7 +13,7 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
-from src.backtest.engine import run_backtest
+from src.backtest.engine import TransactionCostConfig, run_backtest
 from src.backtest.portfolio import PortfolioConfig
 from src.data.dataset_builder import PanelDatasetBuilder
 from src.data.loader import load_panel_data
@@ -52,7 +52,7 @@ DEFAULT_FEATURE_COLS = (
 
 @dataclass
 class ExperimentConfig:
-    data_path: str = "dataset/processed/factor_panel_1500.parquet"
+    data_path: str = "dataset/processed/factor_panel_1500_ind.parquet"
 
     date_col: str = "time"
     stock_col: str = "stock_id"
@@ -68,7 +68,7 @@ class ExperimentConfig:
     meta_cols: Sequence[str] = ("industry_csrc_2012", "list_date")
 
     model_names: Sequence[str] = (
-        "LightGBM", "XGBoost",
+        "lightgbm", "dlinear",
     )
 
     train_end: str = ""
@@ -88,13 +88,13 @@ class ExperimentConfig:
 
     model_params: dict = dataclasses.field(default_factory=lambda: {
         "dlinear":      {"seq_len": 15, "epochs": 15, "lr": 7.5e-4,   "wd": 0.0, "patience": 2},
-        "itransformer": {"seq_len": 40, "epochs": 5,  "lr": 2e-4,   "wd": 0.0},
+        "itransformer": {"seq_len": 40, "epochs": 10, "lr": 1e-4,   "wd": 0.0, "patience": 2},
         "tsmixer":      {"seq_len": 40, "epochs": 15, "lr": 4e-3,   "wd": 0.0, "patience": 2},
     })
     predict_batch_size: int = 8192
 
-    output_dir: str = "dataset/output/experiment_001"
-    report_path: str = "reports/experiment_001.md"
+    output_dir: str = "dataset/output/experiment_003"
+    report_path: str = "reports/experiment_003.md"
 
 
 def _split_clean_df_7_1_2(
@@ -246,6 +246,23 @@ def build_returns_frame_from_next_target(
         )
 
     return returns_df
+
+
+
+def _align_preds_to_returns(pred_df, returns_df, config):
+    """Filter predictions to keep only stocks with valid next-day returns."""
+    import pandas as pd
+    ret_dates = pd.DatetimeIndex(returns_df[config.date_col].dropna().unique()).sort_values()
+    pred_dates = pd.DatetimeIndex(pred_df[config.date_col].dropna().unique()).sort_values()
+    nd_map = {}
+    for sd in pred_dates:
+        fut = ret_dates[ret_dates > sd]
+        if len(fut): nd_map[sd] = fut[0]
+    keep = pd.Series(False, index=pred_df.index)
+    for sd, nd in nd_map.items():
+        stocks_on_nd = returns_df.loc[returns_df[config.date_col] == nd, config.stock_col].unique()
+        keep[(pred_df[config.date_col] == sd) & (pred_df[config.stock_col].isin(stocks_on_nd))] = True
+    return pred_df[keep].copy()
 
 
 def _get_model_params(model_name: str, config: ExperimentConfig) -> dict:
@@ -568,13 +585,11 @@ def main() -> None:
         meta_cols=list(config.meta_cols),
     )
 
-    returns_df = build_returns_frame_from_next_target(
-        df=clean_df,
-        date_col=config.date_col,
-        stock_col=config.stock_col,
-        target_col=config.backtest_return_source,
-        return_col=config.return_col,
-    )
+    returns_df = clean_df[[config.date_col, config.stock_col, "ret_daily"]].rename(
+        columns={"ret_daily": config.return_col}).copy()
+    returns_df[config.date_col] = pd.to_datetime(returns_df[config.date_col])
+    returns_df[config.stock_col] = returns_df[config.stock_col].astype(str)
+    returns_df[config.return_col] = returns_df[config.return_col].astype(float)
 
     portfolio_config = PortfolioConfig(
         strategy="top_n",
@@ -582,6 +597,7 @@ def main() -> None:
         pred_col="y_pred",
         stock_col=config.stock_col,
     )
+    cost_config = TransactionCostConfig()
 
     model_results: dict[str, dict[str, Any]] = {}
     tabular_names = [n for n in config.model_names if get_model_family(n) == "tabular"]
@@ -622,14 +638,16 @@ def main() -> None:
                 output_path=output_dir / f"predictions_{model_name}.parquet",
             )
 
+            pred_df_bt = _align_preds_to_returns(pred_df, returns_df, config)
             backtest_result = run_backtest(
-                pred_df=pred_df,
+                pred_df=pred_df_bt,
                 returns_df=returns_df,
                 portfolio_config=portfolio_config,
                 return_col=config.return_col,
                 date_col=config.date_col,
                 stock_col=config.stock_col,
                 periods_per_year=config.periods_per_year,
+                cost_config=cost_config,
             )
 
             daily_returns_path = output_dir / f"daily_returns_{model_name}.csv"
@@ -704,40 +722,56 @@ def main() -> None:
                     ),
                 )
 
-            pred_df = generate_predictions(
+                pred_df = generate_predictions(
                 model=model,
                 dataset=seq_test,
                 model_name=model_name,
                 config=prediction_config,
                 required_meta_cols=(config.date_col, config.stock_col),
-            )
-
-            prediction_path = save_predictions(
+                )
+    
+                prediction_path = save_predictions(
                 pred_df=pred_df,
                 output_path=output_dir / f"predictions_{model_name}.parquet",
-            )
+                )
+    
+                # Filter preds to stocks with valid next-day returns
+                ret_dates = pd.DatetimeIndex(returns_df[config.date_col].dropna().unique()).sort_values()
+                pred_dates = pd.DatetimeIndex(pred_df[config.date_col].dropna().unique()).sort_values()
+                nd_map = {}
+                for sd in pred_dates:
+                    fut = ret_dates[ret_dates > sd]
+                    if len(fut): nd_map[sd] = fut[0]
+                keep = pd.Series(False, index=pred_df.index)
+                for sd, nd in nd_map.items():
+                    stocks_on_nd = returns_df.loc[
+                        returns_df[config.date_col] == nd, config.stock_col
+                    ].unique()
+                    keep[(pred_df[config.date_col] == sd) & (pred_df[config.stock_col].isin(stocks_on_nd))] = True
+                pred_df_bt = pred_df[keep].copy()
 
-            backtest_result = run_backtest(
-                pred_df=pred_df,
+                backtest_result = run_backtest(
+                pred_df=pred_df_bt,
                 returns_df=returns_df,
                 portfolio_config=portfolio_config,
                 return_col=config.return_col,
                 date_col=config.date_col,
                 stock_col=config.stock_col,
                 periods_per_year=config.periods_per_year,
-            )
+                cost_config=cost_config,
+                )
 
-            daily_returns_path = output_dir / f"daily_returns_{model_name}.csv"
-            daily_nav_path = output_dir / f"daily_nav_{model_name}.csv"
-            daily_weights_path = output_dir / f"daily_weights_{model_name}.csv"
-            daily_turnover_path = output_dir / f"daily_turnover_{model_name}.csv"
+                daily_returns_path = output_dir / f"daily_returns_{model_name}.csv"
+                daily_nav_path = output_dir / f"daily_nav_{model_name}.csv"
+                daily_weights_path = output_dir / f"daily_weights_{model_name}.csv"
+                daily_turnover_path = output_dir / f"daily_turnover_{model_name}.csv"
 
-            backtest_result["daily_returns"].to_csv(daily_returns_path, header=True)
-            backtest_result["daily_nav"].to_csv(daily_nav_path, header=True)
-            backtest_result["daily_weights"].to_csv(daily_weights_path)
-            backtest_result["daily_turnover"].to_csv(daily_turnover_path, header=True)
-
-            model_results[model_name] = {
+                backtest_result["daily_returns"].to_csv(daily_returns_path, header=True)
+                backtest_result["daily_nav"].to_csv(daily_nav_path, header=True)
+                backtest_result["daily_weights"].to_csv(daily_weights_path)
+                backtest_result["daily_turnover"].to_csv(daily_turnover_path, header=True)
+    
+                model_results[model_name] = {
                 "model_family": "torch",
                 "train_summary": train_summary,
                 "backtest_summary": backtest_result["summary"],
@@ -746,11 +780,11 @@ def main() -> None:
                 "daily_nav_path": str(daily_nav_path),
                 "daily_weights_path": str(daily_weights_path),
                 "daily_turnover_path": str(daily_turnover_path),
-            }
-
-            print(f"{model_name} completed.")
-            print(backtest_result["summary"])
-
+                }
+    
+                print(f"{model_name} completed.")
+                print(backtest_result["summary"])
+    
     comparison_df = _build_model_comparison_df(model_results)
     comparison_path = output_dir / "model_comparison.csv"
     comparison_df.to_csv(comparison_path, index=False)

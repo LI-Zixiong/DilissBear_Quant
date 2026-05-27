@@ -114,6 +114,21 @@ lr tuned from 0.03 → **0.01** on new pool, Sharpe 2.39 (standalone, full 405 d
 
 ---
 
+## Experiment 003: Industry-Neutralized Factors (2026-05-22)
+
+Industry z-score applied to 7 financial factors, leaving 5 price/momentum factors unchanged.
+
+| Model | Baseline (001) | Full Neutralization | Partial (financial only) |
+|---|---|---|---|
+| LightGBM | 2.39 | 2.24 (-0.15) | 2.33 (-0.06) |
+| DLinear | 2.27 | 1.74 (-0.53) | 1.96 (-0.31) |
+
+Conclusion: industry neutralization degrades performance. Industry bias is a
+feature, not a bug — the model captures sector rotation as part of alpha.
+Abandoned. Baseline factors retained.
+
+---
+
 ## Strategy V0 (2026-05-22)
 
 3-day rolling prediction smoothing + transaction costs (buy 0.03%, sell 0.08%).

@@ -231,6 +231,7 @@ dataset/output/*
 # Project documentation (local only, not for GitHub)
 CLAUDE.md
 PROJECT_DIAGNOSTIC_REPORT.md
+STAGE_0.md
 
 outputs/
 dataset/output/
@@ -245,6 +246,9 @@ reports/*
 
 # Temp scripts
 temp/
+
+# Tushare skill (API credentials in _meta.json)
+dataset/skill/
 
 # Claude Code local settings
 .claude/

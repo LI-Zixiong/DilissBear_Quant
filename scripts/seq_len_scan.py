@@ -20,7 +20,7 @@ from scripts.run_experiment import (
     save_markdown_report,
     _build_model_comparison_df,
 )
-from src.backtest.engine import run_backtest
+from src.backtest.engine import TransactionCostConfig, run_backtest
 from src.backtest.portfolio import PortfolioConfig
 from src.data.dataset_builder import PanelDatasetBuilder
 from src.data.preprocess import PreprocessConfig, preprocess_panel_data
@@ -95,6 +95,7 @@ def run_one_experiment(config: ExperimentConfig) -> dict:
         pred_col="y_pred",
         stock_col=config.stock_col,
     )
+    cost_config = TransactionCostConfig()
 
     model_results = {}
     tabular_names = [n for n in config.model_names if get_model_family(n) == "tabular"]
@@ -127,6 +128,7 @@ def run_one_experiment(config: ExperimentConfig) -> dict:
                 return_col=config.return_col,
                 date_col=config.date_col, stock_col=config.stock_col,
                 periods_per_year=config.periods_per_year,
+                cost_config=cost_config,
             )
             for suffix, data in [
                 ("daily_returns", bt["daily_returns"]),
@@ -204,6 +206,7 @@ def run_one_experiment(config: ExperimentConfig) -> dict:
                 return_col=config.return_col,
                 date_col=config.date_col, stock_col=config.stock_col,
                 periods_per_year=config.periods_per_year,
+                cost_config=cost_config,
             )
             valid_summary = bt_valid["summary"]
 
@@ -220,6 +223,7 @@ def run_one_experiment(config: ExperimentConfig) -> dict:
                 return_col=config.return_col,
                 date_col=config.date_col, stock_col=config.stock_col,
                 periods_per_year=config.periods_per_year,
+                cost_config=cost_config,
             )
             test_summary = bt_test["summary"]
 

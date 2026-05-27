@@ -21,9 +21,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-INPUT_FACTORS = "dataset/processed/factor_panel_12.parquet"
+INPUT_FACTORS = "dataset/processed/factor_panel_12_ind.parquet"
 INPUT_FINANCIAL = "dataset/processed/csmar_daily_raw_panel.parquet"
-OUTPUT = "dataset/processed/factor_panel_1500.parquet"
+OUTPUT = "dataset/processed/factor_panel_1500_ind.parquet"
 AUDIT_CSV = "dataset/processed/selected_universe_audit.csv"
 TARGET = 1500
 MAX_MKTCAP_Q = 0.95

@@ -14,19 +14,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.backtest.engine import run_backtest
-from src.backtest.metrics import cumulative_nav, summarize_backtest
+from src.backtest.engine import TransactionCostConfig, run_backtest
 from src.backtest.portfolio import PortfolioConfig
 from scripts.run_experiment import (
     ExperimentConfig, _load_experiment_raw_data, build_returns_frame_from_next_target,
 )
 from src.data.preprocess import PreprocessConfig, preprocess_panel_data
 
-OUT = Path("dataset/output/experiment_001")
+OUT = Path("dataset/output/experiment_003")
 MODELS = ["lightgbm", "xgboost", "dlinear", "itransformer", "tsmixer"]
 WINDOWS = [1, 3, 5]
-BUY_COST = 0.0003
-SELL_COST = 0.0008
 
 
 def load_test():
@@ -62,11 +59,11 @@ def build_returns():
         replace_inf_with_nan=True, drop_rows_with_missing_keys=True,
         drop_rows_with_missing_target=True, duplicate_policy="raise", sort_values=True,
     )).df
-    ret = build_returns_frame_from_next_target(
-        clean, config.date_col, config.stock_col,
-        config.backtest_return_source, config.return_col)
-    ret["time"] = pd.to_datetime(ret["time"]).dt.normalize()
-    ret["stock_id"] = ret["stock_id"].astype(str).str.strip()
+    ret = clean[[config.date_col, config.stock_col, "ret_daily"]].rename(
+        columns={"ret_daily": config.return_col}).copy()
+    ret[config.date_col] = pd.to_datetime(ret[config.date_col]).dt.normalize()
+    ret[config.stock_col] = ret[config.stock_col].astype(str).str.strip()
+    ret[config.return_col] = ret[config.return_col].astype(float)
     return ret
 
 
@@ -78,20 +75,24 @@ def smooth(df, w):
 
 
 def bt_with_cost(df, ret):
+    d = df.copy()
+    ret_dates = pd.DatetimeIndex(ret["time"].dropna().unique()).sort_values()
+    pred_dates = pd.DatetimeIndex(d["time"].dropna().unique()).sort_values()
+    nd_map = {}
+    for sd in pred_dates:
+        future = ret_dates[ret_dates > sd]
+        if len(future): nd_map[sd] = future[0]
+    keep = pd.Series(False, index=d.index)
+    for sd, nd in nd_map.items():
+        stocks_on_nd = ret.loc[ret["time"] == nd, "stock_id"].unique()
+        keep[(d["time"] == sd) & (d["stock_id"].isin(stocks_on_nd))] = True
+    d = d[keep].copy()
     pfolio = PortfolioConfig(strategy="top_n", top_n=50, pred_col="y_pred", stock_col="stock_id")
     result = run_backtest(
-        pred_df=df, returns_df=ret, portfolio_config=pfolio,
-        return_col="return_1d", date_col="time", stock_col="stock_id")
-    daily_ret = np.nan_to_num(result["daily_returns"].values, nan=0, posinf=0, neginf=0)
-    daily_turn = np.nan_to_num(result["daily_turnover"].values, nan=0, posinf=0, neginf=0)
-    cost = daily_turn * 0.5 * (BUY_COST + SELL_COST)
-    daily_ret = pd.Series(daily_ret - cost, index=result["daily_returns"].index)
-    nav = cumulative_nav(daily_ret)
-    summary = summarize_backtest(daily_ret)
-    summary["final_nav"] = float(nav.iloc[-1])
-    summary["max_drawdown"] = float((nav / nav.cummax() - 1).min()) * (-1)
-    summary["mean_turnover"] = float(result["daily_turnover"].mean())
-    return summary
+        pred_df=d, returns_df=ret, portfolio_config=pfolio,
+        return_col="return_1d", date_col="time", stock_col="stock_id",
+        cost_config=TransactionCostConfig())
+    return result["summary"]
 
 
 def main():

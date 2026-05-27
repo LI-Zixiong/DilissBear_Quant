@@ -27,6 +27,7 @@ class TorchTrainConfig:
     weight_decay: float = 0.0
     device: str = 'auto'
     shuffle_train: bool = True
+    date_col: str = "time"
 
     def __post_init__(self) -> None:
         if self.epochs <= 0:
@@ -46,6 +47,8 @@ class TorchTrainConfig:
         
         if self.device not in ('auto', 'cpu', 'cuda'):
             raise ValueError(f"Invalid device={self.device!r}. Expected 'auto', 'cpu', or 'cuda'.")
+        if not isinstance(self.date_col, str) or self.date_col == "":
+            raise ValueError("date_col must be a non-empty string")
     
 def _resolve_device(device: str) -> torch.device:
     if device == 'auto':
@@ -66,6 +69,28 @@ def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
             f"but y_pred has shape {y_pred.shape}."
         )
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+def _compute_icir(y_true: np.ndarray, y_pred: np.ndarray,
+                  meta: pd.DataFrame, date_col: str,
+                  min_obs: int = 10) -> dict:
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    dates = meta[date_col].values
+
+    df = pd.DataFrame({"date": dates, "y_true": y_true, "y_pred": y_pred})
+    daily_ic = df.groupby("date").apply(
+        lambda g: np.nan
+        if len(g) < min_obs or g["y_true"].nunique() <= 1 or g["y_pred"].nunique() <= 1
+        else g["y_true"].corr(g["y_pred"], method="spearman")
+    ).dropna()
+
+    daily_ic = daily_ic.astype(float)
+    if len(daily_ic) < 2:
+        return {"icir": np.nan, "mean_ic": float(daily_ic.mean()) if len(daily_ic) > 0 else np.nan,
+                "n_dates": len(daily_ic)}
+
+    icir = float(daily_ic.mean() / daily_ic.std(ddof=1))
+    return {"icir": icir, "mean_ic": float(daily_ic.mean()), "n_dates": len(daily_ic)}
 
 def _validate_torch_dataset(dataset: BuiltDataset, name: str) -> None:
     if not isinstance(dataset, BuiltDataset):
@@ -269,8 +294,8 @@ def train_torch_model(
 
     best_valid_rmse = float("inf")
     best_rmse_epoch = -1
-    best_ric = -np.inf
-    best_ric_epoch = -1
+    best_icir = -np.inf
+    best_icir_epoch = -1
     epochs_without_improvement = 0
 
     final_train_loss = float("nan")
@@ -279,7 +304,7 @@ def train_torch_model(
 
     t_start = time.perf_counter()
 
-    ric_checkpoint_path = output_dir / f"{model_name}_best_ric.pt"
+    icir_checkpoint_path = output_dir / f"{model_name}_best_icir.pt"
 
     for epoch in range(1, config.epochs + 1):
         t_epoch = time.perf_counter()
@@ -299,8 +324,10 @@ def train_torch_model(
             device=device
         )
 
-        eval_df = pd.DataFrame({"y_true": y_true, "y_pred": y_pred})
-        rank_ic = eval_df["y_true"].corr(eval_df["y_pred"], method="spearman")
+        ic_result = _compute_icir(y_true, y_pred, valid_data.meta, config.date_col)
+        icir = ic_result["icir"]
+        mean_ic = ic_result["mean_ic"]
+        n_ic_dates = ic_result["n_dates"]
         valid_ret_mean = float(np.mean(y_pred))
         valid_ret_std = float(np.std(y_pred))
         valid_sharpe = float(valid_ret_mean / valid_ret_std * np.sqrt(252)) if valid_ret_std > 0 else 0.0
@@ -321,19 +348,19 @@ def train_torch_model(
         else:
             epochs_without_improvement += 1
 
-        if np.isfinite(rank_ic) and rank_ic > best_ric:
-            best_ric = rank_ic
-            best_ric_epoch = epoch
-            torch.save(model.state_dict(), ric_checkpoint_path)
+        if np.isfinite(icir) and icir > best_icir:
+            best_icir = icir
+            best_icir_epoch = epoch
+            torch.save(model.state_dict(), icir_checkpoint_path)
 
         epoch_time = time.perf_counter() - t_epoch
         elapsed = time.perf_counter() - t_start
         print(
             f"[{model_name}  epoch {epoch:>3}/{config.epochs}] "
             f"train_loss={train_loss:.6f}  valid_rmse={valid_rmse:.6f}  "
-            f"rIC={rank_ic:.4f}  vSharpe={valid_sharpe:+.3f}  "
+            f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  n={n_ic_dates}  vSharpe={valid_sharpe:+.3f}  "
             f"best_rmse={best_valid_rmse:.6f} @epoch {best_rmse_epoch:<3}  "
-            f"best_rIC={best_ric:.4f} @epoch {best_ric_epoch}  "
+            f"best_ICIR={best_icir:.4f} @epoch {best_icir_epoch}  "
             f"epoch={epoch_time:.1f}s  elapsed={elapsed:.1f}s"
         )
 
@@ -344,9 +371,9 @@ def train_torch_model(
             )
             break
 
-    # Use rIC-best checkpoint for prediction
-    use_checkpoint = ric_checkpoint_path if (best_ric_epoch >= 1 and ric_checkpoint_path.exists()) else checkpoint_path
-    use_epoch = best_ric_epoch if (best_ric_epoch >= 1 and ric_checkpoint_path.exists()) else best_rmse_epoch
+    # Use ICIR-best checkpoint for prediction
+    use_checkpoint = icir_checkpoint_path if (best_icir_epoch >= 1 and icir_checkpoint_path.exists()) else checkpoint_path
+    use_epoch = best_icir_epoch if (best_icir_epoch >= 1 and icir_checkpoint_path.exists()) else best_rmse_epoch
 
     if use_epoch < 1 or not use_checkpoint.exists():
         raise RuntimeError(
@@ -366,8 +393,8 @@ def train_torch_model(
         "final_valid_rmse": final_valid_rmse,
         "best_valid_rmse": best_valid_rmse,
         "best_rmse_epoch": best_rmse_epoch,
-        "best_ric": best_ric,
-        "best_ric_epoch": best_ric_epoch,
+        "best_icir": best_icir,
+        "best_icir_epoch": best_icir_epoch,
         "train_size": int(train_data.y.shape[0]),
         "valid_size": int(valid_data.y.shape[0]),
         "model_path": str(use_checkpoint),
@@ -402,13 +429,13 @@ if __name__ == "__main__":
     train_data = BuiltDataset(
         X=X_train,
         y=y_train,
-        meta=pd.DataFrame({"sample_id": range(n_train)}),
+        meta=pd.DataFrame({"time": range(n_train)}),
     )
 
     valid_data = BuiltDataset(
         X=X_valid,
         y=y_valid,
-        meta=pd.DataFrame({"sample_id": range(n_valid)}),
+        meta=pd.DataFrame({"time": range(n_valid)}),
     )
 
     model = DummyTimeSeriesRegressor(

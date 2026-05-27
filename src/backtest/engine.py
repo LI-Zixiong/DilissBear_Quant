@@ -2,6 +2,7 @@
 Backtest engine for converting predictions into portfolio returns.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
@@ -13,6 +14,18 @@ from src.backtest.metrics import (
     summarize_backtest,
 )
 from src.backtest.portfolio import PortfolioConfig, build_portfolio_weights
+
+
+@dataclass
+class TransactionCostConfig:
+    buy_cost: float = 0.0003
+    sell_cost: float = 0.0008
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.buy_cost < 1.0):
+            raise ValueError(f"buy_cost must be in [0, 1), got {self.buy_cost}")
+        if not (0.0 <= self.sell_cost < 1.0):
+            raise ValueError(f"sell_cost must be in [0, 1), got {self.sell_cost}")
 
 def _validate_backtest_inputs(
     pred_df: pd.DataFrame,
@@ -150,6 +163,7 @@ def run_backtest(
     date_col: str = "date",
     stock_col: str = "stock_id",
     periods_per_year: int = 252,
+    cost_config: TransactionCostConfig | None = None,
 ) -> dict[str, Any]:
     """
     Run a simple next-period portfolio backtest.
@@ -157,7 +171,8 @@ def run_backtest(
     Assumption:
     - Predictions on signal_date are used to build a portfolio at that date.
     - The portfolio earns returns on the next available return_date.
-    - No transaction costs or slippage are applied in V0.
+    - If cost_config is provided, transaction costs are subtracted from daily returns
+      and reflected in NAV, summary, and Sharpe ratio.
     """
     if periods_per_year <= 0:
         raise ValueError("periods_per_year must be positive")
@@ -191,6 +206,7 @@ def run_backtest(
     weights_records: list[pd.Series] = []
     weight_dates: list[pd.Timestamp] = []
     turnover_values: dict[pd.Timestamp, float] = {}
+    signal_to_return: dict[pd.Timestamp, pd.Timestamp] = {}
 
     previous_weights: pd.Series | None = None
 
@@ -235,6 +251,7 @@ def run_backtest(
 
         period_returns[return_date] = period_return
         turnover_values[signal_date] = turnover
+        signal_to_return[signal_date] = return_date
 
         weights.name = signal_date
         weights_records.append(weights)
@@ -245,17 +262,35 @@ def run_backtest(
     if not period_returns:
         raise ValueError("No valid backtest periods were generated")
 
-    daily_returns = pd.Series(period_returns).sort_index()
-    daily_returns.name = "strategy_return"
+    daily_returns_raw = pd.Series(period_returns).sort_index()
+    daily_returns_raw.name = "strategy_return"
+
+    daily_turnover = pd.Series(turnover_values).sort_index()
+    daily_turnover.name = "turnover"
+
+    if cost_config is not None:
+        avg_cost = 0.5 * (cost_config.buy_cost + cost_config.sell_cost)
+        turnover_by_return = pd.Series({
+            signal_to_return[sd]: tv
+            for sd, tv in turnover_values.items()
+        }).sort_index()
+        daily_returns = daily_returns_raw - turnover_by_return * avg_cost
+        daily_returns.name = "strategy_return_net"
+        result = {
+            "daily_returns": daily_returns,
+            "daily_returns_raw": daily_returns_raw,
+        }
+    else:
+        daily_returns = daily_returns_raw
+        result = {
+            "daily_returns": daily_returns,
+        }
 
     daily_nav = cumulative_nav(daily_returns)
     daily_nav.name = "nav"
 
     daily_weights = pd.DataFrame(weights_records, index=weight_dates).sort_index()
     daily_weights.index.name = date_col
-
-    daily_turnover = pd.Series(turnover_values).sort_index()
-    daily_turnover.name = "turnover"
 
     summary = summarize_backtest(
         returns=daily_returns,
@@ -265,13 +300,12 @@ def run_backtest(
     summary["mean_turnover"] = float(daily_turnover.mean())
     summary["total_turnover"] = float(daily_turnover.sum())
 
-    return {
-        "summary": summary,
-        "daily_returns": daily_returns,
-        "daily_nav": daily_nav,
-        "daily_weights": daily_weights,
-        "daily_turnover": daily_turnover,
-    }
+    result["summary"] = summary
+    result["daily_nav"] = daily_nav
+    result["daily_weights"] = daily_weights
+    result["daily_turnover"] = daily_turnover
+
+    return result
 
 if __name__ == "__main__":
     sample_pred = pd.DataFrame(

@@ -33,7 +33,7 @@ from src.data.dataset_builder import PanelDatasetBuilder
 from src.predict.generate_predictions import PredictionConfig, generate_predictions
 from src.utils.seed import set_seed
 
-OUT = Path("dataset/output/experiment_001")
+OUT = Path("dataset/output/experiment_003")
 MODELS = ["lightgbm", "xgboost", "dlinear", "itransformer", "tsmixer"]
 COMBO_WEIGHTS = [
     (0.30, 0.30, 0.20, 0.15, 0.05),
@@ -71,9 +71,11 @@ def build_returns():
         replace_inf_with_nan=True, drop_rows_with_missing_keys=True,
         drop_rows_with_missing_target=True, duplicate_policy="raise", sort_values=True,
     )).df
-    ret = build_returns_frame_from_next_target(
-        clean, config.date_col, config.stock_col,
-        config.backtest_return_source, config.return_col)
+    ret = clean[[config.date_col, config.stock_col, "ret_daily"]].rename(
+        columns={"ret_daily": config.return_col}).copy()
+    ret[config.date_col] = pd.to_datetime(ret[config.date_col]).dt.normalize()
+    ret[config.stock_col] = ret[config.stock_col].astype(str).str.strip()
+    ret[config.return_col] = ret[config.return_col].astype(float)
     ret["time"] = pd.to_datetime(ret["time"]).dt.normalize()
     ret["stock_id"] = ret["stock_id"].astype(str).str.strip()
     return ret
@@ -119,7 +121,7 @@ def generate_valid():
                 date_col=config.date_col, stock_col=config.stock_col, seq_len=p["seq_len"],
                 meta_cols=list(config.meta_cols))
             data = builder.build_sequence_dataset(valid_df)
-            ckpt = OUT / "models" / f"{model.__class__.__name__}_best_ric.pt"
+            ckpt = OUT / "models" / f"{model.__class__.__name__}_best_icir.pt"
             if not ckpt.exists():
                 ckpt = OUT / "models" / f"{model.__class__.__name__}.pt"
             model.load_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
@@ -141,8 +143,24 @@ def generate_valid():
 
 
 def bt(df, returns, yp_col="_yp"):
-    pfolio = PortfolioConfig(strategy="top_n", top_n=50, pred_col="y_pred", stock_col="stock_id")
     d = df[["time", "stock_id", yp_col]].dropna(subset=[yp_col]).rename(columns={yp_col: "y_pred"})
+    # Build (time, stock_id) set from returns — only keep predictions with valid returns
+    ret_pairs = set(zip(returns["time"], returns["stock_id"]))
+    pred_dates = pd.DatetimeIndex(d["time"].dropna().unique()).sort_values()
+    ret_dates = pd.DatetimeIndex(returns["time"].dropna().unique()).sort_values()
+    # Find next return date for each signal date
+    next_date_map = {}
+    for sd in pred_dates:
+        future = ret_dates[ret_dates > sd]
+        if len(future): next_date_map[sd] = future[0]
+    # Keep only rows where the next return date has the same stock
+    keep = pd.Series(False, index=d.index)
+    for sd, nd in next_date_map.items():
+        stocks_on_nd = returns.loc[returns["time"] == nd, "stock_id"].unique()
+        mask = (d["time"] == sd) & (d["stock_id"].isin(stocks_on_nd))
+        keep[mask] = True
+    d = d[keep].copy()
+    pfolio = PortfolioConfig(strategy="top_n", top_n=50, pred_col="y_pred", stock_col="stock_id")
     return run_backtest(pred_df=d, returns_df=returns, portfolio_config=pfolio,
                         return_col="return_1d", date_col="time", stock_col="stock_id")["summary"]
 

@@ -33,7 +33,7 @@ from src.utils.seed import set_seed
 @dataclass
 class FactorConfig:
     input_path: str = "dataset/processed/csmar_daily_raw_panel.parquet"
-    output_path: str = "dataset/processed/factor_panel_12.parquet"
+    output_path: str = "dataset/processed/factor_panel_12_ind.parquet"
     model_start_date: str = "2018-01-01"
     date_col: str = "time"
     stock_col: str = "stock_id"
@@ -309,16 +309,28 @@ def _build_ttm_factors(df: pd.DataFrame, fc: FactorConfig) -> pd.DataFrame:
 # ---- Targets ----
 
 def _build_targets(df: pd.DataFrame) -> pd.DataFrame:
-    g = df.groupby("stock_id")["close_adj"]
+    g = df.groupby("stock_id")["open"]
     result = pd.DataFrame(index=df.index)
-    result["1d_next_raw"] = g.shift(-1) / df["close_adj"] - 1
-    result["5d_next_raw"] = g.shift(-5) / df["close_adj"] - 1
+    # T+1: buy at t+1 open, sell at t+2 open
+    result["1d_next_raw"] = g.shift(-2) / g.shift(-1) - 1
+    # T+1 buy at t+1 open, sell at t+7 open (~5 trading days)
+    result["5d_next_raw"] = g.shift(-6) / g.shift(-1) - 1
     return result
 
 
 # ---- Cross-sectional winsorize + z-score ----
 
-def _winsorize_zscore(df: pd.DataFrame, factor_names: list[str]) -> pd.DataFrame:
+def _winsorize_zscore(df: pd.DataFrame, factor_names: list[str],
+                      industry_col: str | None = None,
+                      neutralize_factors: list[str] | None = None) -> pd.DataFrame:
+    """
+    Winsorize (1%/99%) then z-score. If neutralize_factors is provided,
+    only those factors get industry neutralization before cross-sectional z-score.
+    """
+    if neutralize_factors is None:
+        neutralize_factors = factor_names
+    neut_set = set(neutralize_factors)
+
     for name in factor_names:
         raw_col = f"{name}_raw"
         if raw_col not in df.columns:
@@ -331,7 +343,13 @@ def _winsorize_zscore(df: pd.DataFrame, factor_names: list[str]) -> pd.DataFrame
         w_col = f"{name}_w"
         df[w_col] = df[raw_col].clip(lo, hi)
 
-        # Z-score: cross-sectional
+        # Step 1: Industry neutralization (only for selected factors)
+        if industry_col and industry_col in df.columns and name in neut_set:
+            mu_ind = df.groupby(["time", industry_col])[w_col].transform("mean")
+            sd_ind = df.groupby(["time", industry_col])[w_col].transform("std")
+            df[w_col] = (df[w_col] - mu_ind) / sd_ind.where(sd_ind > 1e-10, 1.0)
+
+        # Step 2: Cross-sectional z-score
         mu = df.groupby("time")[w_col].transform("mean")
         sd = df.groupby("time")[w_col].transform("std")
         df[name] = (df[w_col] - mu) / sd.where(sd > 1e-10, 1.0)
@@ -436,7 +454,9 @@ def main() -> None:
         "EARNYLD", "GROWTH",
     ]
     print("\nCross-sectional winsorize + z-score...")
-    df = _winsorize_zscore(df, factor_names)
+    fin_factors = ["SIZE", "SIZENL", "LIQUIDITY", "VALUE", "LEVERAGE", "EARNYLD", "GROWTH"]
+    df = _winsorize_zscore(df, factor_names,
+                           industry_col="industry_csrc_2012", neutralize_factors=fin_factors)
 
     # --- Filter to model start date ---
     print(f"\nFiltering to time >= {config.model_start_date}...")
@@ -452,7 +472,7 @@ def main() -> None:
     output_cols = [config.date_col, config.stock_col] + factor_names + \
                   ["1d_next_raw", "5d_next_raw"]
     # Add metadata cols if present
-    for meta in ["industry_csrc_2012", "list_date", "close", "close_adj",
+    for meta in ["industry_csrc_2012", "list_date", "open", "close", "close_adj",
                  "ret_daily", "mktcap_float", "mktcap_total", "volume",
                  "trade_status", "limit_status", "change_ratio"]:
         if meta in df.columns:
