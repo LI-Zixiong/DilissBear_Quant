@@ -4,52 +4,62 @@
 JulongQuant/
 │
 ├── dataset/              # Data storage
-│   ├── input/            #   CSMAR raw data, teacher validation
-│   ├── processed/        #   factor_panel_12.parquet, daily raw panels
-│   └── output/           #   Experiment outputs & backtest results
+│   ├── input/            #   CSMAR raw data, Tushare daily panel, Aindustry.xlsx
+│   ├── processed/        #   unified_daily_panel, financial_quarterly_panel, factor_panel_54
+│   └── output/           #   Experiment outputs, backtest results, tuning runs
 │
-├── reports/              # Generated experiment reports
+├── mds/                  # Documentation
+│   └── FACTOR_LIBRARY.md #   54-factor library with formulas and ICIR rankings
+│
+├── reports/              # Generated experiment reports + factor audit
 │
 ├── scripts/              # Runnable entry points
-│   ├── check_data_to_model.py    End-to-end smoke test
-│   ├── run_experiment.py         Full experiment pipeline
-│   ├── check_experiment.py       Output validation & baseline comparison
-│   ├── build_factor_panel.py     CSMAR → unified daily panel
-│   ├── calc_factors.py           12 factor + 2 targets computation
-│   ├── select_stocks.py          Stock universe selection
-│   └── ensemble.py               5-model ensemble & comparison
+│   ├── dataset/          #   Data pipeline
+│   │   ├── build_base_panel.py       Tushare + CSMAR → unified daily panel
+│   │   ├── calc_factor_panel.py       Full 54-factor computation
+│   │   ├── add_factors.py            Column extension (new factors only)
+│   │   ├── select_universe.py        1500-stock stratified selection
+│   │   └── daily_update.py           Daily incremental update
+│   ├── experiment/       #   Experiments
+│   │   ├── run_experiment.py         Single experiment entry point
+│   │   └── tune_experiment.py        Grid tuning entry point
+│   ├── evaluation/       #   Evaluation
+│   │   ├── ensemble.py              Rank-Ridge + grid ensemble
+│   │   └── check_experiment.py      Output validation
+│   ├── factor/           #   Factor analysis
+│   │   └── audit_factors.py         ICIR ranking + correlation + auto-selection
+│   └── strategy/         #   Strategy research
+│       └── strategy_v0.py           Prediction smoothing + backtest
 │
 ├── src/                  # Source code
-│   ├── data/             #   Data pipeline
+│   ├── data/             #   Data pipeline (stable — do not modify)
 │   │   ├── loader.py             Parquet data loader
 │   │   ├── preprocess.py         Factor preprocessing
 │   │   └── dataset_builder.py    Sliding window dataset
-│   ├── models/           #   Model implementations (6 models)
-│   │   ├── lightgbm_model.py     LightGBM (tabular)
-│   │   ├── xgboost_model.py      XGBoost (tabular)
-│   │   ├── dlinear.py            DLinear (sequence)
-│   │   ├── itransformer.py       iTransformer (sequence)
-│   │   ├── patchtst.py           PatchTST (sequence)
-│   │   └── tsmixer.py            TSMixer (sequence)
+│   ├── models/           #   Model implementations (6 models, stable)
 │   ├── train/            #   Training logic
-│   │   ├── train_tabular.py      LightGBM & XGBoost training
-│   │   └── train_torch.py        PyTorch sequence model training
-│   ├── backtest/         #   Backtesting engine
-│   │   ├── metrics.py            Sharpe, max drawdown, IC, turnover
-│   │   ├── portfolio.py          Portfolio construction (top-N, equal)
-│   │   └── engine.py             Date-by-date simulation
 │   ├── predict/          #   Prediction
-│   │   └── generate_predictions.py   Model inference & output
-│   └── utils/            #   Utilities
-│       ├── seed.py               Reproducibility
-│       └── logger.py             Structured logging
+│   ├── backtest/         #   Backtesting engine
+│   ├── utils/            #   Utilities
+│   ├── experiment/       #   Experiment orchestration
+│   │   ├── config.py             ExperimentConfig dataclass
+│   │   ├── data.py               Data loading + preprocessing
+│   │   ├── split.py              Chronological date split
+│   │   ├── returns.py            Return frame construction + alignment
+│   │   ├── model_factory.py      Model construction + param resolution
+│   │   ├── runner.py             End-to-end experiment orchestrator
+│   │   ├── evaluation.py         IC/top-bottom-spread/backtest per split
+│   │   ├── report.py             Markdown report generation
+│   │   └── tuning.py             Grid search runner
+│   └── pipeline/         #   Data pipeline (reusable)
+│       ├── base_panel.py         Base panel build + incremental + checks
+│       └── factor_panel.py       54-factor compute + incremental + column extension
 │
 ├── tests/                # Unit tests (25 tests)
-│   ├── test_data_alignment.py    X/y/meta alignment checks
-│   ├── test_no_future_leakage.py Future-leakage prevention
-│   └── test_portfolio_weight.py  Weight validity & constraints
 │
 ├── .gitignore
+├── CLAUDE.md
+├── STAGE_0.md
 ├── requirements.txt
 ├── LICENSE
 └── README.md

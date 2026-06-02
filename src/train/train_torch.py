@@ -328,9 +328,6 @@ def train_torch_model(
         icir = ic_result["icir"]
         mean_ic = ic_result["mean_ic"]
         n_ic_dates = ic_result["n_dates"]
-        valid_ret_mean = float(np.mean(y_pred))
-        valid_ret_std = float(np.std(y_pred))
-        valid_sharpe = float(valid_ret_mean / valid_ret_std * np.sqrt(252)) if valid_ret_std > 0 else 0.0
 
         final_train_loss = train_loss
         final_valid_loss = valid_loss
@@ -358,7 +355,7 @@ def train_torch_model(
         print(
             f"[{model_name}  epoch {epoch:>3}/{config.epochs}] "
             f"train_loss={train_loss:.6f}  valid_rmse={valid_rmse:.6f}  "
-            f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  n={n_ic_dates}  vSharpe={valid_sharpe:+.3f}  "
+            f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  n={n_ic_dates}  "
             f"best_rmse={best_valid_rmse:.6f} @epoch {best_rmse_epoch:<3}  "
             f"best_ICIR={best_icir:.4f} @epoch {best_icir_epoch}  "
             f"epoch={epoch_time:.1f}s  elapsed={elapsed:.1f}s"

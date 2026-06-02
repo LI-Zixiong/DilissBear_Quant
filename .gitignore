@@ -252,3 +252,32 @@ dataset/skill/
 
 # Claude Code local settings
 .claude/
+
+# Backup files
+backup/
+
+# Markdown documents
+mds/
+
+# Tuning outputs
+dataset/output/tuning/
+reports/tuning/
+reports/factor_audit/
+reports/strategy_v1/
+
+# Temp scripts and outputs
+temp/*.py
+temp/*.csv
+temp/*.parquet
+ind.txt
+
+# Old scripts (moved to new structure)
+scripts/build_factor_panel.py
+scripts/calc_factors.py
+scripts/check_data_to_model.py
+scripts/check_experiment.py
+scripts/ensemble.py
+scripts/run_experiment.py
+scripts/select_stocks.py
+scripts/seq_len_scan.py
+scripts/strategy_v0.py
