@@ -15,10 +15,10 @@ def main() -> None:
     config = FactorPanelConfig(
         base_panel_path="dataset/processed/unified_daily_panel.parquet",
         financial_panel_path="dataset/processed/financial_quarterly_panel.parquet",
-        output_path="dataset/processed/factor_panel_24_ind.parquet",
-        metadata_path="dataset/processed/factor_panel_24_metadata.json",
+        output_path="dataset/processed/factor_panel_54_ind.parquet",
+        metadata_path="dataset/processed/factor_panel_54_metadata.json",
 
-        model_start_date="2018-01-01",
+        model_start_date="2015-06-01",
         date_col="time",
         stock_col="stock_id",
 

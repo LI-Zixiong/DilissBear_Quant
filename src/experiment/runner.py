@@ -344,6 +344,7 @@ def _run_torch_models(
                 config=config,
             )
 
+            set_seed(config.seed)  # reset seed per model for reproducibility
             train_summary = train_torch_model(
                 model=model,
                 train_data=train_data,

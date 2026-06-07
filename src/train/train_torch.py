@@ -3,11 +3,14 @@ Training utilities for PyTorch time-series models.
 """
 
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+warnings.filterwarnings("ignore", "An input array is constant")
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -91,6 +94,65 @@ def _compute_icir(y_true: np.ndarray, y_pred: np.ndarray,
 
     icir = float(daily_ic.mean() / daily_ic.std(ddof=1))
     return {"icir": icir, "mean_ic": float(daily_ic.mean()), "n_dates": len(daily_ic)}
+
+
+def _compute_valid_cumret(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    meta: pd.DataFrame,
+    date_col: str,
+    top_n: int = 50,
+) -> dict:
+    """Compute cumulative return of daily top-N equal-weight portfolio on valid set.
+
+    Signal at date t uses the next trading day's ret_daily (forward return t→t+1),
+    matching the backtest engine's _get_next_return_date logic.
+    """
+    if "ret_daily" not in meta.columns or "stock_id" not in meta.columns:
+        return {"cumret": np.nan, "sharpe": np.nan, "n_dates": 0}
+
+    df = pd.DataFrame({
+        "time": pd.to_datetime(meta[date_col].values),
+        "stock_id": meta["stock_id"].astype(str).values,
+        "y_pred": y_pred,
+        "ret_daily": meta["ret_daily"].values,
+    })
+    df = df.dropna(subset=["y_pred", "ret_daily"])
+
+    # Forward-return lookup: (date, stock_id) -> ret_daily at that date
+    # ret_daily[t+1] = return from t to t+1 → this is what we earn on signal at t
+    fwd_ret = df.set_index(["time", "stock_id"])["ret_daily"]
+
+    # Map each signal date to the next available trading date
+    all_dates = np.sort(df["time"].unique())
+    next_date = {pd.Timestamp(all_dates[i]): pd.Timestamp(all_dates[i + 1])
+                 for i in range(len(all_dates) - 1)}
+
+    daily_rets = []
+    for signal_date, g in df.groupby("time", sort=True):
+        rd = next_date.get(pd.Timestamp(signal_date))
+        if rd is None:
+            continue
+        top = g.nlargest(top_n, "y_pred")
+        day_rets = []
+        for sid in top["stock_id"]:
+            try:
+                r = fwd_ret.loc[(rd, sid)]
+                if np.isfinite(r):
+                    day_rets.append(r)
+            except KeyError:
+                continue
+        if day_rets:
+            daily_rets.append(np.mean(day_rets))
+
+    if not daily_rets:
+        return {"cumret": np.nan, "sharpe": np.nan, "n_dates": 0}
+
+    rets = pd.Series(daily_rets, dtype=float)
+    cumret = float((1.0 + rets).prod() - 1.0)
+    sharpe = float(rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0.0
+    return {"cumret": cumret, "sharpe": sharpe, "n_dates": len(rets)}
+
 
 def _validate_torch_dataset(dataset: BuiltDataset, name: str) -> None:
     if not isinstance(dataset, BuiltDataset):
@@ -296,6 +358,12 @@ def train_torch_model(
     best_rmse_epoch = -1
     best_icir = -np.inf
     best_icir_epoch = -1
+    best_cumret = -np.inf
+    best_cumret_epoch = -1
+    cumret_checkpoint_path = output_dir / f"{model_name}_best_cumret.pt"
+
+    epoch_records: list[dict] = []  # per-epoch cumret/sharpe for composite scoring
+    composite_checkpoint_path = output_dir / f"{model_name}_best_composite.pt"
     epochs_without_improvement = 0
 
     final_train_loss = float("nan")
@@ -350,14 +418,32 @@ def train_torch_model(
             best_icir_epoch = epoch
             torch.save(model.state_dict(), icir_checkpoint_path)
 
+        cumret_result = _compute_valid_cumret(y_true, y_pred, valid_data.meta, config.date_col)
+        cumret = cumret_result["cumret"]
+        epoch_sharpe = cumret_result["sharpe"]
+        if np.isfinite(cumret) and cumret > best_cumret:
+            best_cumret = cumret
+            best_cumret_epoch = epoch
+            torch.save(model.state_dict(), cumret_checkpoint_path)
+
+        epoch_records.append({
+            "epoch": epoch,
+            "cumret": cumret if np.isfinite(cumret) else -np.inf,
+            "sharpe": epoch_sharpe if np.isfinite(epoch_sharpe) else -np.inf,
+            "checkpoint": output_dir / f"{model_name}_epoch{epoch}.pt",
+        })
+        torch.save(model.state_dict(), epoch_records[-1]["checkpoint"])
+
         epoch_time = time.perf_counter() - t_epoch
         elapsed = time.perf_counter() - t_start
         print(
             f"[{model_name}  epoch {epoch:>3}/{config.epochs}] "
             f"train_loss={train_loss:.6f}  valid_rmse={valid_rmse:.6f}  "
-            f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  n={n_ic_dates}  "
-            f"best_rmse={best_valid_rmse:.6f} @epoch {best_rmse_epoch:<3}  "
-            f"best_ICIR={best_icir:.4f} @epoch {best_icir_epoch}  "
+            f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  n_ic_dates={n_ic_dates}  "
+            f"cumret={cumret:.4f}  "
+            f"best_rmse={best_valid_rmse:.6f} @{best_rmse_epoch}  "
+            f"best_ICIR={best_icir:.4f} @{best_icir_epoch}  "
+            f"best_cumret={best_cumret:.4f} @{best_cumret_epoch}  "
             f"epoch={epoch_time:.1f}s  elapsed={elapsed:.1f}s"
         )
 
@@ -368,9 +454,32 @@ def train_torch_model(
             )
             break
 
-    # Use ICIR-best checkpoint for prediction
-    use_checkpoint = icir_checkpoint_path if (best_icir_epoch >= 1 and icir_checkpoint_path.exists()) else checkpoint_path
-    use_epoch = best_icir_epoch if (best_icir_epoch >= 1 and icir_checkpoint_path.exists()) else best_rmse_epoch
+    # Composite score: 80% cumret rank + 20% sharpe rank (percentile)
+    records_df = pd.DataFrame(epoch_records)
+    best_composite_epoch = -1
+    if len(records_df) >= 2:
+        records_df["rank_cumret"] = records_df["cumret"].rank(pct=True)
+        records_df["rank_sharpe"] = records_df["sharpe"].rank(pct=True)
+        records_df["composite"] = 0.8 * records_df["rank_cumret"] + 0.2 * records_df["rank_sharpe"]
+        best_idx = records_df["composite"].idxmax()
+        best_composite_epoch = int(records_df.loc[best_idx, "epoch"])
+        best_record = records_df.loc[best_idx]
+        best_ckpt = best_record["checkpoint"]
+        import shutil
+        shutil.copy2(best_ckpt, composite_checkpoint_path)
+        print(
+            f"[{model_name}] best_composite: epoch={best_composite_epoch}  "
+            f"cumret={best_record['cumret']:.4f}  sharpe={best_record['sharpe']:.4f}  "
+            f"composite={best_record['composite']:.4f}"
+        )
+
+    # Use composite-best checkpoint for prediction (fallback: ICIR > RMSE)
+    use_checkpoint = (composite_checkpoint_path if best_composite_epoch >= 1
+                      else icir_checkpoint_path if best_icir_epoch >= 1
+                      else checkpoint_path)
+    use_epoch = (best_composite_epoch if best_composite_epoch >= 1
+                 else best_icir_epoch if best_icir_epoch >= 1
+                 else best_rmse_epoch)
 
     if use_epoch < 1 or not use_checkpoint.exists():
         raise RuntimeError(
@@ -392,6 +501,9 @@ def train_torch_model(
         "best_rmse_epoch": best_rmse_epoch,
         "best_icir": best_icir,
         "best_icir_epoch": best_icir_epoch,
+        "best_cumret": best_cumret,
+        "best_cumret_epoch": best_cumret_epoch,
+        "best_composite_epoch": best_composite_epoch,
         "train_size": int(train_data.y.shape[0]),
         "valid_size": int(valid_data.y.shape[0]),
         "model_path": str(use_checkpoint),

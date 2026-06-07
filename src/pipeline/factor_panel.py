@@ -97,7 +97,9 @@ FIN6_FACTORS: tuple[str, ...] = (
     "F054RECEIVABLE_RATIO",
 )
 
-DEFAULT_FACTOR_NAMES: tuple[str, ...] = BARRA12_FACTORS + NEW12_FACTORS + TECH24_FACTORS + FIN6_FACTORS
+IND1_FACTORS: tuple[str, ...] = ("F055IND",)
+
+DEFAULT_FACTOR_NAMES: tuple[str, ...] = BARRA12_FACTORS + NEW12_FACTORS + TECH24_FACTORS + FIN6_FACTORS + IND1_FACTORS
 
 FACTOR_ALIAS: dict[str, str] = {
     "F001SIZE": "SIZE",
@@ -154,6 +156,7 @@ FACTOR_ALIAS: dict[str, str] = {
     "F052CFOA": "F52_cfoa",
     "F053RD_INTENSITY": "F53_rd_intensity",
     "F054RECEIVABLE_RATIO": "F54_receivable_ratio",
+    "F055IND": "F55_ind",
 }
 
 
@@ -171,7 +174,7 @@ class FactorPanelConfig:
     output_path: str | Path = "dataset/processed/factor_panel_24_ind.parquet"
     metadata_path: str | Path = "dataset/processed/factor_panel_24_metadata.json"
 
-    model_start_date: str = "2018-01-01"
+    model_start_date: str = "2015-06-01"
     date_col: str = "time"
     stock_col: str = "stock_id"
 
@@ -229,6 +232,9 @@ def compute_factor_panel_full(
 ) -> dict[str, Any]:
     """
     Compute full factor panel from base panel and quarterly financial panel.
+
+    Factors are computed in batches of 10 to keep peak memory low.
+    Each batch is saved as a column extension to the output parquet.
     """
 
     if config is None:
@@ -237,12 +243,60 @@ def compute_factor_panel_full(
     base = load_base_panel(config)
     financial = load_financial_quarterly_panel(config)
 
-    panel = compute_factor_columns(
-        base_panel=base,
-        financial_quarterly=financial,
-        config=config,
-        factor_names=config.factor_names,
-    )
+    factor_names = tuple(config.factor_names)
+    batch_size = 10
+    output_path = Path(config.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_raw_cols: list[str] = []
+    first_batch = True
+    n_batches = (len(factor_names) + batch_size - 1) // batch_size
+
+    for b in range(0, len(factor_names), batch_size):
+        batch = factor_names[b:b + batch_size]
+        batch_num = b // batch_size + 1
+        print(f"\n--- Batch {batch_num}/{n_batches}: {', '.join(batch)} ---")
+
+        panel = compute_factor_columns(
+            base_panel=base,
+            financial_quarterly=financial,
+            config=config,
+            factor_names=batch,
+        )
+
+        panel = filter_and_select_output_columns(
+            panel=panel,
+            config=config,
+            factor_names=batch,
+            include_targets=False,
+        )
+
+        if first_batch:
+            panel.to_parquet(output_path, index=False)
+            first_batch = False
+        else:
+            new_cols = [config.date_col, config.stock_col] + [f for f in batch if f in panel.columns]
+            existing = pd.read_parquet(output_path)
+            existing[config.date_col] = pd.to_datetime(existing[config.date_col]).dt.normalize()
+            existing[config.stock_col] = existing[config.stock_col].astype(str).str.strip().str.zfill(6)
+            merged = existing.merge(
+                panel[new_cols],
+                on=[config.date_col, config.stock_col],
+                how="inner",
+            )
+            merged.to_parquet(output_path, index=False)
+            del existing, merged
+
+        for fn in batch:
+            if fn in panel.columns:
+                all_raw_cols.append(fn)
+        # Free memory
+        del panel
+
+    # Reload merged panel, add targets, final save
+    panel = pd.read_parquet(output_path)
+    panel[config.date_col] = pd.to_datetime(panel[config.date_col]).dt.normalize()
+    panel[config.stock_col] = panel[config.stock_col].astype(str).str.strip().str.zfill(6)
 
     if config.mode == "research":
         targets = build_targets(panel, config)
@@ -252,8 +306,6 @@ def compute_factor_panel_full(
     elif config.mode == "live":
         for col in config.target_names:
             panel[col] = np.nan
-    else:
-        raise ValueError(f"Unsupported mode: {config.mode}")
 
     panel = filter_and_select_output_columns(
         panel=panel,
@@ -263,8 +315,6 @@ def compute_factor_panel_full(
 
     audit = run_factor_panel_checks(panel, config, config.factor_names)
 
-    output_path = Path(config.output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     panel.to_parquet(output_path, index=False)
 
     metadata = build_factor_metadata(
@@ -652,6 +702,13 @@ def compute_factor_columns(
             config=config,
         )
         df = df.merge(ttm_df, on=[config.date_col, config.stock_col], how="left")
+
+    if "F055IND" in needs:
+        df["F055IND_raw"] = (
+            df["industry_sw"].fillna(-1).astype(float)
+            if "industry_sw" in df.columns
+            else -1.0
+        )
 
     # Drop temporary helper columns to save memory before winsorize
     tmp_cols = [c for c in df.columns if c.startswith("_")]
@@ -1614,11 +1671,17 @@ def winsorize_zscore(
 
     neutralize_set = set(config.neutralize_factors)
 
+    categorical_factors = {"F055IND"}
+
     for name in factor_names:
         raw_col = f"{name}_raw"
 
         if raw_col not in df.columns:
             print(f"    [WARNING] {raw_col} not found, skipping")
+            continue
+
+        if name in categorical_factors:
+            df[name] = df[raw_col]
             continue
 
         lower = df.groupby(config.date_col)[raw_col].transform(

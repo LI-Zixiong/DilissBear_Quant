@@ -90,6 +90,7 @@ class ExperimentConfig:
     meta_cols: Sequence[str] = (
         "industry_sw",
         "list_date",
+        "ret_daily",
     )
 
     # Per-model feature overrides. None = all models use feature_cols.
@@ -108,6 +109,7 @@ class ExperimentConfig:
         "lightgbm",
         "xgboost",
         "dlinear",
+        "gated_dwtcn",
         "itransformer",
         "tsmixer",
     )

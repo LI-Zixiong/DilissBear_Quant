@@ -54,7 +54,7 @@ def compute_factor_icir(fp, factor_names, target):
             continue
         daily_ic = []
         for t, g in sub.groupby("time"):
-            if len(g) >= 30:
+            if len(g) >= 30 and g[f].nunique() >= 2:
                 ic = g[f].corr(g[target], method="spearman")
                 daily_ic.append(ic)
         ic = pd.Series(daily_ic).dropna()

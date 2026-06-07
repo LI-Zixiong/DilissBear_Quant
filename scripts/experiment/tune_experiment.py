@@ -45,25 +45,81 @@ if __name__ == "__main__":
             "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
             "F049ROE", "F050ROA", "F051GPM", "F052CFOA",
             "F053RD_INTENSITY", "F054RECEIVABLE_RATIO",
+            "F055IND",
         ),
-        meta_cols=("industry_sw", "list_date"),
+        meta_cols=("industry_sw", "list_date", "ret_daily"),
 
         # This can be overwritten by GRID.
-        model_names=("dlinear",),
+        model_names=("gated_dwtcn",),
         model_feature_cols={
+            "gated_dwtcn": (
+                "F002SIZENL", "F003LIQUIDITY", "F004BETA",
+                "F005RESVOL", "F007LTREV", "F008STREV",
+                "F010VALUE", "F011EARNYLD", "F012GROWTH",
+                "F013REV5", "F015VOLREV", "F016MAXRET",
+                "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
+                "F021CFP", "F023ACCRUAL", "F024ASSETGR",
+                "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
+                "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
+                "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
+                "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
+                "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
+                "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
+                "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
+                "F055IND",
+            ),
+            "xgboost": (
+                "F002SIZENL", "F003LIQUIDITY", "F004BETA",
+                "F005RESVOL", "F007LTREV", "F008STREV",
+                "F010VALUE", "F011EARNYLD", "F012GROWTH",
+                "F013REV5", "F015VOLREV", "F016MAXRET",
+                "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
+                "F021CFP", "F023ACCRUAL", "F024ASSETGR",
+                "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
+                "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
+                "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
+                "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
+                "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
+                "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
+                "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
+                "F055IND",
+            ),
+            "tsmixer": (
+                "F002SIZENL", "F003LIQUIDITY", "F004BETA",
+                "F005RESVOL", "F007LTREV", "F008STREV",
+                "F010VALUE", "F011EARNYLD", "F012GROWTH",
+                "F013REV5", "F015VOLREV", "F016MAXRET",
+                "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
+                "F021CFP", "F023ACCRUAL", "F024ASSETGR",
+                "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
+                "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
+                "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
+                "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
+                "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
+                "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
+                "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
+                "F055IND",
+            ),
             "dlinear": (
-                "F001SIZE", "F003LIQUIDITY", "F005RESVOL", "F008STREV",
-                "F010VALUE", "F013REV5", "F015VOLREV", "F019COSTDEV",
-                "F020BP", "F021CFP",
-                "F025GAP", "F030RSV20", "F031RSV60",
-                "F043SLOPE20", "F045RESI20",
+                "F039VSTD20", "F041RETVOLCORR20",
+                "F016MAXRET", "F040PVCORR20",
+                "F017IVOL", "F018AMIHUD", "F002SIZENL",
+                "F026KLEN", "F028KLOW", "F035LOWDEV20",
+                "F008STREV", "F019COSTDEV", "F042AMTCORR20",
+                "F031RSV60",
+                "F005RESVOL", "F003LIQUIDITY", "F025GAP",
+                "F027KUP", "F013REV5", "F010VALUE",
+                "F038TURNZ20", "F033GAPREV5", "F029KSFT",
+                "F021CFP", "F020BP", "F023ACCRUAL",
+                "F030RSV20", "F015VOLREV", "F011EARNYLD",
+                "F007LTREV", "F052CFOA",
             ),
         },
 
         # ──────────────────────────────────────────────────────────
         # Split, portfolio, seed
         # ──────────────────────────────────────────────────────────
-        split_ratio=(0.7, 0.1, 0.2),
+        split_ratio=(0.6, 0.2, 0.2),
         top_n=50,
         periods_per_year=252,
         seed=42,
@@ -73,7 +129,7 @@ if __name__ == "__main__":
         # ──────────────────────────────────────────────────────────
         seq_len=20,
         torch_epochs=10,
-        torch_patience=1,
+        torch_patience=3,
         torch_batch_size=4096,
         torch_learning_rate=7.5e-4,
         torch_weight_decay=0.0,
@@ -104,6 +160,16 @@ if __name__ == "__main__":
                 "wd": 0.0,
                 "patience": 2,
             },
+            "gated_dwtcn": {
+                "seq_len": 20,
+                "epochs": 15,
+                "lr": 5e-4,
+                "wd": 0.0,
+                "patience": 2,
+                "kernel_size": 3,
+                "hidden_dim": 32,
+                "gate_rank": 8,
+            },
             "itransformer": {
                 "seq_len": 40,
                 "epochs": 10,
@@ -113,8 +179,8 @@ if __name__ == "__main__":
             },
             "tsmixer": {
                 "seq_len": 40,
-                "epochs": 15,
-                "lr": 4e-3,
+                "epochs": 10,
+                "lr": 5e-3,
                 "wd": 0.0,
                 "patience": 2,
             },
@@ -123,7 +189,7 @@ if __name__ == "__main__":
                 "epochs": 10,
                 "lr": 1e-4,
                 "wd": 0.0,
-                "patience": 2,
+                "patience": 3,
             },
         },
 
@@ -152,12 +218,14 @@ if __name__ == "__main__":
     #
     GRID = {
         "model_names": [
-            ("dlinear",),
+            ("gated_dwtcn",),
         ],
-        "model_params.dlinear.seq_len": [10, 15, 20, 25, 30, 40],
+        "model_params.gated_dwtcn.lr": [5e-4],
+        "model_params.gated_dwtcn.epochs": [15],
+        "model_params.gated_dwtcn.dilations": [(1,2,4)],
     }
 
-    tuning_name = "dlinear_seq_scan"
+    tuning_name = "gated_dwtcn_lr"
 
     run_grid_search(
         base_config=BASE_CONFIG,

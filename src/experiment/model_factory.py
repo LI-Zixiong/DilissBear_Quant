@@ -16,6 +16,7 @@ from typing import Any
 from src.experiment.config import ExperimentConfig
 
 from src.models.dlinear import DLinearConfig, build_dlinear_model
+from src.models.gated_dwtcn import GatedDWTcnConfig, build_gated_dwtcn
 from src.models.itransformer import ITransformerConfig, build_itransformer_model
 from src.models.lightgbm_model import LightGBMConfig, build_lightgbm_model
 from src.models.patchtst import PatchTSTConfig, build_patchtst_model
@@ -30,6 +31,7 @@ TABULAR_MODELS = {
 
 TORCH_MODELS = {
     "dlinear",
+    "gated_dwtcn",
     "itransformer",
     "patchtst",
     "tsmixer",
@@ -187,6 +189,20 @@ def build_experiment_model(
                 n_features=n_features,
                 num_blocks=2,
                 dropout=0.1,
+            )
+        )
+
+    if normalized_name == "gated_dwtcn":
+        p = params if isinstance(params, dict) else {}
+        return build_gated_dwtcn(
+            GatedDWTcnConfig(
+                seq_len=seq_len,
+                n_features=n_features,
+                kernel_size=int(p.get("kernel_size", 3)),
+                dilations=tuple(p.get("dilations", (1, 2, 4))),
+                hidden_dim=int(p.get("hidden_dim", 32)),
+                gate_rank=int(p.get("gate_rank", 8)),
+                dropout=float(p.get("dropout", 0.1)),
             )
         )
 

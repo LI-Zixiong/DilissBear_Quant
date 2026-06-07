@@ -24,6 +24,7 @@ class XGBoostConfig:
     colsample_bytree: float = 0.8
     reg_alpha: float = 0.0
     reg_lambda: float = 1.0
+    early_stopping_rounds: int | None = None
     random_state: int = 42
     n_jobs: int = -1
 
@@ -66,6 +67,9 @@ class XGBoostReturnRegressor:
     def __init__(self, config: XGBoostConfig) -> None:
         self.config = config
         self._is_fitted = False
+        kwargs = {}
+        if config.early_stopping_rounds is not None:
+            kwargs["early_stopping_rounds"] = config.early_stopping_rounds
         self.model = XGBRegressor(
             n_estimators=config.n_estimators,
             max_depth=config.max_depth,
@@ -77,6 +81,7 @@ class XGBoostReturnRegressor:
             random_state=config.random_state,
             n_jobs=config.n_jobs,
             objective='reg:squarederror',
+            **kwargs,
         )
 
     @staticmethod
