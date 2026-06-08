@@ -40,7 +40,7 @@ class EvalConfig:
     bayes_window: int = 63
     bayes_clip: float = 2.0
     output_dir: Path = Path("reports/strategy_v1/evidence")
-    exp_dir: Path = Path("dataset/output/experiment_003")
+    exp_dir: Path = Path("dataset/output/experiment_004")
     returns_path: Path = Path("dataset/processed/unified_daily_panel.parquet")
     factor_path: Path = Path("dataset/processed/factor_panel_1500_54_ind.parquet")
 

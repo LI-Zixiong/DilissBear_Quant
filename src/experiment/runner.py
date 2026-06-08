@@ -357,6 +357,7 @@ def _run_torch_models(
                     learning_rate=float(params["lr"]),
                     weight_decay=float(params["wd"]),
                     device=config.torch_device,
+                    seed=config.seed,
                     date_col=config.date_col,
                 ),
             )

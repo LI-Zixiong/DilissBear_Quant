@@ -30,6 +30,7 @@ class TorchTrainConfig:
     weight_decay: float = 0.0
     device: str = 'auto'
     shuffle_train: bool = True
+    seed: int = 42
     date_col: str = "time"
 
     def __post_init__(self) -> None:
@@ -325,6 +326,13 @@ def train_torch_model(
 
     device = _resolve_device(config.device)
     model = model.to(device)
+
+    # Reset seed post-model-init to guarantee deterministic DataLoader shuffle.
+    # nn.init in model constructors consumes torch.random state.
+    import random as _random
+    _random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
 
     train_loader = _build_dataloader(
         dataset=train_data,
