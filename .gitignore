@@ -267,7 +267,6 @@ reports/strategy_v1/
 
 # Temp scripts and outputs
 temp/*.py
-temp/*.csv
 temp/*.parquet
 ind.txt
 
@@ -280,4 +279,4 @@ scripts/ensemble.py
 scripts/run_experiment.py
 scripts/select_stocks.py
 scripts/seq_len_scan.py
-scripts/strategy_v0.py
+scripts/strategy_v0.py!reports/strategy_v1/evidence/*.csv
