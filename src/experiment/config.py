@@ -13,7 +13,7 @@ Design rules:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence
 
 
 @dataclass
@@ -169,7 +169,7 @@ class ExperimentConfig:
     #
     # That function should merge:
     #   default torch settings + model-specific overrides.
-    model_params: dict[str, dict[str, float | int]] = field(default_factory=lambda: {
+    model_params: dict[str, dict[str, Any]] = field(default_factory=lambda: {
         # Tree model parameters (used by model_factory.build_experiment_model)
         "lightgbm": {
             "n_estimators": 500,
@@ -191,6 +191,18 @@ class ExperimentConfig:
             "lr": 7.5e-4,
             "wd": 0.0,
             "patience": 2,
+        },
+        "gated_dwtcn": {
+            "seq_len": 20,
+            "epochs": 20,
+            "lr": 2e-4,
+            "wd": 0.0,
+            "patience": 3,
+            "kernel_size": 3,
+            "dilations": (1, 2, 4),
+            "hidden_dim": 32,
+            "gate_rank": 8,
+            "dropout": 0.1,
         },
         "itransformer": {
             "seq_len": 40,
@@ -316,7 +328,7 @@ class ExperimentConfig:
 
         return tuple(
             m for m in self.model_names
-            if m in {"dlinear", "itransformer", "tsmixer", "patchtst"}
+            if m in {"dlinear", "gated_dwtcn", "itransformer", "tsmixer", "patchtst"}
         )
 
 

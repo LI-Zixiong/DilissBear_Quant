@@ -81,7 +81,8 @@ def get_model_params(
         "patience": config.torch_patience,
     }
 
-    overrides = config.model_params.get(model_name.lower(), {})
+    normalized_name = model_name.lower()
+    overrides = config.model_params.get(normalized_name, {})
     defaults.update(overrides)
 
     return defaults
@@ -123,9 +124,19 @@ def build_experiment_model(
                 n_estimators=int(params.get("n_estimators", 500)),
                 learning_rate=float(params.get("learning_rate", 0.01)),
                 num_leaves=int(params.get("num_leaves", 31)),
+                max_depth=int(params.get("max_depth", -1)),
+                min_child_samples=int(params.get("min_child_samples", 20)),
+                subsample=float(params.get("subsample", 0.8)),
+                subsample_freq=int(params.get("subsample_freq", 1)),
+                colsample_bytree=float(
+                    params.get("colsample_bytree", params.get("feature_fraction", 0.8))
+                ),
+                reg_alpha=float(params.get("reg_alpha", 0.0)),
+                reg_lambda=float(params.get("reg_lambda", 1.0)),
                 early_stopping_rounds=int(params.get("early_stopping_rounds", 50)),
                 verbose_eval=False,
                 random_state=seed,
+                n_jobs=int(params.get("n_jobs", -1)),
             )
         )
 
@@ -139,8 +150,9 @@ def build_experiment_model(
                 colsample_bytree=float(params.get("colsample_bytree", 0.8)),
                 reg_alpha=float(params.get("reg_alpha", 0.0)),
                 reg_lambda=float(params.get("reg_lambda", 1.0)),
+                early_stopping_rounds=params.get("early_stopping_rounds", None),
                 random_state=seed,
-                n_jobs=-1,
+                n_jobs=int(params.get("n_jobs", -1)),
             )
         )
 

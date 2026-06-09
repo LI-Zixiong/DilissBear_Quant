@@ -2,6 +2,9 @@
 Training utilities for PyTorch time-series models.
 """
 
+import os
+import random
+import shutil
 import time
 import warnings
 from dataclasses import dataclass
@@ -16,6 +19,51 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.data.dataset_builder import BuiltDataset
+
+
+def _set_torch_reproducible(seed: int) -> None:
+    """Reset Python/NumPy/PyTorch RNGs and request deterministic kernels.
+
+    This makes a torch model run independent of any RNG consumed by previous
+    models in a larger experiment. `warn_only=True` avoids crashing if PyTorch
+    hits an operation that has no deterministic implementation on the machine.
+    """
+    seed = int(seed)
+
+    # For CUDA matmul determinism; best set before CUDA context is created.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        # Older PyTorch has no warn_only argument.
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _load_state_dict_safely(path: Path, device: torch.device) -> dict:
+    """Load a checkpoint state_dict across PyTorch versions without warnings when possible."""
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        # PyTorch versions before weights_only support.
+        return torch.load(path, map_location=device)
+
 
 @dataclass
 class TorchTrainConfig:
@@ -139,12 +187,16 @@ def _compute_valid_cumret(
         for sid in top["stock_id"]:
             try:
                 r = fwd_ret.loc[(rd, sid)]
+                # Defensive handling for accidental duplicate (date, stock_id) rows.
+                if isinstance(r, pd.Series):
+                    r = r.iloc[0] if len(r) else np.nan
+                r = float(r)
                 if np.isfinite(r):
                     day_rets.append(r)
-            except KeyError:
+            except (KeyError, TypeError, ValueError):
                 continue
         if day_rets:
-            daily_rets.append(np.mean(day_rets))
+            daily_rets.append(float(np.mean(day_rets)))
 
     if not daily_rets:
         return {"cumret": np.nan, "sharpe": np.nan, "n_dates": 0}
@@ -194,17 +246,20 @@ def _build_dataloader(
     dataset: BuiltDataset,
     batch_size: int,
     shuffle: bool,
+    seed: int = 42,
 ) -> DataLoader:
     X_tensor = torch.as_tensor(dataset.X, dtype=torch.float32)
     y_tensor = torch.as_tensor(dataset.y, dtype=torch.float32).reshape(-1, 1)
 
     tensor_dataset = TensorDataset(X_tensor, y_tensor)
 
-    return DataLoader(
-        tensor_dataset, 
-        batch_size=batch_size, 
-        shuffle=shuffle
-    )
+    if shuffle:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        sampler = torch.utils.data.RandomSampler(tensor_dataset, generator=g)
+        return DataLoader(tensor_dataset, batch_size=batch_size, sampler=sampler)
+
+    return DataLoader(tensor_dataset, batch_size=batch_size, shuffle=False)
 
 def _train_one_epoch(
     model: nn.Module,
@@ -315,6 +370,10 @@ def train_torch_model(
     if config is None:
         config = TorchTrainConfig()
 
+    # Re-seed inside the training function too, so the training loop is
+    # order-invariant even when called after other models in a full experiment.
+    _set_torch_reproducible(config.seed)
+
     if not isinstance(model, nn.Module):
         raise ValueError(
             f"Invalid model. Expected a PyTorch nn.Module instance, "
@@ -327,23 +386,18 @@ def train_torch_model(
     device = _resolve_device(config.device)
     model = model.to(device)
 
-    # Reset seed post-model-init to guarantee deterministic DataLoader shuffle.
-    # nn.init in model constructors consumes torch.random state.
-    import random as _random
-    _random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
-
     train_loader = _build_dataloader(
         dataset=train_data,
         batch_size=config.batch_size,
         shuffle=config.shuffle_train,
+        seed=config.seed,
     )
 
     valid_loader = _build_dataloader(
         dataset=valid_data,
         batch_size=config.batch_size,
         shuffle=False,
+        seed=config.seed,
     )
 
     criterion = nn.MSELoss()
@@ -462,32 +516,61 @@ def train_torch_model(
             )
             break
 
-    # Composite score: 80% cumret rank + 20% sharpe rank (percentile)
+    # Composite score: 80% cumret rank + 20% sharpe rank (percentile).
+    # Keep an epoch-level CSV because it is the fastest way to verify
+    # full-run vs single-run reproducibility from epoch 1 onward.
     records_df = pd.DataFrame(epoch_records)
+    epoch_records_path = output_dir / f"{model_name}_epoch_records.csv"
     best_composite_epoch = -1
-    if len(records_df) >= 2:
-        records_df["rank_cumret"] = records_df["cumret"].rank(pct=True)
-        records_df["rank_sharpe"] = records_df["sharpe"].rank(pct=True)
-        records_df["composite"] = 0.8 * records_df["rank_cumret"] + 0.2 * records_df["rank_sharpe"]
-        best_idx = records_df["composite"].idxmax()
-        best_composite_epoch = int(records_df.loc[best_idx, "epoch"])
-        best_record = records_df.loc[best_idx]
-        best_ckpt = best_record["checkpoint"]
-        import shutil
-        shutil.copy2(best_ckpt, composite_checkpoint_path)
-        print(
-            f"[{model_name}] best_composite: epoch={best_composite_epoch}  "
-            f"cumret={best_record['cumret']:.4f}  sharpe={best_record['sharpe']:.4f}  "
-            f"composite={best_record['composite']:.4f}"
-        )
 
-    # Use composite-best checkpoint for prediction (fallback: ICIR > RMSE)
-    use_checkpoint = (composite_checkpoint_path if best_composite_epoch >= 1
-                      else icir_checkpoint_path if best_icir_epoch >= 1
-                      else checkpoint_path)
-    use_epoch = (best_composite_epoch if best_composite_epoch >= 1
-                 else best_icir_epoch if best_icir_epoch >= 1
-                 else best_rmse_epoch)
+    if not records_df.empty:
+        finite_score_df = records_df[
+            np.isfinite(records_df["cumret"].to_numpy(dtype=float))
+            & np.isfinite(records_df["sharpe"].to_numpy(dtype=float))
+        ].copy()
+
+        if len(finite_score_df) >= 1:
+            finite_score_df["rank_cumret"] = finite_score_df["cumret"].rank(pct=True)
+            finite_score_df["rank_sharpe"] = finite_score_df["sharpe"].rank(pct=True)
+            finite_score_df["composite"] = (
+                0.8 * finite_score_df["rank_cumret"]
+                + 0.2 * finite_score_df["rank_sharpe"]
+            )
+            best_idx = finite_score_df["composite"].idxmax()
+            best_composite_epoch = int(finite_score_df.loc[best_idx, "epoch"])
+            best_record = finite_score_df.loc[best_idx]
+            best_ckpt = Path(best_record["checkpoint"])
+            shutil.copy2(best_ckpt, composite_checkpoint_path)
+            print(
+                f"[{model_name}] best_composite: epoch={best_composite_epoch}  "
+                f"cumret={best_record['cumret']:.4f}  sharpe={best_record['sharpe']:.4f}  "
+                f"composite={best_record['composite']:.4f}"
+            )
+
+            records_df = records_df.merge(
+                finite_score_df[["epoch", "rank_cumret", "rank_sharpe", "composite"]],
+                on="epoch",
+                how="left",
+            )
+
+        records_to_save = records_df.copy()
+        records_to_save["checkpoint"] = records_to_save["checkpoint"].astype(str)
+        records_to_save.to_csv(epoch_records_path, index=False)
+
+    # Use composite-best checkpoint for prediction (fallback: ICIR > RMSE).
+    # The selected_* fields are deliberately returned for reports/debugging.
+    if best_composite_epoch >= 1:
+        use_checkpoint = composite_checkpoint_path
+        use_epoch = best_composite_epoch
+        selection_metric = "composite"
+    elif best_icir_epoch >= 1:
+        use_checkpoint = icir_checkpoint_path
+        use_epoch = best_icir_epoch
+        selection_metric = "icir"
+    else:
+        use_checkpoint = checkpoint_path
+        use_epoch = best_rmse_epoch
+        selection_metric = "rmse"
 
     if use_epoch < 1 or not use_checkpoint.exists():
         raise RuntimeError(
@@ -499,7 +582,7 @@ def train_torch_model(
             f"best_rmse_epoch={best_rmse_epoch}."
         )
 
-    model.load_state_dict(torch.load(use_checkpoint, map_location=device))
+    model.load_state_dict(_load_state_dict_safely(use_checkpoint, device))
 
     return {
         "final_train_loss": final_train_loss,
@@ -512,6 +595,9 @@ def train_torch_model(
         "best_cumret": best_cumret,
         "best_cumret_epoch": best_cumret_epoch,
         "best_composite_epoch": best_composite_epoch,
+        "selected_epoch": use_epoch,
+        "selection_metric": selection_metric,
+        "epoch_records_path": str(epoch_records_path),
         "train_size": int(train_data.y.shape[0]),
         "valid_size": int(valid_data.y.shape[0]),
         "model_path": str(use_checkpoint),

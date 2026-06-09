@@ -1,76 +1,85 @@
+# JulongQuant · 巨龙量化
+
+Quantitative stock-selection research framework. Pipeline: raw factor data → preprocessing → sliding-window dataset → model training → prediction → Bayes blending → backtest. PyTorch + LightGBM + XGBoost. Python 3.11. Non-commercial research license.
+
+## V2 Production (2026-06-09)
+
+**Bayes V2 Auto-Blender** — fully data-driven ensemble. Hierarchy weights and LLR clip recalibrated automatically from each 63-day rolling window. No hardcoded model-specific parameters.
+
+| Strategy | Sharpe | NAV | MaxDD | Turnover |
+|---|---|---|---|---|
+| **Bayes V2** | **1.985** | **3.163** | **16.5%** | **25.9%** |
+| gated_dwtcn | 1.895 | 2.776 | 15.8% | 15.7% |
+| EW rank 3d | 1.894 | 3.105 | 19.0% | 35.8% |
+| Rank-Ridge 3d | 1.847 | 3.038 | 19.2% | 36.7% |
+
+**Config**: smooth=3d, auto_clip p85 (≈1.31), auto_weights from top-bin positive count-weighted LLR. Rolling window=63d. Universe=ZZ500+ZZ1000 (1500 stocks). Split=0.6/0.2/0.2. Transaction costs included (buy 0.03%, sell 0.08%).
+
+## Model Zoo
+
+| Model | Type | Factors | Test Sharpe | Key traits |
+|---|---|---|---|---|
+| LGBM | tabular | 43 (no limit-up/down) | 1.83 | leaf-wise, feat_frac=0.8 |
+| XGBoost | tabular | 55 | 1.77 | colsample=0.12 forces tree diversity |
+| DLinear | torch | 30 (slow-varying) | 1.69 | seq=20, linear decomposition |
+| GatedDW-TCN | torch | 46 (interaction) | 1.90 | 3,047 params, rank-8 gate, dil=(1,2,4) |
+
 ## Project Structure
 
 ```
 JulongQuant/
-│
-├── dataset/              # Data storage
-│   ├── input/            #   CSMAR raw data, Tushare daily panel, Aindustry.xlsx
-│   ├── processed/        #   unified_daily_panel, financial_quarterly_panel, factor_panel_54
-│   └── output/           #   Experiment outputs, backtest results, tuning runs
-│
-├── mds/                  # Documentation
-│   └── FACTOR_LIBRARY.md #   54-factor library with formulas and ICIR rankings
-│
-├── reports/              # Generated experiment reports + factor audit
-│
-├── scripts/              # Runnable entry points
-│   ├── dataset/          #   Data pipeline
-│   │   ├── build_base_panel.py       Tushare + CSMAR → unified daily panel
-│   │   ├── calc_factor_panel.py       Full 54-factor computation
-│   │   ├── add_factors.py            Column extension (new factors only)
-│   │   ├── select_universe.py        1500-stock stratified selection
-│   │   └── daily_update.py           Daily incremental update
-│   ├── experiment/       #   Experiments
-│   │   ├── run_experiment.py         Single experiment entry point
-│   │   └── tune_experiment.py        Grid tuning entry point
-│   ├── evaluation/       #   Evaluation
-│   │   ├── ensemble.py              Rank-Ridge + grid ensemble
-│   │   └── check_experiment.py      Output validation
-│   ├── factor/           #   Factor analysis
-│   │   └── audit_factors.py         ICIR ranking + correlation + auto-selection
-│   └── strategy/         #   Strategy research
-│       └── strategy_v0.py           Prediction smoothing + backtest
-│
-├── src/                  # Source code
-│   ├── data/             #   Data pipeline (stable — do not modify)
-│   │   ├── loader.py             Parquet data loader
-│   │   ├── preprocess.py         Factor preprocessing
-│   │   └── dataset_builder.py    Sliding window dataset
-│   ├── models/           #   Model implementations (6 models, stable)
-│   ├── train/            #   Training logic
-│   ├── predict/          #   Prediction
-│   ├── backtest/         #   Backtesting engine
-│   ├── utils/            #   Utilities
-│   ├── experiment/       #   Experiment orchestration
-│   │   ├── config.py             ExperimentConfig dataclass
-│   │   ├── data.py               Data loading + preprocessing
-│   │   ├── split.py              Chronological date split
-│   │   ├── returns.py            Return frame construction + alignment
-│   │   ├── model_factory.py      Model construction + param resolution
-│   │   ├── runner.py             End-to-end experiment orchestrator
-│   │   ├── evaluation.py         IC/top-bottom-spread/backtest per split
-│   │   ├── report.py             Markdown report generation
-│   │   └── tuning.py             Grid search runner
-│   └── pipeline/         #   Data pipeline (reusable)
-│       ├── base_panel.py         Base panel build + incremental + checks
-│       └── factor_panel.py       54-factor compute + incremental + column extension
-│
-├── tests/                # Unit tests (25 tests)
-│
-├── .gitignore
-├── CLAUDE.md
-├── STAGE_0.md
+├── src/
+│   ├── backtest/
+│   │   ├── bayes_blender.py        V2 auto-calibrating Bayes ensemble
+│   │   ├── ensemble_methods.py     single/EW/dual/rank-ridge fusion
+│   │   ├── ensemble_utils.py       smoothing, ranking, backtest helpers
+│   │   ├── engine.py               backtest engine with transaction costs
+│   │   ├── portfolio.py            portfolio construction (top_n)
+│   │   └── metrics.py              Sharpe, MaxDD, IC, turnover
+│   ├── models/                     6 models (stable — see CLAUDE.md)
+│   ├── train/                      train_tabular + train_torch
+│   ├── predict/                    generate_predictions
+│   ├── data/                       loader, preprocess, dataset_builder (stable)
+│   ├── experiment/                 config, data, split, returns, model_factory, runner, report, tuning
+│   └── pipeline/                   base_panel, factor_panel
+├── scripts/
+│   ├── evaluation/
+│   │   └── run_full_eval.py        unified evaluation (single → EW → dual → Ridge → Bayes V2)
+│   ├── experiment/
+│   │   ├── run_experiment.py       end-to-end experiment
+│   │   └── tune_experiment.py      grid tuning
+│   └── dataset/                    build_base_panel, calc_factor_panel, select_universe, daily_update
+├── temp/                           diagnostic + scan scripts (not tracked)
+├── dataset/
+│   ├── input/                      CSMAR, Tushare, Aindustry.xlsx
+│   ├── processed/                  unified_daily_panel, factor_panel_1500_54_ind
+│   └── output/                     experiment outputs
+├── mds/                            FACTOR_LIBRARY.md
+├── reports/                        generated reports + evidence CSVs
+├── tests/                          25 tests
+├── CLAUDE.md                       project rules + stable file list
 ├── requirements.txt
-├── LICENSE
-└── README.md
+└── LICENSE
 ```
 
-## License and Disclaimer
+## Quick Reference
 
-This project is released for non-commercial research and educational use only.
+```bash
+source .venv/Scripts/activate
 
-Commercial use is prohibited without prior written permission from the authors.
+# Run full evaluation (all strategies + Bayes V2)
+python -m scripts.evaluation.run_full_eval
 
-This project is not financial advice, investment advice, trading advice, or a recommendation to buy, sell, hold, or trade any financial instrument. Backtested or simulated performance does not guarantee future results. Use at your own risk.
+# Bayes V2 only
+python -m scripts.evaluation.run_full_eval --mode bayes
 
-See [LICENSE](./LICENSE) for details.
+# Run experiment pipeline
+python -m scripts.experiment.run_experiment
+
+# Run tests
+python -m pytest tests/ -v
+```
+
+## License
+
+Non-commercial research and educational use only. Commercial use prohibited without prior written permission. Not financial advice. Backtested performance does not guarantee future results. Use at your own risk. See [LICENSE](./LICENSE).

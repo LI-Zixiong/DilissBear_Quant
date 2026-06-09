@@ -23,6 +23,8 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 # LightGBM uses np.array for features; feature names warning is just noise.
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
@@ -61,12 +63,39 @@ def _model_features(
 def _apply_feature_signs(
     df: pd.DataFrame, model_name: str, config: ExperimentConfig
 ) -> pd.DataFrame:
-    """Flip sign of specific factor columns for a model. Does NOT modify factor panel."""
-    if config.model_feature_signs and model_name in config.model_feature_signs:
-        for col, sign in config.model_feature_signs[model_name].items():
-            if col in df.columns and sign == -1:
-                df[col] = -df[col]
+    """Flip configured factor signs for one model on a caller-owned copy.
+
+    The function is intentionally strict. A typo in model_feature_signs should
+    fail fast instead of silently producing a different experiment.
+    """
+    if not config.model_feature_signs or model_name not in config.model_feature_signs:
+        return df
+
+    for col, sign in config.model_feature_signs[model_name].items():
+        if sign not in (-1, 1):
+            raise ValueError(
+                f"Invalid feature sign for {model_name}.{col}: {sign!r}. "
+                "Expected -1 or 1."
+            )
+        if col not in df.columns:
+            raise KeyError(
+                f"Feature sign configured for {model_name}.{col}, "
+                "but the column is absent from the experiment dataframe."
+            )
+        if sign == -1:
+            df[col] = -df[col]
     return df
+
+
+def _feature_sign_key(
+    model_name: str, config: ExperimentConfig
+) -> tuple[tuple[str, int], ...]:
+    """Return a hashable representation of a model's sign overrides."""
+    if not config.model_feature_signs or model_name not in config.model_feature_signs:
+        return ()
+    return tuple(
+        sorted((str(col), int(sign)) for col, sign in config.model_feature_signs[model_name].items())
+    )
 
 
 def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
@@ -200,10 +229,12 @@ def _run_tabular_models(
             meta_cols=list(config.meta_cols),
         )
 
-        train_data = builder.build_tabular_dataset(data.train_df)
-        valid_data = builder.build_tabular_dataset(data.valid_df)
-        test_data = builder.build_tabular_dataset(data.test_df)
+        train_data = builder.build_tabular_dataset(train_df)
+        valid_data = builder.build_tabular_dataset(valid_df)
+        test_data = builder.build_tabular_dataset(test_df)
 
+        # Isolate each model from RNG consumed by any previous model.
+        set_seed(config.seed)
         model = build_experiment_model(
             model_name=model_name,
             seed=config.seed,
@@ -212,11 +243,17 @@ def _run_tabular_models(
             config=config,
         )
 
+        # Reset again so training-time randomness, if any, also starts from the
+        # same state in single-model and multi-model runs.
+        set_seed(config.seed)
         train_summary = train_tabular_model(
             model=model,
             train_data=train_data,
             valid_data=valid_data,
-            output_dir=output_dir / "models",
+            # Keep checkpoints for each experiment model isolated. This avoids
+            # accidental overwrites when two model names share the same class,
+            # and makes full-vs-single debugging cleaner.
+            output_dir=output_dir / "models" / model_name,
         )
 
         valid_pred_df = generate_predictions(
@@ -296,14 +333,16 @@ def _run_torch_models(
 
     results: dict[str, dict[str, Any]] = {}
 
-    # Group by (seq_len, feature_cols) — models with same seq AND features share datasets
-    group_key: dict[str, tuple[int, tuple[str, ...]]] = {}
+    # Group by (seq_len, feature_cols, feature_signs).
+    # Signs must be part of the key; otherwise a signed model can silently reuse
+    # an unsigned dataset from another model with the same feature list.
+    group_key: dict[str, tuple[int, tuple[str, ...], tuple[tuple[str, int], ...]]] = {}
     for model_name in model_names:
         params = get_model_params(model_name, config)
         cols = _model_features(model_name, config)
-        group_key[model_name] = (int(params["seq_len"]), cols)
+        group_key[model_name] = (int(params["seq_len"]), cols, _feature_sign_key(model_name, config))
 
-    groups: dict[tuple[int, tuple[str, ...]], list[str]] = {}
+    groups: dict[tuple[int, tuple[str, ...], tuple[tuple[str, int], ...]], list[str]] = {}
     for model_name in model_names:
         groups.setdefault(group_key[model_name], []).append(model_name)
 
@@ -312,11 +351,20 @@ def _run_torch_models(
         device=config.torch_device,
     )
 
-    for (seq_len, cols), names in groups.items():
+    for (seq_len, cols, _sign_key), names in groups.items():
         print(
             f"\nBuilding sequence datasets "
             f"(seq_len={seq_len}, n_feat={len(cols)}) for: {', '.join(names)}..."
         )
+
+        # Apply signs once per compatible group, on copies only.
+        sign_model = names[0]
+        train_df = data.train_df.copy()
+        valid_df = data.valid_df.copy()
+        test_df = data.test_df.copy()
+        _apply_feature_signs(train_df, sign_model, config)
+        _apply_feature_signs(valid_df, sign_model, config)
+        _apply_feature_signs(test_df, sign_model, config)
 
         builder = PanelDatasetBuilder(
             feature_cols=list(cols),
@@ -327,15 +375,30 @@ def _run_torch_models(
             meta_cols=list(config.meta_cols),
         )
 
-        train_data = builder.build_sequence_dataset(data.train_df)
-        valid_data = builder.build_sequence_dataset(data.valid_df)
-        test_data = builder.build_sequence_dataset(data.test_df)
+        # Build sequence windows on the concatenated chronological panel, then
+        # split by the window end date. This keeps validation/test warm-up
+        # history available without leaking future targets: each sample still
+        # belongs to the split of its endpoint row.
+        train_data, valid_data, test_data = builder.build_sequence_splits_from_frames(
+            train_df=train_df,
+            valid_df=valid_df,
+            test_df=test_df,
+        )
+        if valid_data is None or test_data is None:
+            raise RuntimeError(
+                "Failed to build non-empty valid/test sequence datasets. "
+                f"seq_len={seq_len}, models={names}"
+            )
 
         for model_name in names:
             print(f"\nRunning model: {model_name}")
 
             params = get_model_params(model_name, config)
 
+            # IMPORTANT: reset BEFORE model construction.
+            # Otherwise the initial weights depend on RNG consumed by earlier
+            # models (e.g. DLinear before GatedDWTCN in the full run).
+            set_seed(config.seed)
             model = build_experiment_model(
                 model_name=model_name,
                 seed=config.seed,
@@ -344,12 +407,14 @@ def _run_torch_models(
                 config=config,
             )
 
-            set_seed(config.seed)  # reset seed per model for reproducibility
+            # Reset again so training-time randomness (dropout, CUDA kernels,
+            # DataLoader shuffling if enabled) is also independent of model order.
+            set_seed(config.seed)
             train_summary = train_torch_model(
                 model=model,
                 train_data=train_data,
                 valid_data=valid_data,
-                output_dir=output_dir / "models",
+                output_dir=output_dir / "models" / model_name,
                 config=TorchTrainConfig(
                     epochs=int(params["epochs"]),
                     patience=int(params.get("patience", config.torch_patience)),

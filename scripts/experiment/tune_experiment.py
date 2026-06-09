@@ -50,9 +50,9 @@ if __name__ == "__main__":
         meta_cols=("industry_sw", "list_date", "ret_daily"),
 
         # This can be overwritten by GRID.
-        model_names=("gated_dwtcn",),
+        model_names=("xgboost",),
         model_feature_cols={
-            "gated_dwtcn": (
+            "lightgbm": (
                 "F002SIZENL", "F003LIQUIDITY", "F004BETA",
                 "F005RESVOL", "F007LTREV", "F008STREV",
                 "F010VALUE", "F011EARNYLD", "F012GROWTH",
@@ -64,11 +64,10 @@ if __name__ == "__main__":
                 "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
                 "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
                 "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
-                "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
                 "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
                 "F055IND",
             ),
-            "xgboost": (
+            "gated_dwtcn": (
                 "F002SIZENL", "F003LIQUIDITY", "F004BETA",
                 "F005RESVOL", "F007LTREV", "F008STREV",
                 "F010VALUE", "F011EARNYLD", "F012GROWTH",
@@ -147,11 +146,12 @@ if __name__ == "__main__":
                 "early_stopping_rounds": 50,
             },
             "xgboost": {
-                "n_estimators": 500,
+                "n_estimators": 1000,
                 "max_depth": 5,
                 "learning_rate": 0.01,
                 "subsample": 0.8,
-                "colsample_bytree": 0.8,
+                "colsample_bytree": 0.12,
+                "early_stopping_rounds": 100,
             },
             "dlinear": {
                 "seq_len": 15,
@@ -163,7 +163,7 @@ if __name__ == "__main__":
             "gated_dwtcn": {
                 "seq_len": 20,
                 "epochs": 15,
-                "lr": 5e-4,
+                "lr": 2e-4,
                 "wd": 0.0,
                 "patience": 2,
                 "kernel_size": 3,
@@ -218,14 +218,13 @@ if __name__ == "__main__":
     #
     GRID = {
         "model_names": [
-            ("gated_dwtcn",),
+            ("xgboost",),
         ],
-        "model_params.gated_dwtcn.lr": [5e-4],
-        "model_params.gated_dwtcn.epochs": [15],
-        "model_params.gated_dwtcn.dilations": [(1,2,4)],
+        "model_params.xgboost.learning_rate": [0.005, 0.01, 0.02],
+        "model_params.xgboost.max_depth": [3, 5, 7],
     }
 
-    tuning_name = "gated_dwtcn_lr"
+    tuning_name = "xgb_lr_depth"
 
     run_grid_search(
         base_config=BASE_CONFIG,

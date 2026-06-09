@@ -52,7 +52,7 @@ if __name__ == "__main__":
         # Active models
         # ──────────────────────────────────────────────────────────
         #  Current default: LightGBM + Xgboost +DLinear + GatedDWTCN (2026-06-04)
-        model_names=("lightgbm", "xgboost", "dlinear", "gated_dwtcn"),
+        model_names=("xgboost", "gated_dwtcn"),
 
         #  To run a single model (e.g. LGBM only):
         #  model_names=("lightgbm",)
@@ -176,17 +176,17 @@ if __name__ == "__main__":
             "lightgbm": {
                 "n_estimators":          1000,
                 "learning_rate":         0.01,
-                "num_leaves":            31,
-                "early_stopping_rounds": 50,
+                "num_leaves":            15,
+                "early_stopping_rounds": 100,
                 "feature_fraction":      0.8,
             },
             "xgboost": {
                 "n_estimators":          1000,
                 "max_depth":             5,
-                "learning_rate":         0.01,
+                "learning_rate":         0.02,
                 "subsample":             0.8,
                 "colsample_bytree":      0.12,
-                "early_stopping_rounds": 50,
+                "early_stopping_rounds": 100,
             },
 
             # ---- Torch models (override torch defaults above) ----
@@ -199,8 +199,8 @@ if __name__ == "__main__":
             },
             "gated_dwtcn": {
                 "seq_len":   20,
-                "epochs":    15,
-                "lr":        5e-4,
+                "epochs":    20,
+                "lr":        2e-4,
                 "wd":        0.0,
                 "patience":  3,
                 "kernel_size": 3,

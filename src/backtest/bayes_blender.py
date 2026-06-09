@@ -75,16 +75,20 @@ class BayesBlenderConfig:
     laplace_alpha_strong: float = 10.0
     laplace_alpha_other: float = 20.0
 
-    # V1: raised from 1.0 to 2.0 — 63-78% of industry bin7 groups were
-    # saturated at +1.0 (diagnostic report, 2026-06-06).
+    # V2 manual clip (fallback when auto_clip=False).
     llr_clip: float = 2.0
+
+    # V2: auto-calibrate clip and hierarchy weights from data.
+    # clip = max(0.5, percentile(|LLR|, clip_percentile)) each window.
+    # hierarchy weights = normalized positive top-bin count-weighted LLR.
+    auto_clip: bool = True
+    auto_weights: bool = True
+    clip_percentile: float = 85.0  # p85 optimal in smooth=3 scan (2026-06-09)
 
     min_group_total: int = 300
     min_group_head: int = 20
 
-    # V1: per-model (global, sector, industry) weights.
-    # XGBoost/DLinear have strong global + industry head prediction.
-    # LGBM/GatedDW have near-zero global LLR but strong industry LLR.
+    # V2 manual per-model hierarchy weights (fallback when auto_weights=False).
     model_weights: dict = field(default_factory=lambda: {
         "xgboost": {
             "strong":       (0.25, 0.20, 0.55),
@@ -131,6 +135,9 @@ class IndustryBayesCalibrator:
         if self.rank_bins[0] > 0.0 or self.rank_bins[-1] < 1.0:
             raise ValueError("rank_bins should cover [0, 1].")
         self.n_bins = len(self.rank_bins) - 1
+        self._auto_clip: float = self.cfg.llr_clip
+        self._auto_weights: dict = {}
+        self.params_history: list[dict] = []
         self._reset()
 
     def _reset(self) -> None:
@@ -149,6 +156,9 @@ class IndustryBayesCalibrator:
         from collections import deque
         self._daily_counts: deque[list] = deque()
         self._current_window_size: int = 0
+        self._auto_clip = self.cfg.llr_clip
+        self._auto_weights = {}
+        self.params_history = []
 
     # ── public API ────────────────────────────────────────────
 
@@ -181,6 +191,8 @@ class IndustryBayesCalibrator:
                 table, groups, meta = self._estimate(df, level=level, group_col=gcol)
                 self._t[level][m] = (table, groups)
                 self._meta[level][m] = meta
+
+        self._finalize_tables()
 
     # ── incremental update ────────────────────────────────────
 
@@ -259,11 +271,114 @@ class IndustryBayesCalibrator:
                     ph = np.maximum(1e-12, (hd + alpha) / (hn + alpha * self.n_bins))
                     pn = np.maximum(1e-12, (nh + alpha) / (nn + alpha * self.n_bins))
                     llr = np.log(ph / pn)
-                    llr = np.clip(llr, -self.cfg.llr_clip, self.cfg.llr_clip)
-                    tbl[:, gi] = llr
+                    tbl[:, gi] = llr  # raw — clip deferred to _finalize_tables()
                     mt[grp] = {"total": total, "head": hn, "not_head": nn}
                 self._t[level][m] = (tbl, grps)
                 self._meta[level][m] = mt
+        self._finalize_tables()
+
+    # ── auto-parameter calibration ──────────────────────────────
+
+    def _finalize_tables(self) -> None:
+        """Compute auto_clip + auto_weights from raw LLR tables, then clip in-place.
+
+        clip = max(0.5, percentile(|LLR|, clip_percentile)) — floor 0.5 prevents degenerate
+        near-zero clip under extreme regularisation.
+        """
+        # 1. Collect all raw LLR values
+        all_vals = []
+        for level in ["global", "sector", "industry"]:
+            for m in self.models:
+                tbl, _ = self._t[level].get(m, (None, None))
+                if tbl is not None:
+                    all_vals.append(tbl.ravel())
+
+        if all_vals:
+            combined = np.concatenate(all_vals)
+            finite = combined[np.isfinite(combined)]
+            if self.cfg.auto_clip and len(finite) > 0:
+                self._auto_clip = max(0.5, float(np.percentile(np.abs(finite), self.cfg.clip_percentile)))
+            else:
+                self._auto_clip = float(self.cfg.llr_clip)
+        else:
+            self._auto_clip = float(self.cfg.llr_clip)
+
+        # 2. Clip all tables
+        for level in ["global", "sector", "industry"]:
+            for m in self.models:
+                if m in self._t[level]:
+                    tbl, grps = self._t[level][m]
+                    if tbl is not None:
+                        self._t[level][m] = (
+                            np.clip(tbl, -self._auto_clip, self._auto_clip),
+                            grps,
+                        )
+
+        # 3. Auto weights from clipped tables
+        if self.cfg.auto_weights:
+            self._auto_weights = self._compute_auto_weights()
+        else:
+            self._auto_weights = {}
+
+        # 4. Log
+        self.params_history.append({
+            "auto_clip": self._auto_clip,
+            "auto_weights": {
+                m: {
+                    "global": self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[0],
+                    "sector": self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[1],
+                    "industry": self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[2],
+                }
+                for m in self.models
+            } if self.cfg.auto_weights else {},
+        })
+
+    def _compute_auto_weights(self) -> dict:
+        """Per-model hierarchy weights from positive top-bin count-weighted LLR.
+
+        For each (model, level), average positive LLR in bins 6-7 (0.97-1.00),
+        weighted by per-group sample count. Normalize into (wg, ws, wi) per model.
+        """
+        top_bi = self.n_bins - 2  # bin 6 (0.97-0.99)
+        weights = {}
+
+        for m in self.models:
+            strengths: dict[str, float] = {}
+            for level in ["global", "sector", "industry"]:
+                tbl, grps = self._t[level].get(m, (None, None))
+                if tbl is None or not grps:
+                    strengths[level] = 1e-6
+                    continue
+                meta = self._meta[level].get(m, {})
+                pos_sum = 0.0
+                total_w = 0.0
+                for gi, grp in enumerate(grps):
+                    count = meta.get(str(grp), {}).get("total", 0)
+                    if count <= 0:
+                        continue
+                    llr_b6 = tbl[top_bi, gi]
+                    llr_b7 = tbl[top_bi + 1, gi]
+                    for llr_val in (llr_b6, llr_b7):
+                        if np.isfinite(llr_val) and llr_val > 0:
+                            pos_sum += count * llr_val
+                            total_w += count
+                strengths[level] = pos_sum / total_w if total_w > 0 else 1e-6
+
+            total = strengths["global"] + strengths["sector"] + strengths["industry"]
+            if total <= 0:
+                total = 1.0
+            wg = strengths["global"] / total
+            ws = strengths["sector"] / total
+            wi = strengths["industry"] / total
+            weights[m] = {
+                "strong": (wg, ws, wi),
+                "weak": (wg, ws, wi),
+                "small": (wg, ws, wi),
+                "global_only": (1.0, 0.0, 0.0),
+            }
+        return weights
+
+    # ── scoring ─────────────────────────────────────────────────
 
     def score(self, today: pd.DataFrame, today_ranks: dict[str, pd.DataFrame]) -> pd.Series:
         """
@@ -343,7 +458,8 @@ class IndustryBayesCalibrator:
             cols[f"{m}_llr_sector"]   = sl
             cols[f"{m}_llr_industry"] = il
 
-            wg, ws, wi = self._weights_many(m, industries, self.cfg.model_weights)
+            wmap = self._auto_weights if (self.cfg.auto_weights and self._auto_weights) else self.cfg.model_weights
+            wg, ws, wi = self._weights_many(m, industries, wmap)
             contrib = wg * gl + ws * sl + wi * il
             cols[f"{m}_llr_blended"] = contrib
             total += contrib
@@ -419,7 +535,8 @@ class IndustryBayesCalibrator:
             fallback=sl, require_quality=True,
         )
 
-        wg, ws, wi = self._weights_many(model, inds.astype(str), self.cfg.model_weights)
+        wmap = self._auto_weights if (self.cfg.auto_weights and self._auto_weights) else self.cfg.model_weights
+        wg, ws, wi = self._weights_many(model, inds.astype(str), wmap)
         return wg * gl + ws * sl + wi * il
 
     def _lookup_many(
@@ -522,7 +639,7 @@ class IndustryBayesCalibrator:
             p_n = (not_b + alpha) / (not_n + alpha * nb)
 
             llr = np.log(p_h / p_n)
-            table[:, gi] = np.clip(llr, -self.cfg.llr_clip, self.cfg.llr_clip)
+            table[:, gi] = llr  # raw — clip deferred to _finalize_tables()
             meta[str(grp)] = {"total": total, "head": head_n, "not_head": not_n}
 
         return table, [str(g) for g in groups], meta

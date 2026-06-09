@@ -35,6 +35,7 @@ MODELS = ["lightgbm", "xgboost", "dlinear", "gated_dwtcn"]
 @dataclass
 class EvalConfig:
     eval_split: str = "test"
+    mode: str = "full"  # "full" | "bayes"
     smooth_window: int = 3
     top_n: int = 50
     bayes_window: int = 63
@@ -195,6 +196,11 @@ def _run_bayes_v1(
 
     all_scores = pd.concat(scores_list, ignore_index=True)
     all_scores["stock_id"] = all_scores["stock_id"].astype(str).str.strip().str.zfill(6)
+
+    # Save daily Bayes scores
+    score_out = cfg.output_dir / f"bayes_scores_{cfg.eval_split}.parquet"
+    all_scores.to_parquet(score_out, index=False)
+
     return backtest_score(all_scores.rename(columns={"bayes_score": "_bayes"}), returns, "_bayes", cfg.top_n)
 
 
@@ -204,6 +210,7 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser()
     # All parameters have defaults in EvalConfig.  Only override when needed.
+    parser.add_argument("--mode", default=None, choices=["full", "bayes"])
     parser.add_argument("--eval-split", default=None)
     parser.add_argument("--bayes-window", type=int, default=None)
     parser.add_argument("--bayes-clip", type=float, default=None)
@@ -212,6 +219,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = EvalConfig()
+    if args.mode is not None:             cfg.mode = args.mode
     if args.eval_split is not None:       cfg.eval_split = args.eval_split
     if args.bayes_window is not None:     cfg.bayes_window = args.bayes_window
     if args.bayes_clip is not None:       cfg.bayes_clip = args.bayes_clip
@@ -231,56 +239,58 @@ def main() -> None:
 
     rows = []
 
-    # ── Single models ──
-    print("\n[2/6] Single models ...")
-    import time as _t
-    sm_results = {}
-    for m in MODELS:
-        _t0 = _t.perf_counter()
-        sm_results[m] = single_model(preds, returns, [m], cfg.smooth_window, cfg.top_n)[m]
-        print(f"  {m:>12s}: elapsed={_t.perf_counter()-_t0:.0f}s")
-    for m, s in sm_results.items():
-        rows.append({"strategy": m, **{k: s.get(k, None) for k in
+    if cfg.mode == "full":
+        # ── Single models ──
+        print("\n[2/6] Single models ...")
+        import time as _t
+        sm_results = {}
+        for m in MODELS:
+            _t0 = _t.perf_counter()
+            sm_results[m] = single_model(preds, returns, [m], cfg.smooth_window, cfg.top_n)[m]
+            print(f"  {m:>12s}: elapsed={_t.perf_counter()-_t0:.0f}s")
+        for m, s in sm_results.items():
+            rows.append({"strategy": m, **{k: s.get(k, None) for k in
+                           ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
+                            "annualized_return", "hit_rate"]}})
+            print(f"  {m:>12s}: Sharpe={s.get('sharpe_ratio',0):.4f}  NAV={s.get('final_nav',0):.4f}")
+
+        # ── EW ──
+        print("\n[3/6] Equal-weight rank 3d ...")
+        ew = equal_weight(preds, returns, MODELS, cfg.smooth_window, cfg.top_n)
+        rows.append({"strategy": "EW rank 3d", **{k: ew.get(k, None) for k in
                        ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
                         "annualized_return", "hit_rate"]}})
-        print(f"  {m:>12s}: Sharpe={s.get('sharpe_ratio',0):.4f}  NAV={s.get('final_nav',0):.4f}")
+        print(f"  EW rank 3d: Sharpe={ew.get('sharpe_ratio',0):.4f}  NAV={ew.get('final_nav',0):.4f}")
 
-    # ── EW ──
-    print("\n[3/6] Equal-weight rank 3d ...")
-    ew = equal_weight(preds, returns, MODELS, cfg.smooth_window, cfg.top_n)
-    rows.append({"strategy": "EW rank 3d", **{k: ew.get(k, None) for k in
-                   ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
-                    "annualized_return", "hit_rate"]}})
-    print(f"  EW rank 3d: Sharpe={ew.get('sharpe_ratio',0):.4f}  NAV={ew.get('final_nav',0):.4f}")
+        # ── LGBM+XGB ──
+        print("\n[4/6] LGBM+XGB rank 3d ...")
+        dual = dual_model(preds, returns, MODELS, cfg.smooth_window, cfg.top_n)
+        rows.append({"strategy": "LGBM+XGB rank 3d", **{k: dual.get(k, None) for k in
+                         ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
+                          "annualized_return", "hit_rate"]}})
+        print(f"  LGBM+XGB: Sharpe={dual.get('sharpe_ratio',0):.4f}  NAV={dual.get('final_nav',0):.4f}")
 
-    # ── LGBM+XGB ──
-    print("\n[4/6] LGBM+XGB rank 3d ...")
-    dual = dual_model(preds, returns, MODELS, cfg.smooth_window, cfg.top_n)
-    rows.append({"strategy": "LGBM+XGB rank 3d", **{k: dual.get(k, None) for k in
-                     ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
-                      "annualized_return", "hit_rate"]}})
-    print(f"  LGBM+XGB: Sharpe={dual.get('sharpe_ratio',0):.4f}  NAV={dual.get('final_nav',0):.4f}")
+        # ── Rank-Ridge ──
+        print("\n[5/6] Rank-Ridge 3d ...")
+        if cfg.eval_split == "test":
+            valid_preds = _load_valid_predictions(cfg)
+            rr, rr_w = rank_ridge(preds, returns, MODELS, valid_preds, cfg.smooth_window, cfg.top_n)
+        else:
+            rr, rr_w = rank_ridge(preds, returns, MODELS, preds, cfg.smooth_window, cfg.top_n)
+        rows.append({"strategy": "Rank-Ridge 3d", **{k: rr.get(k, None) for k in
+                         ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
+                          "annualized_return", "hit_rate"]}})
+        print(f"  RR: Sharpe={rr.get('sharpe_ratio',0):.4f}  NAV={rr.get('final_nav',0):.4f}")
+        print(f"  weights: " + " ".join(f"{m}={rr_w[m]:.3f}" for m in MODELS))
 
-    # ── Rank-Ridge ──
-    print("\n[5/6] Rank-Ridge 3d ...")
-    if cfg.eval_split == "test":
-        valid_preds = _load_valid_predictions(cfg)
-        rr, rr_w = rank_ridge(preds, returns, MODELS, valid_preds, cfg.smooth_window, cfg.top_n)
-    else:
-        rr, rr_w = rank_ridge(preds, returns, MODELS, preds, cfg.smooth_window, cfg.top_n)
-    rows.append({"strategy": "Rank-Ridge 3d", **{k: rr.get(k, None) for k in
-                     ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
-                      "annualized_return", "hit_rate"]}})
-    print(f"  RR: Sharpe={rr.get('sharpe_ratio',0):.4f}  NAV={rr.get('final_nav',0):.4f}")
-    print(f"  weights: " + " ".join(f"{m}={rr_w[m]:.3f}" for m in MODELS))
-
-    # ── Bayes V1 ──
-    print("\n[6/6] Bayes V1 (rolling) ...")
+    # ── Bayes V2 ──
+    step_label = "6/6" if cfg.mode == "full" else "2/2"
+    print(f"\n[{step_label}] Bayes V2 (rolling) ...")
     bayes_result = _run_bayes_v1(preds, returns, ind_panel, cfg)
-    rows.append({"strategy": "Bayes V1", **{k: bayes_result.get(k, None) for k in
+    rows.append({"strategy": "Bayes V2", **{k: bayes_result.get(k, None) for k in
                     ["sharpe_ratio", "final_nav", "max_drawdown", "mean_turnover",
                      "annualized_return", "hit_rate"]}})
-    print(f"  Bayes V1: Sharpe={bayes_result.get('sharpe_ratio',0):.4f}  NAV={bayes_result.get('final_nav',0):.4f}")
+    print(f"  Bayes V2: Sharpe={bayes_result.get('sharpe_ratio',0):.4f}  NAV={bayes_result.get('final_nav',0):.4f}")
 
     # ── Save ──
     results_df = pd.DataFrame(rows)

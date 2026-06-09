@@ -50,6 +50,9 @@ class XGBoostConfig:
         if self.reg_lambda < 0:
             raise ValueError("reg_lambda must be >= 0")
 
+        if self.early_stopping_rounds is not None and self.early_stopping_rounds < 1:
+            raise ValueError("early_stopping_rounds must be None or >= 1")
+
 class XGBoostReturnRegressor:
     """
     XGBoost wrapper for stock return regression.
