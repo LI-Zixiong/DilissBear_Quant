@@ -230,6 +230,7 @@ def run_backtest(
         weights = build_portfolio_weights(
             pred_df=daily_pred,
             config=portfolio_config,
+            previous_weights=previous_weights,
         )
 
         next_returns = return_lookup[return_date]

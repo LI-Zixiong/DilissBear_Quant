@@ -52,7 +52,7 @@ if __name__ == "__main__":
         # Active models
         # ──────────────────────────────────────────────────────────
         #  Current default: LightGBM + Xgboost +DLinear + GatedDWTCN (2026-06-04)
-        model_names=("xgboost", "gated_dwtcn"),
+        model_names=("lightgbm",),
 
         #  To run a single model (e.g. LGBM only):
         #  model_names=("lightgbm",)
@@ -176,7 +176,7 @@ if __name__ == "__main__":
             "lightgbm": {
                 "n_estimators":          1000,
                 "learning_rate":         0.01,
-                "num_leaves":            15,
+                "num_leaves":            31,
                 "early_stopping_rounds": 100,
                 "feature_fraction":      0.8,
             },

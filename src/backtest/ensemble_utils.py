@@ -350,7 +350,10 @@ def add_weighted_rank_score(
 # ---------------------------------------------------------------------------
 
 
-def backtest_score(df: pd.DataFrame, returns: pd.DataFrame, score_col: str, top_n: int) -> dict:
+def backtest_score(
+    df: pd.DataFrame, returns: pd.DataFrame, score_col: str, top_n: int,
+    portfolio_config: PortfolioConfig | None = None,
+) -> dict:
     """Backtest score column using realized next-day return_1d."""
     pred = df[["time", "stock_id", score_col]].rename(columns={score_col: "y_pred"}).dropna()
     aligned = align_predictions_to_returns(
@@ -361,7 +364,8 @@ def backtest_score(df: pd.DataFrame, returns: pd.DataFrame, score_col: str, top_
         pred_col="y_pred",
         return_col="return_1d",
     )
-    portfolio_config = PortfolioConfig(strategy="top_n", top_n=top_n, pred_col="y_pred", stock_col="stock_id")
+    if portfolio_config is None:
+        portfolio_config = PortfolioConfig(strategy="top_n", top_n=top_n, pred_col="y_pred", stock_col="stock_id")
     return run_backtest(
         pred_df=aligned,
         returns_df=returns,

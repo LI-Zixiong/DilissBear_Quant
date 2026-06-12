@@ -1,85 +1,60 @@
 # JulongQuant · 巨龙量化
 
-Quantitative stock-selection research framework. Pipeline: raw factor data → preprocessing → sliding-window dataset → model training → prediction → Bayes blending → backtest. PyTorch + LightGBM + XGBoost. Python 3.11. Non-commercial research license.
+A-share quantitative stock-selection research framework. Pipeline: factor data → model training → Bayes blending → account-level real backtest.
 
-## V2 Production (2026-06-09)
+> **V1** — 6/2026. Open-to-open execution, smart-hold, FF5 attribution. Sharpe 1.42 real, alpha 13.3%/yr after factor controls.
 
-**Bayes V2 Auto-Blender** — fully data-driven ensemble. Hierarchy weights and LLR clip recalibrated automatically from each 63-day rolling window. No hardcoded model-specific parameters.
+## Results (real backtest, 2024-03 ~ 2026-06)
 
-| Strategy | Sharpe | NAV | MaxDD | Turnover |
+| | Sharpe | NAV | MaxDD | Notes |
 |---|---|---|---|---|
-| **Bayes V2** | **1.985** | **3.163** | **16.5%** | **25.9%** |
-| gated_dwtcn | 1.895 | 2.776 | 15.8% | 15.7% |
-| EW rank 3d | 1.894 | 3.105 | 19.0% | 35.8% |
-| Rank-Ridge 3d | 1.847 | 3.038 | 19.2% | 36.7% |
+| **Strategy (real)** | **1.42** | **2.03** | 14.8% | open-to-open, smart-hold, budget lots |
+| Strategy (paper) | 2.00 | 3.26 | 15.0% | close-to-close, continuous weights |
+| ZZ500 | — | 1.46 | — | benchmark |
+| ZZ1000 | — | 1.45 | — | benchmark |
 
-**Config**: smooth=3d, auto_clip p85 (≈1.31), auto_weights from top-bin positive count-weighted LLR. Rolling window=63d. Universe=ZZ500+ZZ1000 (1500 stocks). Split=0.6/0.2/0.2. Transaction costs included (buy 0.03%, sell 0.08%).
+**FF5 Alpha**: 13.3%/yr (t=2.69, Newey-West). Selection residual Sharpe **1.91**, market-neutral (corr -0.13).  
+See `reports/strategy_v1/V1_REPORT.md` for full attribution.
 
-## Model Zoo
+## Stack
 
-| Model | Type | Factors | Test Sharpe | Key traits |
-|---|---|---|---|---|
-| LGBM | tabular | 43 (no limit-up/down) | 1.83 | leaf-wise, feat_frac=0.8 |
-| XGBoost | tabular | 55 | 1.77 | colsample=0.12 forces tree diversity |
-| DLinear | torch | 30 (slow-varying) | 1.69 | seq=20, linear decomposition |
-| GatedDW-TCN | torch | 46 (interaction) | 1.90 | 3,047 params, rank-8 gate, dil=(1,2,4) |
+Python 3.11, PyTorch, LightGBM, XGBoost. 6 models (LGBM, XGBoost, DLinear, iTransformer, PatchTST, GatedDW-TCN). Bayes V2 rolling-window ensemble. Account-based real backtest with integer lots, limit filters, and smart-hold.
 
-## Project Structure
-
-```
-JulongQuant/
-├── src/
-│   ├── backtest/
-│   │   ├── bayes_blender.py        V2 auto-calibrating Bayes ensemble
-│   │   ├── ensemble_methods.py     single/EW/dual/rank-ridge fusion
-│   │   ├── ensemble_utils.py       smoothing, ranking, backtest helpers
-│   │   ├── engine.py               backtest engine with transaction costs
-│   │   ├── portfolio.py            portfolio construction (top_n)
-│   │   └── metrics.py              Sharpe, MaxDD, IC, turnover
-│   ├── models/                     6 models (stable — see CLAUDE.md)
-│   ├── train/                      train_tabular + train_torch
-│   ├── predict/                    generate_predictions
-│   ├── data/                       loader, preprocess, dataset_builder (stable)
-│   ├── experiment/                 config, data, split, returns, model_factory, runner, report, tuning
-│   └── pipeline/                   base_panel, factor_panel
-├── scripts/
-│   ├── evaluation/
-│   │   └── run_full_eval.py        unified evaluation (single → EW → dual → Ridge → Bayes V2)
-│   ├── experiment/
-│   │   ├── run_experiment.py       end-to-end experiment
-│   │   └── tune_experiment.py      grid tuning
-│   └── dataset/                    build_base_panel, calc_factor_panel, select_universe, daily_update
-├── temp/                           diagnostic + scan scripts (not tracked)
-├── dataset/
-│   ├── input/                      CSMAR, Tushare, Aindustry.xlsx
-│   ├── processed/                  unified_daily_panel, factor_panel_1500_54_ind
-│   └── output/                     experiment outputs
-├── mds/                            FACTOR_LIBRARY.md
-├── reports/                        generated reports + evidence CSVs
-├── tests/                          25 tests
-├── CLAUDE.md                       project rules + stable file list
-├── requirements.txt
-└── LICENSE
-```
-
-## Quick Reference
+## Quick Start
 
 ```bash
 source .venv/Scripts/activate
 
-# Run full evaluation (all strategies + Bayes V2)
-python -m scripts.evaluation.run_full_eval
+# Run real backtest (budget mode)
+python -m scripts.evaluation.real_backtest --position-sizing budget
 
-# Bayes V2 only
-python -m scripts.evaluation.run_full_eval --mode bayes
+# Full evaluation sweep
+python -m scripts.evaluation.run_full_eval --mode full
 
-# Run experiment pipeline
-python -m scripts.experiment.run_experiment
+# FF5 attribution
+python temp/build_ff5_factors.py
+python temp/ff5_attribution.py
+```
 
-# Run tests
-python -m pytest tests/ -v
+## Structure
+
+```
+src/
+  backtest/     real_backtest (account engine), bayes_blender, ensemble, portfolio, metrics
+  models/       6 models (stable)
+  pipeline/     base_panel, factor_panel
+  utils/        seed, logger, stats (Newey-West)
+scripts/
+  evaluation/   run_full_eval, real_backtest
+  dataset/      build pipelines, daily_update
+  experiment/   run_experiment, tune_experiment
+dataset/
+  input/        CSMAR, Tushare, indices (gitignored)
+  processed/    unified_daily_panel, factor_panel, ff5_factors (gitignored)
+reports/
+  strategy_v1/  V1_REPORT.md, evidence/
 ```
 
 ## License
 
-Non-commercial research and educational use only. Commercial use prohibited without prior written permission. Not financial advice. Backtested performance does not guarantee future results. Use at your own risk. See [LICENSE](./LICENSE).
+Non-commercial research and educational use only. Not financial advice. Backtested performance does not guarantee future results. See [LICENSE](./LICENSE).

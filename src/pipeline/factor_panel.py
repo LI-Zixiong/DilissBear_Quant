@@ -366,14 +366,18 @@ def append_factor_panel_rows(
         recompute_window = config.incremental_window
 
     existing = standardize_panel_keys(existing_factor_panel, config)
-    base = standardize_panel_keys(updated_base_panel, config)
     financial = standardize_financial_keys(financial_quarterly, config)
 
     if existing.empty:
         raise ValueError("existing_factor_panel is empty")
 
     last_factor_date = existing[config.date_col].max()
-    all_dates = pd.DatetimeIndex(base[config.date_col].dropna().unique()).sort_values()
+
+    # Avoid copying the full base panel — only extract dates to find warmup range
+    base_dates = pd.to_datetime(
+        updated_base_panel[config.date_col], errors="raise"
+    ).dt.normalize()
+    all_dates = pd.DatetimeIndex(base_dates.dropna().unique()).sort_values()
 
     if last_factor_date not in set(all_dates):
         raise ValueError(
@@ -384,7 +388,8 @@ def append_factor_panel_rows(
     start_pos = max(0, last_pos - recompute_window)
     warmup_start_date = all_dates[start_pos]
 
-    base_slice = base[base[config.date_col] >= warmup_start_date].copy()
+    base_slice = updated_base_panel[base_dates >= warmup_start_date]
+    base_slice = standardize_panel_keys(base_slice, config).copy()
 
     recomputed = compute_factor_columns(
         base_panel=base_slice,
@@ -399,8 +404,10 @@ def append_factor_panel_rows(
             if col in targets.columns:
                 recomputed[col] = targets[col]
     elif config.mode == "live":
+        targets = build_targets(recomputed, config)
         for col in config.target_names:
-            recomputed[col] = np.nan
+            if col in targets.columns:
+                recomputed[col] = targets[col]
     else:
         raise ValueError(f"Unsupported mode: {config.mode}")
 

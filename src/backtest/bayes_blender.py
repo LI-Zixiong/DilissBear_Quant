@@ -9,14 +9,22 @@ is that stock to be a future head-winner?"
 Design:
     Global models (no retrain) -> daily rank_pct per model
     -> rolling-window LLR calibration at global / sector / industry levels
-    -> Naive Bayes score with shrinkage, clip, and temperature
+    -> Naive Bayes score with auto alpha, auto clip, and auto hierarchy weights.
 
 Key choices:
     1. H = future 1d return in top 5% (handled by the runner)
     2. Rolling calibration avoids fixed-valid-regime overfitting
     3. No industry prior by default (no direct sector timing)
-    4. Per-size-class Laplace alpha, LLR clip=1.0
-       (tau removed — applied post-sum, equal for all stocks → no-op for ranking)
+    4. tau removed — applied post-sum, equal for all stocks -> no-op for ranking
+
+V2.1 implementation notes:
+    - SW2021 sector map fixed.
+    - GLOBAL_ONLY fixed to {"51", "-1"}; 77 is beauty care, not global.
+    - Auto weights keep across-model per-level normalisation.
+    - Added level-budget gate: first decide which hierarchy level is useful,
+      then decide which model is useful within that level.
+    - global_only names only use global LLR and respect auto-learned global
+      model weights.
 """
 
 from __future__ import annotations
@@ -29,32 +37,78 @@ import pandas as pd
 
 
 # ------------------------------------------------------------------
-# Sector & industry classification
+# Sector & industry classification — SW2021 first-level industry code
 # ------------------------------------------------------------------
 
 SECTOR_MAP: dict[str, str] = {
-    "63": "TMT", "61": "TMT", "62": "TMT",
-    "64": "MFG", "71": "MFG", "24": "MFG", "65": "MFG",
-    "37": "CYCLICAL", "22": "CYCLICAL", "28": "CYCLICAL", "34": "CYCLICAL",
-    "41": "PROPERTY", "73": "PROPERTY",
-    "11": "STABLE", "49": "STABLE", "72": "STABLE",
-    "27": "CONS_HEALTH", "42": "CONS_HEALTH", "23": "CONS_HEALTH",
-    "77": "GLOBAL", "-1": "GLOBAL",
+    # TMT: 电子＋计算机＋传媒＋通信
+    "27": "TMT", "71": "TMT", "72": "TMT", "73": "TMT",
+    # MFG: 汽车＋电力设备＋机械设备＋国防军工
+    "28": "MFG", "63": "MFG", "64": "MFG", "65": "MFG",
+    # CYCLICAL: 化工＋钢铁＋有色＋煤炭＋石油石化
+    "22": "CYCLICAL", "23": "CYCLICAL", "24": "CYCLICAL",
+    "74": "CYCLICAL", "75": "CYCLICAL",
+    # PROPERTY: 房地产＋建材＋建筑＋银行＋非银
+    "43": "PROPERTY", "61": "PROPERTY", "62": "PROPERTY",
+    "48": "PROPERTY", "49": "PROPERTY",
+    # CONSUMER: 家电＋食品＋纺织＋轻工＋商贸＋社服＋美容＋医药＋农林牧渔
+    "33": "CONSUMER", "34": "CONSUMER", "35": "CONSUMER",
+    "36": "CONSUMER", "45": "CONSUMER", "46": "CONSUMER",
+    "77": "CONSUMER", "37": "CONSUMER", "11": "CONSUMER",
+    # STABLE: 公用事业＋交通运输＋环保
+    "41": "STABLE", "42": "STABLE", "76": "STABLE",
+    # GLOBAL: 综合＋未知
+    "51": "GLOBAL", "-1": "GLOBAL",
 }
 
-STRONG = frozenset({"27", "37", "63", "64", "71", "22", "24", "28"})
-WEAK = frozenset({"72", "65", "41", "42", "49", "73", "34"})
-SMALL = frozenset({"23", "62", "11", "61"})
-GLOBAL_ONLY = frozenset({"77", "-1"})
+# Manual fallback tiers. In auto mode these are mostly for readable fallback,
+# but keep the SW2021 code base consistent.
+STRONG = frozenset({
+    "22",  # 基础化工
+    "24",  # 有色金属
+    "27",  # 电子
+    "28",  # 汽车
+    "37",  # 医药生物
+    "63",  # 电力设备
+    "64",  # 机械设备
+    "71",  # 计算机
+})
+WEAK = frozenset({
+    "23",  # 钢铁
+    "34",  # 食品饮料
+    "41",  # 公用事业
+    "42",  # 交通运输
+    "43",  # 房地产
+    "49",  # 非银金融
+    "61",  # 建筑材料
+    "62",  # 建筑装饰
+    "65",  # 国防军工
+    "72",  # 传媒
+    "73",  # 通信
+})
+SMALL = frozenset({
+    "11",  # 农林牧渔
+    "33",  # 家用电器
+    "35",  # 纺织服饰
+    "36",  # 轻工制造
+    "45",  # 商贸零售
+    "46",  # 社会服务
+    "48",  # 银行
+    "74",  # 煤炭
+    "75",  # 石油石化
+    "76",  # 环保
+    "77",  # 美容护理
+})
+GLOBAL_ONLY = frozenset({"51", "-1"})
 
 W_STRONG = (0.30, 0.20, 0.50)       # global, sector, industry
 W_WEAK = (0.45, 0.30, 0.25)
 W_SMALL = (0.55, 0.45, 0.00)
 W_GLOBAL_ONLY = (1.00, 0.00, 0.00)
 
+ALPHA_STRONG = 10.0
+ALPHA_OTHER = 20.0
 
-ALPHA_STRONG = 10.0   # Laplace smoothing for strong industries
-ALPHA_OTHER  = 20.0   # Laplace smoothing for weak / small / global
 
 # ------------------------------------------------------------------
 # Config
@@ -64,55 +118,69 @@ ALPHA_OTHER  = 20.0   # Laplace smoothing for weak / small / global
 class BayesBlenderConfig:
     models: Tuple[str, ...] = ("lightgbm", "xgboost", "dlinear", "gated_dwtcn")
 
-    # Current default keeps valid-split tuning feasible. For final long walk-forward
-    # runs, override to 168 or 252 from the runner if desired.
     rolling_window: int = 63
 
     rank_bins: Tuple[float, ...] = (
-        0.00, 0.50, 0.70, 0.85, 0.90, 0.95, 0.97, 0.99, 1.00,
+        0.00, 0.94, 0.96, 0.985, 1.00,
     )
+    # 4 bins:
+    #   bin0 = background / negative-evidence region
+    #   bin1 = buffer
+    #   bin2 = strong
+    #   bin3 = elite
+    # The lowest bin is not ignored; it may provide negative evidence.
 
-    laplace_alpha_strong: float = 10.0
-    laplace_alpha_other: float = 20.0
+    laplace_alpha_strong: float = 10.0    # fallback when auto_alpha=False
+    laplace_alpha_other: float = 20.0     # fallback when auto_alpha=False
+    auto_alpha: bool = True               # alpha = clamp(3, 1000/sqrt(total), 30)
 
-    # V2 manual clip (fallback when auto_clip=False).
+    # Manual clip fallback when auto_clip=False.
     llr_clip: float = 2.0
 
-    # V2: auto-calibrate clip and hierarchy weights from data.
-    # clip = max(0.5, percentile(|LLR|, clip_percentile)) each window.
-    # hierarchy weights = normalized positive top-bin count-weighted LLR.
+    # Auto clip and auto hierarchy weights.
+    # clip = max(0.5, percentile(|raw LLR|, clip_percentile)) each window.
     auto_clip: bool = True
     auto_weights: bool = True
-    clip_percentile: float = 85.0  # p85 optimal in smooth=3 scan (2026-06-09)
+    clip_percentile: float = 85.0  # optimal in smooth=3 scan
+    use_sector: bool = True
+
+    # If True, auto weights are:
+    #     final_weight[m, level] = B[level] * q(model=m | level)
+    # rather than only q(model | level). This prevents weak hierarchy levels from
+    # being forced to speak.
+    level_budget_gate: bool = False
+    level_budget: tuple[float, float, float] = (0.333, 0.333, 0.334)
+    # Manual level budget (global, sector, industry). Used when gate=False.
+    # Sum must be ~1.0. Only the relative proportions matter.
 
     min_group_total: int = 300
     min_group_head: int = 20
 
-    # V2 manual per-model hierarchy weights (fallback when auto_weights=False).
+    # Manual per-model hierarchy weights used when auto_weights=False.
     model_weights: dict = field(default_factory=lambda: {
         "xgboost": {
-            "strong":       (0.25, 0.20, 0.55),
-            "weak":         (0.40, 0.30, 0.30),
-            "small":        (0.55, 0.45, 0.00),
-            "global_only":  (1.00, 0.00, 0.00),
+            "strong":      (0.25, 0.20, 0.55),
+            "weak":        (0.40, 0.30, 0.30),
+            "small":       (0.55, 0.45, 0.00),
+            "global_only": (1.00, 0.00, 0.00),
         },
         "dlinear": {
-            "strong":       (0.25, 0.20, 0.55),
-            "weak":         (0.40, 0.30, 0.30),
-            "small":        (0.55, 0.45, 0.00),
-            "global_only":  (1.00, 0.00, 0.00),
+            "strong":      (0.25, 0.20, 0.55),
+            "weak":        (0.40, 0.30, 0.30),
+            "small":       (0.55, 0.45, 0.00),
+            "global_only": (1.00, 0.00, 0.00),
         },
         "lightgbm": {
-            "strong":       (0.05, 0.25, 0.70),
-            "weak":         (0.15, 0.40, 0.45),
-            "small":        (0.20, 0.80, 0.00),
-            "global_only":  (1.00, 0.00, 0.00),
+            "strong":      (0.05, 0.25, 0.70),
+            "weak":        (0.15, 0.40, 0.45),
+            "small":       (0.20, 0.80, 0.00),
+            "global_only": (1.00, 0.00, 0.00),
         },
         "gated_dwtcn": {
-            "strong":       (0.05, 0.25, 0.70),
-            "weak":         (0.15, 0.40, 0.45),
-            "small":        (0.20, 0.80, 0.00),
-            "global_only":  (1.00, 0.00, 0.00),
+            "strong":      (0.05, 0.25, 0.70),
+            "weak":        (0.15, 0.40, 0.45),
+            "small":       (0.20, 0.80, 0.00),
+            "global_only": (1.00, 0.00, 0.00),
         },
     })
 
@@ -137,7 +205,9 @@ class IndustryBayesCalibrator:
         self.n_bins = len(self.rank_bins) - 1
         self._auto_clip: float = self.cfg.llr_clip
         self._auto_weights: dict = {}
+        self._level_budgets: dict[str, float] = {}
         self.params_history: list[dict] = []
+        self._levels = ["global", "industry"] if not self.cfg.use_sector else ["global", "sector", "industry"]
         self._reset()
 
     def _reset(self) -> None:
@@ -147,28 +217,21 @@ class IndustryBayesCalibrator:
         self._meta: dict[str, dict[str, dict[str, dict[str, int]]]] = {
             "global": {}, "sector": {}, "industry": {},
         }
-        # Incremental: running totals per (level, model, group)
-        # _rt[level][model][group] = (head_arr, not_arr)  each shape (n_bins,)
         self._rt: dict[str, dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]] = {
             "global": {}, "sector": {}, "industry": {},
         }
-        # Day-by-day snapshots for eviction
         from collections import deque
         self._daily_counts: deque[list] = deque()
         self._current_window_size: int = 0
         self._auto_clip = self.cfg.llr_clip
         self._auto_weights = {}
+        self._level_budgets = {}
         self.params_history = []
 
     # ── public API ────────────────────────────────────────────
 
     def fit_window(self, window_ranks: dict[str, pd.DataFrame]) -> None:
-        """
-        Parameters
-        ----------
-        window_ranks:
-            dict[model -> DataFrame(time, stock_id, industry_sw, rank_pct, H)]
-        """
+        """Fit one full rolling window from scratch."""
         self._reset()
         for m in self.models:
             if m not in window_ranks:
@@ -181,13 +244,10 @@ class IndustryBayesCalibrator:
                 raise ValueError(f"window_ranks[{m}] missing columns: {missing}")
 
             df["industry_sw"] = _clean_industry(df["industry_sw"])
-            df["sector"] = df["industry_sw"].map(_sector_for)
+            if self.cfg.use_sector:
+                df["sector"] = df["industry_sw"].map(_sector_for)
 
-            for level, gcol in (
-                ("global", None),
-                ("sector", "sector"),
-                ("industry", "industry_sw"),
-            ):
+            for level, gcol in self._level_groups():
                 table, groups, meta = self._estimate(df, level=level, group_col=gcol)
                 self._t[level][m] = (table, groups)
                 self._meta[level][m] = meta
@@ -197,7 +257,8 @@ class IndustryBayesCalibrator:
     # ── incremental update ────────────────────────────────────
 
     def update_incremental(
-        self, new_day_ranks: dict[str, pd.DataFrame],
+        self,
+        new_day_ranks: dict[str, pd.DataFrame],
         drop_day_ranks: dict[str, pd.DataFrame] | None = None,
     ) -> None:
         """+new_day counts, -drop_day counts, recompute all LLR tables."""
@@ -207,17 +268,16 @@ class IndustryBayesCalibrator:
         for m in self.models:
             new_df = self._day_df(new_day_ranks, m)
             drop_df = self._day_df(drop_day_ranks, m) if drop_day_ranks else None
-            for level, gcol in [("global", None), ("sector", "sector"),
-                                 ("industry", "industry_sw")]:
+            for level, gcol in self._level_groups():
                 self._update_level(level, m, new_df, drop_df, gcol)
         self._recompute_all_tables()
 
     def _init_from_window(self, ranks: dict[str, pd.DataFrame]) -> None:
         for m in self.models:
             df = self._day_df(ranks, m)
-            if df is None: continue
-            for level, gcol in [("global", None), ("sector", "sector"),
-                                 ("industry", "industry_sw")]:
+            if df is None:
+                continue
+            for level, gcol in self._level_groups():
                 rt_m = self._rt[level].setdefault(m, {})
                 groups = [self.GLOBAL_KEY] if gcol is None else sorted(df[gcol].astype(str).unique())
                 for grp in groups:
@@ -229,19 +289,23 @@ class IndustryBayesCalibrator:
         self._recompute_all_tables()
 
     def _day_df(self, ranks_dict, model):
-        if ranks_dict is None or model not in ranks_dict: return None
+        if ranks_dict is None or model not in ranks_dict:
+            return None
         df = ranks_dict[model].copy()
-        if {"rank_pct", "H"} - set(df.columns): return None
+        if {"rank_pct", "H"} - set(df.columns):
+            return None
         df["_bin"] = self._rank_to_bin(df["rank_pct"].to_numpy(dtype=float))
         df["H"] = df["H"].astype(int).clip(0, 1)
-        df["industry_sw"] = _clean_industry(df.get("industry_sw", pd.Series(["-1"]*len(df))))
-        df["sector"] = df["industry_sw"].map(_sector_for)
+        df["industry_sw"] = _clean_industry(df.get("industry_sw", pd.Series(["-1"] * len(df))))
+        if self.cfg.use_sector:
+            df["sector"] = df["industry_sw"].map(_sector_for)
         return df
 
     def _update_level(self, level, model, new_df, drop_df, group_col):
         rt_m = self._rt[level].get(model, {})
         for df, sign in [(new_df, +1), (drop_df, -1)]:
-            if df is None: continue
+            if df is None:
+                continue
             h, b = df["H"].to_numpy(dtype=int), df["_bin"].to_numpy(dtype=int)
             groups = np.full(len(df), self.GLOBAL_KEY) if group_col is None else df[group_col].astype(str).to_numpy()
             for grp in np.unique(groups):
@@ -249,16 +313,20 @@ class IndustryBayesCalibrator:
                 head = np.bincount(b[msk & (h == 1)], minlength=self.n_bins).astype(float) * sign
                 not_h = np.bincount(b[msk & (h == 0)], minlength=self.n_bins).astype(float) * sign
                 k = str(grp)
-                if k not in rt_m: rt_m[k] = (np.zeros(self.n_bins), np.zeros(self.n_bins))
-                rt_m[k] = (np.maximum(0, rt_m[k][0] + head),
-                            np.maximum(0, rt_m[k][1] + not_h))
+                if k not in rt_m:
+                    rt_m[k] = (np.zeros(self.n_bins), np.zeros(self.n_bins))
+                rt_m[k] = (
+                    np.maximum(0, rt_m[k][0] + head),
+                    np.maximum(0, rt_m[k][1] + not_h),
+                )
         self._rt[level][model] = rt_m
 
     def _recompute_all_tables(self) -> None:
-        for level in ["global", "sector", "industry"]:
+        for level in self._levels:
             for m in self.models:
                 rm = self._rt[level].get(m, {})
-                if not rm: continue
+                if not rm:
+                    continue
                 grps = sorted(rm.keys())
                 n_g = len(grps)
                 tbl = np.zeros((self.n_bins, n_g), dtype=float)
@@ -267,27 +335,29 @@ class IndustryBayesCalibrator:
                     hd, nh = rm[grp]
                     hn, nn = int(hd.sum()), int(nh.sum())
                     total = hn + nn
-                    alpha = ALPHA_STRONG if (level == "industry" and grp in STRONG and total > 5000) else ALPHA_OTHER
+                    alpha = self._alpha_for(level, grp, total)
                     ph = np.maximum(1e-12, (hd + alpha) / (hn + alpha * self.n_bins))
                     pn = np.maximum(1e-12, (nh + alpha) / (nn + alpha * self.n_bins))
                     llr = np.log(ph / pn)
-                    tbl[:, gi] = llr  # raw — clip deferred to _finalize_tables()
+                    tbl[:, gi] = llr
                     mt[grp] = {"total": total, "head": hn, "not_head": nn}
                 self._t[level][m] = (tbl, grps)
                 self._meta[level][m] = mt
         self._finalize_tables()
 
+    def _level_groups(self):
+        pairs = [("global", None)]
+        if self.cfg.use_sector:
+            pairs.append(("sector", "sector"))
+        pairs.append(("industry", "industry_sw"))
+        return pairs
+
     # ── auto-parameter calibration ──────────────────────────────
 
     def _finalize_tables(self) -> None:
-        """Compute auto_clip + auto_weights from raw LLR tables, then clip in-place.
-
-        clip = max(0.5, percentile(|LLR|, clip_percentile)) — floor 0.5 prevents degenerate
-        near-zero clip under extreme regularisation.
-        """
-        # 1. Collect all raw LLR values
+        """Compute auto_clip + auto_weights from raw LLR tables, then clip in-place."""
         all_vals = []
-        for level in ["global", "sector", "industry"]:
+        for level in self._levels:
             for m in self.models:
                 tbl, _ = self._t[level].get(m, (None, None))
                 if tbl is not None:
@@ -303,96 +373,113 @@ class IndustryBayesCalibrator:
         else:
             self._auto_clip = float(self.cfg.llr_clip)
 
-        # 2. Clip all tables
-        for level in ["global", "sector", "industry"]:
+        # Clip all tables after using raw LLR to determine the cap.
+        for level in self._levels:
             for m in self.models:
                 if m in self._t[level]:
                     tbl, grps = self._t[level][m]
                     if tbl is not None:
-                        self._t[level][m] = (
-                            np.clip(tbl, -self._auto_clip, self._auto_clip),
-                            grps,
-                        )
+                        self._t[level][m] = (np.clip(tbl, -self._auto_clip, self._auto_clip), grps)
 
-        # 3. Auto weights from clipped tables
         if self.cfg.auto_weights:
             self._auto_weights = self._compute_auto_weights()
         else:
             self._auto_weights = {}
+            self._level_budgets = {level: 1.0 / len(self._levels) for level in self._levels}
 
-        # 4. Log
         self.params_history.append({
-            "auto_clip": self._auto_clip,
+            "auto_clip": float(self._auto_clip),
+            "level_budgets": dict(self._level_budgets),
             "auto_weights": {
                 m: {
-                    "global": self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[0],
-                    "sector": self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[1],
-                    "industry": self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[2],
+                    "global": float(self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[0]),
+                    "sector": float(self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[1]) if self.cfg.use_sector else 0.0,
+                    "industry": float(self._auto_weights.get(m, {}).get("strong", (0, 0, 0))[2]),
                 }
                 for m in self.models
             } if self.cfg.auto_weights else {},
         })
 
+    def _top_bin_indices_and_weights(self) -> tuple[list[int], np.ndarray]:
+        """Top 2 bins only — strong + elite. Buffer bin excluded (noisy LLR)."""
+        top_bins = [self.n_bins - 2, self.n_bins - 1]
+        return top_bins, np.array([1.0, 1.0], dtype=float)
+
     def _compute_auto_weights(self) -> dict:
-        """Per-model hierarchy weights from positive top-bin count-weighted LLR.
+        """Auto model-level hierarchy weights with level budget gate.
 
-        For each (model, level), average positive LLR in bins 6-7 (0.97-1.00),
-        weighted by per-group sample count. Normalize into (wg, ws, wi) per model.
+        Step 1: compute positive count-weighted top-bin LLR strength for each
+                (model, level).
+        Step 2: compute B(level), the whole hierarchy level budget.
+        Step 3: compute q(model | level), across-model per-level allocation.
+        Step 4: final weight(model, level) = B(level) * q(model | level).
+
+        This preserves vertical normalisation, so weak models do not have to
+        speak, while also preventing weak hierarchy levels from being forced to
+        speak.
         """
-        top_bi = self.n_bins - 2  # bin 6 (0.97-0.99)
-        weights = {}
+        top_bins, top_bin_weights = self._top_bin_indices_and_weights()
 
+        raw: dict[str, dict[str, float]] = {m: {l: 0.0 for l in self._levels} for m in self.models}
         for m in self.models:
-            strengths: dict[str, float] = {}
-            for level in ["global", "sector", "industry"]:
+            for level in self._levels:
                 tbl, grps = self._t[level].get(m, (None, None))
                 if tbl is None or not grps:
-                    strengths[level] = 1e-6
                     continue
                 meta = self._meta[level].get(m, {})
-                pos_sum = 0.0
+                llr_sum = 0.0
                 total_w = 0.0
                 for gi, grp in enumerate(grps):
                     count = meta.get(str(grp), {}).get("total", 0)
                     if count <= 0:
                         continue
-                    llr_b6 = tbl[top_bi, gi]
-                    llr_b7 = tbl[top_bi + 1, gi]
-                    for llr_val in (llr_b6, llr_b7):
-                        if np.isfinite(llr_val) and llr_val > 0:
-                            pos_sum += count * llr_val
-                            total_w += count
-                strengths[level] = pos_sum / total_w if total_w > 0 else 1e-6
+                    for bi, bw in zip(top_bins, top_bin_weights):
+                        llr_val = tbl[bi, gi]
+                        if np.isfinite(llr_val):
+                            llr_sum += count * float(bw) * max(float(llr_val), 0.0)
+                            total_w += count * float(bw)
+                raw[m][level] = llr_sum / total_w if total_w > 0 else 0.0
 
-            total = strengths["global"] + strengths["sector"] + strengths["industry"]
-            if total <= 0:
-                total = 1.0
-            wg = strengths["global"] / total
-            ws = strengths["sector"] / total
-            wi = strengths["industry"] / total
+        level_strength = {level: sum(max(0.0, raw[m][level]) for m in self.models) for level in self._levels}
+        total_level_strength = sum(level_strength.values())
+
+        if self.cfg.level_budget_gate and total_level_strength > 0:
+            level_budget = {level: level_strength[level] / total_level_strength for level in self._levels}
+        else:
+            bg, bs, bi = self.cfg.level_budget
+            level_budget = {"global": bg, "sector": bs, "industry": bi}
+        # Normalize
+        s = sum(level_budget.values())
+        if s > 0:
+            level_budget = {k: v / s for k, v in level_budget.items()}
+        self._level_budgets = level_budget
+
+        q_model_given_level: dict[str, dict[str, float]] = {m: {l: 0.0 for l in self._levels} for m in self.models}
+        for level in self._levels:
+            denom = level_strength[level]
+            if denom <= 0:
+                continue
+            for m in self.models:
+                q_model_given_level[m][level] = max(0.0, raw[m][level]) / denom
+
+        weights: dict[str, dict[str, tuple[float, float, float]]] = {}
+        for m in self.models:
+            wg = level_budget.get("global", 0.0) * q_model_given_level[m].get("global", 0.0)
+            ws = level_budget.get("sector", 0.0) * q_model_given_level[m].get("sector", 0.0)
+            wi = level_budget.get("industry", 0.0) * q_model_given_level[m].get("industry", 0.0)
+            if not self.cfg.use_sector:
+                ws = 0.0
             weights[m] = {
-                "strong": (wg, ws, wi),
-                "weak": (wg, ws, wi),
-                "small": (wg, ws, wi),
-                "global_only": (1.0, 0.0, 0.0),
+                "strong":      (float(wg), float(ws), float(wi)),
+                "weak":        (float(wg), float(ws), float(wi)),
+                "small":       (float(wg), float(ws), float(wi)),
+                "global_only": (float(wg), 0.0, 0.0),
             }
         return weights
 
     # ── scoring ─────────────────────────────────────────────────
 
     def score(self, today: pd.DataFrame, today_ranks: dict[str, pd.DataFrame]) -> pd.Series:
-        """
-        Parameters
-        ----------
-        today:
-            DataFrame(time, stock_id, industry_sw)
-        today_ranks:
-            dict[model -> DataFrame(time, stock_id, rank_pct)]
-
-        Returns
-        -------
-        pd.Series indexed by stock_id, named bayes_score.
-        """
         required = {"time", "stock_id", "industry_sw"}
         missing = required - set(today.columns)
         if missing:
@@ -420,22 +507,18 @@ class IndustryBayesCalibrator:
 
         return pd.Series(total, index=base["stock_id"], name="bayes_score")
 
-    def score_detailed(
-        self, today: pd.DataFrame, today_ranks: dict[str, pd.DataFrame],
-    ) -> pd.DataFrame:
-        """Like score() but returns per-model LLR breakdown for diagnostics.
-
-        Output columns: time, stock_id, industry_sw, sector, bayes_score, H,
-                        {m}_rank, {m}_llr_global, {m}_llr_sector, {m}_llr_industry
-        """
+    def score_detailed(self, today: pd.DataFrame, today_ranks: dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """Like score(), but returns per-model LLR breakdown for diagnostics."""
         base = today[["time", "stock_id", "industry_sw"]].drop_duplicates().copy()
         base["stock_id"] = base["stock_id"].astype(str).str.strip().str.zfill(6)
         base["industry_sw"] = _clean_industry(base["industry_sw"])
-        base["sector"] = base["industry_sw"].map(_sector_for)
+        if self.cfg.use_sector:
+            base["sector"] = base["industry_sw"].map(_sector_for)
         base = base.reset_index(drop=True)
         n = len(base)
         industries = base["industry_sw"].to_numpy(dtype=str)
-        sectors = base["sector"].to_numpy(dtype=str)
+        sectors = base["sector"].to_numpy(dtype=str) if self.cfg.use_sector else np.full(n, "")
+        is_go = np.isin(industries.astype(str), list(GLOBAL_ONLY))
 
         cols = {}
         total = np.zeros(n, dtype=float)
@@ -447,19 +530,30 @@ class IndustryBayesCalibrator:
             bins = self._rank_to_bin(ranks)
             cols[f"{m}_rank"] = ranks
 
-            # per-level LLR
             gt, gg = self._t["global"].get(m, (None, []))
-            st, sg = self._t["sector"].get(m, (None, []))
             it, ig = self._t["industry"].get(m, (None, []))
             gl = self._lookup_many("global", m, gt, gg, np.full(n, self.GLOBAL_KEY), bins, np.zeros(n), False)
-            sl = self._lookup_many("sector", m, st, sg, sectors, bins, gl, True)
-            il = self._lookup_many("industry", m, it, ig, industries, bins, sl, True)
-            cols[f"{m}_llr_global"]   = gl
-            cols[f"{m}_llr_sector"]   = sl
+            if self.cfg.use_sector:
+                st, sg = self._t["sector"].get(m, (None, []))
+                sl = self._lookup_many("sector", m, st, sg, sectors, bins, gl, True)
+                il = self._lookup_many("industry", m, it, ig, industries, bins, sl, True)
+            else:
+                sl = np.zeros(n, dtype=float)
+                il = self._lookup_many("industry", m, it, ig, industries, bins, gl, True)
+
+            # global-only names cannot inherit sector/industry through fallback.
+            sl[is_go] = 0.0
+            il[is_go] = 0.0
+
+            cols[f"{m}_llr_global"] = gl
+            cols[f"{m}_llr_sector"] = sl
             cols[f"{m}_llr_industry"] = il
 
             wmap = self._auto_weights if (self.cfg.auto_weights and self._auto_weights) else self.cfg.model_weights
             wg, ws, wi = self._weights_many(m, industries, wmap)
+            if not self.cfg.use_sector:
+                wg = wg + ws
+                ws = np.zeros_like(ws)
             contrib = wg * gl + ws * sl + wi * il
             cols[f"{m}_llr_blended"] = contrib
             total += contrib
@@ -468,75 +562,110 @@ class IndustryBayesCalibrator:
         out["time"] = base["time"].values
         out["stock_id"] = base["stock_id"].values
         out["industry_sw"] = industries
-        out["sector"] = sectors
+        if self.cfg.use_sector:
+            out["sector"] = sectors
         out["bayes_score"] = total
-        return out[["time", "stock_id", "industry_sw", "sector", "bayes_score"] +
-                    [f"{m}_rank" for m in self.models] +
-                    [f"{m}_llr_global" for m in self.models] +
-                    [f"{m}_llr_sector" for m in self.models] +
-                    [f"{m}_llr_industry" for m in self.models] +
-                    [f"{m}_llr_blended" for m in self.models]]
+        base_cols = ["time", "stock_id", "industry_sw"]
+        if self.cfg.use_sector:
+            base_cols.append("sector")
+        base_cols.append("bayes_score")
+        return out[base_cols +
+                   [f"{m}_rank" for m in self.models] +
+                   [f"{m}_llr_global" for m in self.models] +
+                   [f"{m}_llr_sector" for m in self.models] +
+                   [f"{m}_llr_industry" for m in self.models] +
+                   [f"{m}_llr_blended" for m in self.models]]
 
     def diagnostic_report(self) -> pd.DataFrame:
-        """Per-group per-model per-bin P(H|bin) from current calibration."""
+        """Per-group per-model per-bin diagnostics from current calibration.
+
+        exp(LLR) is a likelihood ratio, not posterior odds. P_H_given_bin below
+        is computed as prior_odds * exp(LLR) converted back to probability.
+        """
         rows = []
         for level_name in ["global", "sector", "industry"]:
+            if level_name not in self._levels:
+                continue
             for m in self.models:
                 table, groups = self._t[level_name].get(m, (None, None))
                 if table is None:
                     continue
+                meta = self._meta[level_name].get(m, {})
                 for gi, grp in enumerate(groups):
+                    gmeta = meta.get(str(grp), {})
+                    head = int(gmeta.get("head", 0))
+                    total = int(gmeta.get("total", 0))
+                    base_rate = float(head / total) if total > 0 else np.nan
+                    if np.isfinite(base_rate):
+                        base_rate = min(max(base_rate, 1e-12), 1.0 - 1e-12)
+                        prior_odds = base_rate / (1.0 - base_rate)
+                    else:
+                        prior_odds = np.nan
                     for bi in range(self.n_bins):
-                        p_h = np.clip(np.exp(table[bi, gi]), 0, None)  # exp(LLR) = odds
-                        p_h = p_h / (1.0 + p_h)  # odds → probability
+                        llr = float(table[bi, gi])
+                        likelihood_ratio = float(np.exp(llr)) if np.isfinite(llr) else np.nan
+                        if np.isfinite(prior_odds) and np.isfinite(likelihood_ratio):
+                            posterior_odds = prior_odds * likelihood_ratio
+                            p_h = posterior_odds / (1.0 + posterior_odds)
+                        else:
+                            p_h = np.nan
                         rows.append({
-                            "level": level_name, "model": m, "group": grp,
-                            "bin": bi, "bin_lo": self.rank_bins[bi],
+                            "level": level_name,
+                            "model": m,
+                            "group": grp,
+                            "bin": bi,
+                            "bin_lo": self.rank_bins[bi],
                             "bin_hi": self.rank_bins[bi + 1],
-                            "llr": table[bi, gi],
-                            "P_H_given_bin": round(float(p_h), 6),
+                            "llr": llr,
+                            "likelihood_ratio": likelihood_ratio,
+                            "base_head_rate": base_rate,
+                            "P_H_given_bin": round(float(p_h), 6) if np.isfinite(p_h) else np.nan,
                         })
         return pd.DataFrame(rows)
 
     # ── per-model contribution ─────────────────────────────────
 
-    def _model_contrib(
-        self,
-        model: str,
-        inds: np.ndarray,
-        secs: np.ndarray,
-        bins: np.ndarray,
-    ) -> np.ndarray:
-        """Vectorized global/sector/industry LLR blending for one model."""
+    def _model_contrib(self, model: str, inds: np.ndarray, secs: np.ndarray, bins: np.ndarray) -> np.ndarray:
         n = len(inds)
 
         gt, gg = self._t["global"].get(model, (None, []))
-        st, sg = self._t["sector"].get(model, (None, []))
         it, ig = self._t["industry"].get(model, (None, []))
 
-        # global: fallback to zero if absent
         gl = self._lookup_many(
             level="global", model=model, table=gt, groups=gg,
             keys=np.full(n, self.GLOBAL_KEY, dtype=object), bins=bins,
             fallback=np.zeros(n, dtype=float), require_quality=False,
         )
 
-        # sector: fallback to global
-        sl = self._lookup_many(
-            level="sector", model=model, table=st, groups=sg,
-            keys=secs.astype(str), bins=bins,
-            fallback=gl, require_quality=True,
-        )
+        if self.cfg.use_sector:
+            st, sg = self._t["sector"].get(model, (None, []))
+            sl = self._lookup_many(
+                level="sector", model=model, table=st, groups=sg,
+                keys=secs.astype(str), bins=bins,
+                fallback=gl, require_quality=True,
+            )
+            il = self._lookup_many(
+                level="industry", model=model, table=it, groups=ig,
+                keys=inds.astype(str), bins=bins,
+                fallback=sl, require_quality=True,
+            )
+        else:
+            sl = np.zeros(n, dtype=float)
+            il = self._lookup_many(
+                level="industry", model=model, table=it, groups=ig,
+                keys=inds.astype(str), bins=bins,
+                fallback=gl, require_quality=True,
+            )
 
-        # industry: fallback to sector
-        il = self._lookup_many(
-            level="industry", model=model, table=it, groups=ig,
-            keys=inds.astype(str), bins=bins,
-            fallback=sl, require_quality=True,
-        )
+        is_go = np.isin(inds.astype(str), list(GLOBAL_ONLY))
+        sl[is_go] = 0.0
+        il[is_go] = 0.0
 
         wmap = self._auto_weights if (self.cfg.auto_weights and self._auto_weights) else self.cfg.model_weights
         wg, ws, wi = self._weights_many(model, inds.astype(str), wmap)
+        if not self.cfg.use_sector:
+            wg = wg + ws
+            ws = np.zeros_like(ws)
         return wg * gl + ws * sl + wi * il
 
     def _lookup_many(
@@ -550,7 +679,6 @@ class IndustryBayesCalibrator:
         fallback: np.ndarray,
         require_quality: bool,
     ) -> np.ndarray:
-        """Lookup LLR by group and bin with vectorized per-group assignment."""
         out = fallback.copy()
         if table is None or not groups:
             return out
@@ -570,18 +698,22 @@ class IndustryBayesCalibrator:
         return out
 
     @staticmethod
-    @staticmethod
-    def _weights_many(model: str, inds: np.ndarray,
-                       weight_map: dict | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _weights_many(model: str, inds: np.ndarray, weight_map: dict | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         wmap = weight_map or {}
         model_w = wmap.get(model, {})
+
         def _w(ind):
             i = str(ind)
-            if i in STRONG:      return model_w.get("strong", W_STRONG)
-            if i in WEAK:        return model_w.get("weak", W_WEAK)
-            if i in SMALL:       return model_w.get("small", W_SMALL)
-            if i in GLOBAL_ONLY: return model_w.get("global_only", W_GLOBAL_ONLY)
+            if i in STRONG:
+                return model_w.get("strong", W_STRONG)
+            if i in WEAK:
+                return model_w.get("weak", W_WEAK)
+            if i in SMALL:
+                return model_w.get("small", W_SMALL)
+            if i in GLOBAL_ONLY:
+                return model_w.get("global_only", W_GLOBAL_ONLY)
             return model_w.get("small", W_SMALL)
+
         w = np.asarray([_w(ind) for ind in inds.astype(str)], dtype=float)
         return w[:, 0], w[:, 1], w[:, 2]
 
@@ -592,19 +724,11 @@ class IndustryBayesCalibrator:
             m = self._meta[level][model][str(group)]
         except KeyError:
             return False
-        return (
-            m["total"] >= self.cfg.min_group_total
-            and m["head"] >= self.cfg.min_group_head
-        )
+        return m["total"] >= self.cfg.min_group_total and m["head"] >= self.cfg.min_group_head
 
     # ── estimation ─────────────────────────────────────────────
 
-    def _estimate(
-        self,
-        df: pd.DataFrame,
-        level: str,
-        group_col: str | None,
-    ) -> tuple[np.ndarray | None, list[str], dict[str, dict[str, int]]]:
+    def _estimate(self, df: pd.DataFrame, level: str, group_col: str | None) -> tuple[np.ndarray | None, list[str], dict[str, dict[str, int]]]:
         cols = ["rank_pct", "H"] + ([group_col] if group_col else [])
         d = df[cols].copy().dropna(subset=["rank_pct", "H"])
         if d.empty:
@@ -634,20 +758,34 @@ class IndustryBayesCalibrator:
             head_b = np.bincount(b[h == 1], minlength=nb).astype(float)
             not_b = np.bincount(b[h == 0], minlength=nb).astype(float)
 
-            alpha = self._alpha_for(level, str(grp))
+            alpha = self._alpha_for(level, str(grp), total)
             p_h = (head_b + alpha) / (head_n + alpha * nb)
             p_n = (not_b + alpha) / (not_n + alpha * nb)
 
             llr = np.log(p_h / p_n)
-            table[:, gi] = llr  # raw — clip deferred to _finalize_tables()
+            table[:, gi] = llr
             meta[str(grp)] = {"total": total, "head": head_n, "not_head": not_n}
 
         return table, [str(g) for g in groups], meta
 
-    def _alpha_for(self, level: str, group: str) -> float:
-        if level == "industry" and str(group) in STRONG:
-            return float(self.cfg.laplace_alpha_strong)
-        return float(self.cfg.laplace_alpha_other)
+    def _alpha_for(self, level: str, group: str, total: int = 0) -> float:
+        if not self.cfg.auto_alpha:
+            if level == "industry" and str(group) in STRONG:
+                return float(self.cfg.laplace_alpha_strong)
+            return float(self.cfg.laplace_alpha_other)
+        if total <= 0:
+            return 20.0
+        if level == "global":
+            return 20.0
+        if level == "sector":
+            alpha = 1000.0 / np.sqrt(total)
+            return float(np.clip(alpha, 10.0, 20.0))
+        if level == "industry":
+            alpha = 1000.0 / np.sqrt(total)
+            if str(group) in STRONG:
+                return float(np.clip(alpha, 8.0, 15.0))
+            return float(np.clip(alpha, 15.0, 25.0))
+        return 20.0
 
     # ── helpers ────────────────────────────────────────────────
 
@@ -658,12 +796,18 @@ class IndustryBayesCalibrator:
 
 
 # ------------------------------------------------------------------
-# Shared helpers (outside class — also callable from outer script)
+# Shared helpers
 # ------------------------------------------------------------------
 
 def _clean_industry(s: pd.Series) -> pd.Series:
     def _fmt(x):
         try:
+            # industry_sw may come as 270000, 27, 27.0, or strings.
+            sx = str(x).strip()
+            if sx.endswith(".0"):
+                sx = sx[:-2]
+            if sx.isdigit() and len(sx) >= 6:
+                return sx[:2]
             return str(int(float(x)))
         except (ValueError, TypeError):
             return str(x).strip()
@@ -708,8 +852,7 @@ def build_bayes_scores(
     final test evaluation without reporting valid results.
 
     eval_burnin optionally enforces a common evaluation start across different
-    rolling windows. Example: compare rolling_window=126/168/252 fairly by
-    setting eval_burnin=252; all versions then emit scores only after date #252.
+    rolling windows.
     """
     cfg = config or BayesBlenderConfig(models=tuple(models))
     cal = IndustryBayesCalibrator(cfg)
@@ -724,29 +867,21 @@ def build_bayes_scores(
 
         w_start = all_dates[i - cfg.rolling_window]
         w_end = all_dates[i - 1]
-        window = merged_ranked[
-            (merged_ranked["time"] >= w_start) &
-            (merged_ranked["time"] <= w_end)
-        ]
+        window = merged_ranked[(merged_ranked["time"] >= w_start) & (merged_ranked["time"] <= w_end)]
 
         w_ranks = {}
         for m in models:
             rcol = f"{m}_r"
-            w_ranks[m] = window[["time", "stock_id", "industry_sw", rcol, "H"]].rename(
-                columns={rcol: "rank_pct"}
-            )
+            w_ranks[m] = window[["time", "stock_id", "industry_sw", rcol, "H"]].rename(columns={rcol: "rank_pct"})
 
         cal.fit_window(w_ranks)
 
         if i < effective_burnin:
             continue
-
         if eval_date_set is not None and pd.Timestamp(t) not in eval_date_set:
             continue
 
-        today = merged_ranked.loc[
-            merged_ranked["time"] == t, ["time", "stock_id", "industry_sw"]
-        ]
+        today = merged_ranked.loc[merged_ranked["time"] == t, ["time", "stock_id", "industry_sw"]]
         t_ranks = {}
         for m in models:
             rcol = f"{m}_r"
@@ -788,7 +923,7 @@ if __name__ == "__main__":
     scores = cal.score(today, today_r)
     print(f"  OK — {len(scores)} scores, [{scores.min():.4f}, {scores.max():.4f}]")
     print(
-        f"  rolling={cfg.rolling_window}, "
-        f"alpha_strong={cfg.laplace_alpha_strong}, "
-        f"alpha_other={cfg.laplace_alpha_other}, clip={cfg.llr_clip}"
+        f"  rolling={cfg.rolling_window}, auto_alpha={cfg.auto_alpha}, "
+        f"auto_clip={cfg.auto_clip}, clip_pct={cfg.clip_percentile}, "
+        f"clip_now={cal._auto_clip:.4f}"
     )

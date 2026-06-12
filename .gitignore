@@ -240,35 +240,28 @@ dataset/output/
 *.ckpt
 *.model
 
-# Generated reports (keep folder)
-reports/*
-!reports/.gitkeep
+# Project documentation (local only)
+CLAUDE.md
+PROJECT_DIAGNOSTIC_REPORT.md
+STAGE_0.md
 
-# Temp scripts
-temp/
-
-# Tushare skill (API credentials in _meta.json)
+# Tushare API credentials
 dataset/skill/
 
 # Claude Code local settings
 .claude/
 
-# Backup files
-backup/
+# Temp scripts (diagnostics, one-off scans)
+temp/
+!temp/build_ff5_factors.py
+!temp/ff5_attribution.py
+!temp/bin_attribution.py
+!temp/daily_update.py
+!temp/diagnose_bayes.py
 
-# Markdown documents
-mds/
-
-# Tuning outputs
-dataset/output/tuning/
-reports/tuning/
-reports/factor_audit/
-reports/strategy_v1/
-
-# Temp scripts and outputs
-temp/*.py
-temp/*.parquet
-ind.txt
+# Reports (all local)
+reports/*
+!reports/.gitkeep
 
 # Old scripts (moved to new structure)
 scripts/build_factor_panel.py
@@ -279,4 +272,18 @@ scripts/ensemble.py
 scripts/run_experiment.py
 scripts/select_stocks.py
 scripts/seq_len_scan.py
-scripts/strategy_v0.py!reports/strategy_v1/evidence/*.csv
+scripts/strategy_v0.py
+scripts/strategy_v1.py
+
+# Backup files
+backup/
+
+# Markdown documents (design docs)
+mds/
+
+# Misc
+ind.txt
+*.pt
+*.pth
+*.ckpt
+*.model
