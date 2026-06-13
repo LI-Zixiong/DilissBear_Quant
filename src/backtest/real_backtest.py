@@ -534,7 +534,13 @@ def run_real_backtest(
     trade_log: list[dict[str, Any]] = []
     position_snapshots: list[dict[str, Any]] = []
 
+    last_entry_date = max(entry_signals) if entry_signals else None
+
     for current_date in price_dates[first_entry_idx:]:
+        # Stop early: no more signals and no open positions
+        if last_entry_date is not None and current_date > last_entry_date and len(positions) == 0:
+            break
+
         today_px = price_lookup.get(current_date, {})
         n_buys = 0
         n_sells = 0

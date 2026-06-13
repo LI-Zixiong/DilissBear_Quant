@@ -143,9 +143,9 @@ class ExperimentConfig:
     # General experiment settings
     # ------------------------------------------------------------------
     # Date split ratio: (train, valid, test). Must sum to 1.0.
-    split_ratio: Sequence[float] = (0.7, 0.1, 0.2)
+    split_ratio: Sequence[float] = (0.6, 0.2, 0.2)
 
-    seed: int = 42
+    seed: int = 912
     top_n: int = 50
     periods_per_year: int = 252
 
@@ -232,8 +232,8 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Outputs
     # ------------------------------------------------------------------
-    output_dir: str = "dataset/output/experiment_003"
-    report_path: str = "reports/experiment_003.md"
+    output_dir: str = "dataset/output/experiment_004"
+    report_path: str = "reports/experiment_004.md"
 
     # ------------------------------------------------------------------
     # Lightweight validation

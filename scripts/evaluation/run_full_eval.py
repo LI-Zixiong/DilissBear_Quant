@@ -27,6 +27,7 @@ from src.backtest.bayes_blender import (
     BayesBlenderConfig, IndustryBayesCalibrator, _clean_industry,
 )
 from src.backtest.ensemble_utils import normalize_keys, backtest_score, smooth_predictions
+from src.experiment.config import ExperimentConfig
 from src.backtest.portfolio import PortfolioConfig
 from src.backtest.real_backtest import RealBacktestConfig, run_real_backtest
 
@@ -48,7 +49,7 @@ class EvalConfig:
     bayes_window: int = 63
     bayes_clip: float = 2.0
     output_dir: Path = Path("reports/strategy_v1/evidence")
-    exp_dir: Path = Path("dataset/output/experiment_003")
+    exp_dir: Path = Path(ExperimentConfig().output_dir)
     returns_path: Path = Path("dataset/processed/unified_daily_panel.parquet")
     factor_path: Path = Path("dataset/processed/factor_panel_1500_54_ind.parquet")
 

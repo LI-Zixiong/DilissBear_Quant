@@ -52,7 +52,7 @@ if __name__ == "__main__":
         # Active models
         # ──────────────────────────────────────────────────────────
         #  Current default: LightGBM + Xgboost +DLinear + GatedDWTCN (2026-06-04)
-        model_names=("lightgbm",),
+        model_names=("lightgbm", "xgboost", "dlinear", "gated_dwtcn"),
 
         #  To run a single model (e.g. LGBM only):
         #  model_names=("lightgbm",)
@@ -151,10 +151,8 @@ if __name__ == "__main__":
         # ──────────────────────────────────────────────────────────
         # Split, portfolio, seed
         # ──────────────────────────────────────────────────────────
-        split_ratio=(0.6, 0.2, 0.2),           # train / valid / test
         top_n=50,                               # top-N equal-weight portfolio
         periods_per_year=252,
-        seed=42,
 
         # ──────────────────────────────────────────────────────────
         # Torch training defaults (fallback for all torch models)
@@ -234,8 +232,6 @@ if __name__ == "__main__":
         # ──────────────────────────────────────────────────────────
         # Output
         # ──────────────────────────────────────────────────────────
-        output_dir="dataset/output/experiment_003",
-        report_path="reports/experiment_003.md",
     )
 
     run_experiment(config)
