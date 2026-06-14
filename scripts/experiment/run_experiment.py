@@ -63,7 +63,7 @@ if __name__ == "__main__":
         # ──────────────────────────────────────────────────────────
         # Per-model factor sets (2026-06-04 audit, ZZ500+1000 universe)
         #   LGBM / iTransformer / TSMixer: |ICIR| >= 0.02, corr < 0.98  (46 factors)
-        #   DLinear: |ICIR| >= 0.10, corr < 0.85  (~20 factors, see audit_dlinear)
+        #   DLinear: |ICIR| >= 0.10, corr < 0.85  (~31 factors, see audit_dlinear)
         # ──────────────────────────────────────────────────────────
         model_feature_signs={},
         model_feature_cols={
@@ -172,35 +172,35 @@ if __name__ == "__main__":
         model_params={
             # ---- Tree models ----
             "lightgbm": {
-                "n_estimators":          1000,
+                "n_estimators":          4000,
                 "learning_rate":         0.01,
                 "num_leaves":            31,
-                "early_stopping_rounds": 100,
+                "early_stopping_rounds": None,
                 "feature_fraction":      0.8,
             },
             "xgboost": {
-                "n_estimators":          1000,
+                "n_estimators":          4000,
                 "max_depth":             5,
                 "learning_rate":         0.02,
                 "subsample":             0.8,
                 "colsample_bytree":      0.12,
-                "early_stopping_rounds": 100,
+                "early_stopping_rounds": None,
             },
 
             # ---- Torch models (override torch defaults above) ----
             "dlinear": {
                 "seq_len":   20,
-                "epochs":    25,
-                "lr":        3e-4,
-                "wd":        0.0,
-                "patience":  3,
+                "epochs":    80,
+                "lr":        2e-4,
+                "wd":        5e-5,
+                "patience":  10,
             },
             "gated_dwtcn": {
                 "seq_len":   20,
-                "epochs":    20,
+                "epochs":    25,
                 "lr":        2e-4,
                 "wd":        0.0,
-                "patience":  3,
+                "patience":  5,
                 "kernel_size": 3,
                 "dilations": (1, 2, 4),
                 "hidden_dim": 32,

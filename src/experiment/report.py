@@ -130,6 +130,10 @@ def build_model_comparison_df(
             "best_icir_epoch": train_summary.get("best_icir_epoch"),
             "best_rmse_epoch": train_summary.get("best_rmse_epoch"),
 
+            # Tree model diagnostics.
+            "best_n": train_summary.get("best_n"),
+            "total_n": train_summary.get("total_n"),
+
             **valid_metrics,
             **test_metrics,
 

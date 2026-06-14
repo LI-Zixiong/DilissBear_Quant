@@ -145,7 +145,7 @@ class ExperimentConfig:
     # Date split ratio: (train, valid, test). Must sum to 1.0.
     split_ratio: Sequence[float] = (0.6, 0.2, 0.2)
 
-    seed: int = 912
+    seed: int = 140503
     top_n: int = 50
     periods_per_year: int = 252
 

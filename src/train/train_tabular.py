@@ -139,11 +139,39 @@ def train_tabular_model(
 
     model_path = _save_tabular_model(model, output_dir)
 
+    inner_model = getattr(model, "model", model)
+    best_n = None
+    total_n = None
+
+    # --- best_n ---
+    if hasattr(inner_model, "best_iteration_"):
+        best_n = int(inner_model.best_iteration_)  # LGBM, 1-indexed
+    elif hasattr(inner_model, "best_iteration"):
+        best_n = int(inner_model.best_iteration)    # XGBoost
+
+    # --- total_n: read from evals_result_ (records every round, not pruned) ---
+    evals = getattr(inner_model, "evals_result_", None)
+    if evals is None and hasattr(inner_model, "evals_result"):
+        try:
+            evals = inner_model.evals_result()
+        except Exception:
+            evals = None
+    evals = evals or {}
+    for key in evals:
+        for metric_name, values in evals[key].items():
+            if values:
+                total_n = len(values)
+                break
+        if total_n is not None:
+            break
+
     return {
         "train_rmse": train_rmse,
         "valid_rmse": valid_rmse,
         "rmse_gap": rmse_gap,
         "rmse_ratio": rmse_ratio,
+        "best_n": best_n if best_n is not None else None,
+        "total_n": total_n if total_n is not None else None,
         "train_size": train_data.X.shape[0],
         "valid_size": valid_data.X.shape[0],
         "model_path": str(model_path)

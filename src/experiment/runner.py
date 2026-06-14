@@ -195,6 +195,69 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
     }
 
 
+def _tabular_predict_at_n(model, dataset, n, date_col, stock_col):
+    """Predict using first N trees, return pred_df with meta columns."""
+    inner = model.model
+    X = dataset.X
+    if hasattr(inner, "best_iteration_"):
+        y_pred = inner.predict(X, num_iteration=n)
+    else:
+        y_pred = inner.predict(X, iteration_range=(0, n))
+    return pd.DataFrame({
+        date_col: dataset.meta[date_col].values,
+        stock_col: dataset.meta[stock_col].astype(str).values,
+        "y_pred": y_pred,
+        "y_true": dataset.y,
+    })
+
+
+def _tabular_n_scan(
+    model, valid_data, data, config, portfolio_config, cost_config,
+    model_name, output_dir,
+):
+    """Scan candidate n_tree values, pick best by valid total return."""
+    inner = model.model
+    candidates = [200, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000]
+    best_n = candidates[0]
+    best_valid_ret = -float("inf")
+    scan_records = []
+
+    print("  n_scan:", end="", flush=True)
+    for n in candidates:
+        pred_df = _tabular_predict_at_n(
+            model, valid_data, n, config.date_col, config.stock_col,
+        )
+        eval_result = evaluate_prediction_split(
+            pred_df=pred_df,
+            returns_df=data.returns_df,
+            config=config,
+            portfolio_config=portfolio_config,
+            cost_config=cost_config,
+            split_name="valid",
+        )
+        valid_ret = eval_result["backtest_result"]["summary"]["total_return"]
+        valid_sr = eval_result["backtest_result"]["summary"]["sharpe_ratio"]
+        scan_records.append({
+            "n_tree": n,
+            "valid_total_return": valid_ret,
+            "valid_sharpe": valid_sr,
+        })
+        marker = "*" if valid_ret > best_valid_ret else ""
+        print(f" {n}:{valid_ret:.3f}{marker}", end="", flush=True)
+        if valid_ret > best_valid_ret:
+            best_valid_ret = valid_ret
+            best_n = n
+    print(flush=True)
+
+    scan_df = pd.DataFrame(scan_records)
+    scan_path = output_dir / f"n_scan_{model_name}.csv"
+    scan_df.to_csv(scan_path, index=False)
+    print(f"  best_n={best_n}  valid_ret={best_valid_ret:.4f}  "
+          f"scan saved to {scan_path}")
+
+    return best_n, best_valid_ret, scan_records
+
+
 def _run_tabular_models(
     config: ExperimentConfig,
     data: ExperimentData,
@@ -250,24 +313,29 @@ def _run_tabular_models(
             model=model,
             train_data=train_data,
             valid_data=valid_data,
-            # Keep checkpoints for each experiment model isolated. This avoids
-            # accidental overwrites when two model names share the same class,
-            # and makes full-vs-single debugging cleaner.
             output_dir=output_dir / "models" / model_name,
         )
 
-        valid_pred_df = generate_predictions(
+        # ── n_tree scan: pick best_n by valid total return ──
+        best_n, best_valid_ret, scan_records = _tabular_n_scan(
             model=model,
-            dataset=valid_data,
+            valid_data=valid_data,
+            data=data,
+            config=config,
+            portfolio_config=portfolio_config,
+            cost_config=cost_config,
             model_name=model_name,
-            required_meta_cols=(config.date_col, config.stock_col),
+            output_dir=output_dir,
         )
+        train_summary["best_n"] = best_n
+        train_summary["best_valid_ret"] = best_valid_ret
 
-        test_pred_df = generate_predictions(
-            model=model,
-            dataset=test_data,
-            model_name=model_name,
-            required_meta_cols=(config.date_col, config.stock_col),
+        # ── Predict with best_n, bypass generate_predictions ──
+        valid_pred_df = _tabular_predict_at_n(
+            model, valid_data, best_n, config.date_col, config.stock_col,
+        )
+        test_pred_df = _tabular_predict_at_n(
+            model, test_data, best_n, config.date_col, config.stock_col,
         )
 
         prediction_paths = _save_prediction_outputs(
@@ -307,7 +375,10 @@ def _run_tabular_models(
             test_eval=test_eval,
         )
 
-        print(f"{model_name} completed.")
+        print(f"{model_name} completed."
+              f"\n  best_n={best_n}"
+              f"  best_valid_ret={best_valid_ret:.4f}"
+              f"  total_n={train_summary.get('total_n', 'N/A')}")
         print("Valid metrics:")
         print(valid_eval["backtest_summary"])
         print("Test metrics:")
@@ -480,7 +551,9 @@ def _run_torch_models(
                 test_eval=test_eval,
             )
 
-            print(f"{model_name} completed.")
+            print(f"{model_name} completed."
+                  f"\n  best_composite_epoch={train_summary.get('best_composite_epoch', 'N/A')}"
+                  f"  selection_metric={train_summary.get('selection_metric', 'N/A')}")
             print("Valid metrics:")
             print(valid_eval["backtest_summary"])
             print("Test metrics:")

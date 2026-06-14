@@ -144,13 +144,18 @@ class DLinearPanelRegressor(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.xavier_uniform_(self.seasonal_linear.weight)
-        nn.init.xavier_uniform_(self.trend_linear.weight)
+        # Uniform prior (equal-weight averaging across time steps) with small
+        # noise to break symmetry. Safer than Xavier for (1, seq_len) shapes
+        # where input-output variance assumptions break down.
+        nn.init.constant_(self.seasonal_linear.weight, 1.0 / self.seq_len)
+        nn.init.constant_(self.trend_linear.weight, 1.0 / self.seq_len)
+        with torch.no_grad():
+            self.seasonal_linear.weight.add_(torch.randn_like(self.seasonal_linear.weight) * 0.01)
+            self.trend_linear.weight.add_(torch.randn_like(self.trend_linear.weight) * 0.01)
 
         nn.init.zeros_(self.seasonal_linear.bias)
         nn.init.zeros_(self.trend_linear.bias)
-        
-        # Initialize feature_head layers consistently
+
         for layer in self.feature_head:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)

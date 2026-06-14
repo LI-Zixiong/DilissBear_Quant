@@ -133,7 +133,7 @@ def build_experiment_model(
                 ),
                 reg_alpha=float(params.get("reg_alpha", 0.0)),
                 reg_lambda=float(params.get("reg_lambda", 1.0)),
-                early_stopping_rounds=int(params.get("early_stopping_rounds", 50)),
+                early_stopping_rounds=_opt_int(params.get("early_stopping_rounds", 50)),
                 verbose_eval=False,
                 random_state=seed,
                 n_jobs=int(params.get("n_jobs", -1)),
@@ -219,6 +219,11 @@ def build_experiment_model(
         )
 
     raise ValueError(f"Unsupported model_name: {model_name}")
+
+
+def _opt_int(value):
+    """Cast to int if not None, else return None."""
+    return int(value) if value is not None else None
 
 
 def get_active_tabular_models(config: ExperimentConfig) -> tuple[str, ...]:
