@@ -51,11 +51,11 @@ class ExperimentConfig:
     #   "column"      -> use an existing realized return column, e.g. ret_daily
     #   "next_target" -> map a next-period target, e.g. 1d_next_raw, to the next date
     #
-    # Current default follows the latest run_experiment.py behavior:
-    #   ret_daily -> return_1d
+    # Default: 1d_next_raw is open-to-open (t+1 open buy, t+2 open sell),
+    # consistent with model training targets and Bayes H.
     return_col: str = "return_1d"
-    backtest_return_mode: str = "column"
-    backtest_return_source: str = "ret_daily"
+    backtest_return_mode: str = "next_target"
+    backtest_return_source: str = "1d_next_raw"
 
     # ------------------------------------------------------------------
     # Features and metadata
@@ -70,27 +70,104 @@ class ExperimentConfig:
     # Sign-flipped factors already have larger = better.
     # Full 54-factor V1 set (2026-06-01).
     # Use audit_factors.py to select subsets per model.
+    # 87-factor set from audit_v2 (icir>=0.02, corr<=0.98, 2023-12-31 cutoff).
+    # Audit kept 87/99 continuous factors.  Old factor names use padded format;
+    # new F056GAP_UP_FAIL-F100INV_MINUS_REV use plain numeric format matching the factor panel columns.
     feature_cols: Sequence[str] = (
-        "F001SIZE", "F002SIZENL", "F003LIQUIDITY", "F004BETA",
-        "F005RESVOL", "F006MOMENTUM", "F007LTREV", "F008STREV",
-        "F009LEVERAGE", "F010VALUE", "F011EARNYLD", "F012GROWTH",
-        "F013REV5", "F014MOM120_20", "F015VOLREV", "F016MAXRET",
-        "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
-        "F021CFP", "F022GPTA", "F023ACCRUAL", "F024ASSETGR",
-        "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
-        "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
-        "F034HIGHDEV20", "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
-        "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
-        "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
-        "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
-        "F049ROE", "F050ROA", "F051GPM", "F052CFOA",
-        "F053RD_INTENSITY", "F054RECEIVABLE_RATIO",
+        "F046LIMITUP20",
+        "F077AMP_VOL20",
+        "F041RETVOLCORR20",
+        "F016MAXRET",
+        "F083TURN_FREE",
+        "F039VSTD20",
+        "F078TURN_SIZE",
+        "F018AMIHUD",
+        "F072CORR_60D",
+        "F001SIZE",
+        "F017IVOL",
+        "F065MAXDD20",
+        "F040PVCORR20",
+        "F071VOL_OF_VOL",
+        "F028KLOW",
+        "F070UP_DN_VOL",
+        "F059GK_VOL20",
+        "F084AMT_FREE20",
+        "F060ON_INTRA_DIV5",
+        "F026KLEN",
+        "F035LOWDEV20",
+        "F008STREV",
+        "F045RESI20",
+        "F081STRONG_CLOSE",
+        "F019COSTDEV",
+        "F042AMTCORR20",
+        "F025GAP",
+        "F068SKEW20",
+        "F005RESVOL",
+        "F080VWAP_DEV",
+        "F003LIQUIDITY",
+        "F076SIGNED_AMT20",
+        "F027KUP",
+        "F031RSV60",
+        "F090CRR",
+        "F057INTRA1",
+        "F086DIV_TTM",
+        "F064RET_ACCEL20",
+        "F033GAPREV5",
+        "F062GAP_DN_RECOVER",
+        "F029KSFT",
+        "F010VALUE",
+        "F021CFP",
+        "F013REV5",
+        "F085SP_TTM",
+        "F007LTREV",
+        "F069DNVOL20",
+        "F038TURNZ20",
+        "F011EARNYLD",
+        "F037VOLSHOCK20",
+        "F063RET5D_SKIP1",
+        "F023ACCRUAL",
+        "F061GAP_UP_HOLD",
+        "F058O2O_RET5",
+        "F048LIMITSTREAKUP",
+        "F030RSV20",
+        "F079TURN_ACCEL",
+        "F015VOLREV",
+        "F052CFOA",
+        "F002SIZENL",
+        "F082LOCKED_PCT",
+        "F088CF_SALES_Q",
+        "F004BETA",
+        "F096DILUTION",
+        "F047LIMITDN20",
+        "F012GROWTH",
+        "F066EFFICIENCY20",
+        "F024ASSETGR",
+        "F095NET_FIN",
+        "F075VOLUME_RATIO",
+        "F036VOLSHOCK5",
+        "F099AR_MINUS_REV",
+        "F032RANGEZ20",
+        "F089CASH_PROFIT",
+        "F055IND",
+        "F087LIST_AGE",
+        "F097INT_BURDEN",
+        "F074BETA_20D",
+        "F022GPTA",
+        "F044RSQR20",
+        "F054RECEIVABLE_RATIO",
+        "F091CF_VOL",
+        "F053RD_INTENSITY",
+        "F006MOMENTUM",
+        "F009LEVERAGE",
+        "F050ROA",
+        "F094CAPEX_INT",
     )
 
     meta_cols: Sequence[str] = (
         "industry_sw",
         "list_date",
         "ret_daily",
+        "1d_next_raw",
     )
 
     # Per-model feature overrides. None = all models use feature_cols.
@@ -134,8 +211,13 @@ class ExperimentConfig:
         "dlinear",
     )
 
+    # Explicit date boundaries (half-open [start,end)). Overrides split_ratio.
+    # Format: (train_start, train_end, valid_start, valid_end, test_start, test_end)
+    date_boundaries: tuple[str, str, str, str, str, str] | None = None
+    purge_days: int = 6
+    target_horizon_days: int = 5
+
     # These are filled by the date split function during the run.
-    # They are kept here because reports and scan scripts read them later.
     train_end: str = ""
     valid_end: str = ""
 
@@ -232,8 +314,8 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Outputs
     # ------------------------------------------------------------------
-    output_dir: str = "dataset/output/experiment_004"
-    report_path: str = "reports/experiment_004.md"
+    output_dir: str = "dataset/output/experiment_005"
+    report_path: str = "reports/experiment_005.md"
 
     # ------------------------------------------------------------------
     # Lightweight validation
@@ -295,6 +377,19 @@ class ExperimentConfig:
         if abs(ratio_sum - 1.0) > 1e-8:
             raise ValueError(
                 f"split_ratio must sum to 1.0. Got {self.split_ratio}, sum={ratio_sum}"
+            )
+
+        if self.date_boundaries is not None:
+            if len(self.date_boundaries) != 6:
+                raise ValueError(
+                    f"date_boundaries must have exactly 6 values, "
+                    f"got {len(self.date_boundaries)}"
+                )
+        if self.purge_days < 0:
+            raise ValueError(f"purge_days must be >= 0, got {self.purge_days}")
+        if self.target_horizon_days < 0:
+            raise ValueError(
+                f"target_horizon_days must be >= 0, got {self.target_horizon_days}"
             )
 
     @property

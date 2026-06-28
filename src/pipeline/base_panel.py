@@ -127,6 +127,11 @@ def build_base_panel(config: BasePanelConfig | None = None) -> dict[str, Any]:
         config=config,
     )
 
+    # Store the cumulative backward-adjustment factor so downstream factor
+    # panels can apply it to any price column (open/high/low) without division.
+    if config.keep_adj_factor and "close_adj" in panel.columns and "close" in panel.columns:
+        panel["adj_factor"] = panel["close_adj"] / panel["close"].clip(lower=1e-12)
+
     print("Step 4: Merging industry metadata...")
     panel = _merge_industry_metadata(panel, config)
 

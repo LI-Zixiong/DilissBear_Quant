@@ -141,3 +141,93 @@ def _validate_split_inputs(
         raise ValueError(
             f"split_ratio must sum to 1.0. Got {split_ratio}, sum={ratio_sum}"
         )
+
+
+def split_panel_by_dates(
+    df: pd.DataFrame,
+    date_col: str,
+    stock_col: str,
+    boundaries: tuple[str, str, str, str, str, str],
+    purge: int = 6,
+    target_horizon: int = 5,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str, str]:
+    """Split panel by explicit date boundaries with purge for walk-forward.
+
+    All boundaries are half-open [start, end).
+
+    Purge: Train's last `purge` signal dates are removed (label must not
+    overlap with Valid). Likewise Valid's last `purge` signal dates are
+    removed (label must not overlap with Test).
+
+    Test right-boundary is NOT purged, but signal dates too close to the
+    data end are dropped so that `ret_daily` can be honoured.
+    """
+    train_start, train_end, valid_start, valid_end, test_start, test_end = boundaries
+
+    # -- validate boundaries --
+    if purge < 0:
+        raise ValueError(f"purge must be >= 0, got {purge}")
+    if target_horizon < 0:
+        raise ValueError(f"target_horizon must be >= 0, got {target_horizon}")
+    def _ts(s: str) -> pd.Timestamp:
+        return pd.Timestamp(s)
+    if not (_ts(train_start) < _ts(train_end) <= _ts(valid_start)
+            < _ts(valid_end) <= _ts(test_start) < _ts(test_end)):
+        raise ValueError(
+            "Boundaries must satisfy: "
+            "train_start < train_end <= valid_start < valid_end <= test_start < test_end. "
+            f"Got: train=[{train_start},{train_end}) "
+            f"valid=[{valid_start},{valid_end}) "
+            f"test=[{test_start},{test_end})"
+        )
+
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="raise")
+    work = work.sort_values([date_col, stock_col], kind="mergesort").reset_index(drop=True)
+
+    all_dates = pd.DatetimeIndex(work[date_col].drop_duplicates()).sort_values()
+
+    # -- helpers --
+    def _dates_in(begin: str, end: str) -> pd.DatetimeIndex:
+        return all_dates[(all_dates >= pd.Timestamp(begin)) & (all_dates < pd.Timestamp(end))]
+
+    def _select(begin: str, end: str) -> pd.DataFrame:
+        d = _dates_in(begin, end)
+        return work[work[date_col].isin(d)].copy().reset_index(drop=True)
+
+    train_dates = _dates_in(train_start, train_end)
+    valid_dates = _dates_in(valid_start, valid_end)
+    test_dates = _dates_in(test_start, test_end)
+
+    # -- purge --
+    if purge > 0:
+        if len(train_dates) > purge:
+            train_dates = train_dates[:-purge]
+        if len(valid_dates) > purge:
+            valid_dates = valid_dates[:-purge]
+
+    # Test: drop dates too close to data end for target label to settle.
+    # Use trading-day index, not calendar days — weekends/holidays would bias.
+    buffer = target_horizon + 1
+    if len(all_dates) <= buffer:
+        raise ValueError(
+            f"Not enough trading dates ({len(all_dates)}) for "
+            f"target_horizon={target_horizon} buffer ({buffer})"
+        )
+    last_usable = all_dates[-(buffer + 1)]
+    test_dates = test_dates[test_dates <= last_usable]
+
+    train_df = work[work[date_col].isin(train_dates)].copy().reset_index(drop=True)
+    valid_df = work[work[date_col].isin(valid_dates)].copy().reset_index(drop=True)
+    test_df = work[work[date_col].isin(test_dates)].copy().reset_index(drop=True)
+
+    for name, df_, dates_ in [("train", train_df, train_dates),
+                               ("valid", valid_df, valid_dates),
+                               ("test", test_df, test_dates)]:
+        if df_.empty:
+            raise ValueError(
+                f"{name} split is empty: {len(dates_)} dates matched after purge, "
+                f"but no rows in panel. boundaries={boundaries}, purge={purge}"
+            )
+
+    return train_df, valid_df, test_df, str(train_dates[-1]), str(valid_dates[-1])

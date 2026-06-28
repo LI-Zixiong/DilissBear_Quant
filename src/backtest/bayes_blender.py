@@ -120,6 +120,11 @@ class BayesBlenderConfig:
 
     rolling_window: int = 63
 
+    # Exponential decay half-life (trading days). When set, LLR counts decay
+    # by exp(-ln(2)/half_life) daily and old observations are never dropped.
+    # Overrides the hard-cutoff rolling_window.
+    half_life: int | None = None
+
     rank_bins: Tuple[float, ...] = (
         0.00, 0.94, 0.96, 0.985, 1.00,
     )
@@ -231,28 +236,22 @@ class IndustryBayesCalibrator:
     # ── public API ────────────────────────────────────────────
 
     def fit_window(self, window_ranks: dict[str, pd.DataFrame]) -> None:
-        """Fit one full rolling window from scratch."""
+        """Fit one full rolling window from scratch.
+
+        Delegates to _init_from_window so _rt (raw counts), _t (LLR tables),
+        and _meta are all built from the same data. This keeps the
+        incremental update path (+new_day / -drop_day) consistent.
+        """
         self._reset()
         for m in self.models:
             if m not in window_ranks:
                 raise KeyError(f"Missing window_ranks for model: {m}")
-
-            df = window_ranks[m].copy()
+            df = window_ranks[m]
             required = {"industry_sw", "rank_pct", "H"}
             missing = required - set(df.columns)
             if missing:
                 raise ValueError(f"window_ranks[{m}] missing columns: {missing}")
-
-            df["industry_sw"] = _clean_industry(df["industry_sw"])
-            if self.cfg.use_sector:
-                df["sector"] = df["industry_sw"].map(_sector_for)
-
-            for level, gcol in self._level_groups():
-                table, groups, meta = self._estimate(df, level=level, group_col=gcol)
-                self._t[level][m] = (table, groups)
-                self._meta[level][m] = meta
-
-        self._finalize_tables()
+        self._init_from_window(window_ranks)
 
     # ── incremental update ────────────────────────────────────
 
@@ -265,12 +264,29 @@ class IndustryBayesCalibrator:
         if not self._rt["global"]:
             self._init_from_window(new_day_ranks)
             return
-        for m in self.models:
-            new_df = self._day_df(new_day_ranks, m)
-            drop_df = self._day_df(drop_day_ranks, m) if drop_day_ranks else None
-            for level, gcol in self._level_groups():
-                self._update_level(level, m, new_df, drop_df, gcol)
+        if self.cfg.half_life is not None:
+            # Exponential decay: +new, no drop, decay existing
+            self._decay_rt()
+            for m in self.models:
+                new_df = self._day_df(new_day_ranks, m)
+                for level, gcol in self._level_groups():
+                    self._update_level(level, m, new_df, None, gcol)
+        else:
+            for m in self.models:
+                new_df = self._day_df(new_day_ranks, m)
+                drop_df = self._day_df(drop_day_ranks, m) if drop_day_ranks else None
+                for level, gcol in self._level_groups():
+                    self._update_level(level, m, new_df, drop_df, gcol)
         self._recompute_all_tables()
+
+    def _decay_rt(self) -> None:
+        """Apply exponential decay to all raw counts."""
+        factor = np.exp(-np.log(2) / self.cfg.half_life)
+        for level in self._rt:
+            for model in self._rt[level]:
+                for grp in self._rt[level][model]:
+                    hd, nh = self._rt[level][model][grp]
+                    self._rt[level][model][grp] = (hd * factor, nh * factor)
 
     def _init_from_window(self, ranks: dict[str, pd.DataFrame]) -> None:
         for m in self.models:
@@ -726,48 +742,6 @@ class IndustryBayesCalibrator:
             return False
         return m["total"] >= self.cfg.min_group_total and m["head"] >= self.cfg.min_group_head
 
-    # ── estimation ─────────────────────────────────────────────
-
-    def _estimate(self, df: pd.DataFrame, level: str, group_col: str | None) -> tuple[np.ndarray | None, list[str], dict[str, dict[str, int]]]:
-        cols = ["rank_pct", "H"] + ([group_col] if group_col else [])
-        d = df[cols].copy().dropna(subset=["rank_pct", "H"])
-        if d.empty:
-            return None, [], {}
-
-        d["H"] = d["H"].astype(int).clip(0, 1)
-        d["_bin"] = self._rank_to_bin(d["rank_pct"].to_numpy(dtype=float))
-        d["_group"] = self.GLOBAL_KEY if group_col is None else d[group_col].astype(str)
-
-        groups = sorted(d["_group"].unique())
-        n_g = len(groups)
-        nb = self.n_bins
-        table = np.zeros((nb, n_g), dtype=float)
-        meta: dict[str, dict[str, int]] = {}
-
-        for gi, grp in enumerate(groups):
-            g = d.loc[d["_group"] == grp]
-            h = g["H"].to_numpy(dtype=int)
-            b = g["_bin"].to_numpy(dtype=int)
-
-            head_n = int((h == 1).sum())
-            not_n = int((h == 0).sum())
-            total = head_n + not_n
-            if total == 0:
-                continue
-
-            head_b = np.bincount(b[h == 1], minlength=nb).astype(float)
-            not_b = np.bincount(b[h == 0], minlength=nb).astype(float)
-
-            alpha = self._alpha_for(level, str(grp), total)
-            p_h = (head_b + alpha) / (head_n + alpha * nb)
-            p_n = (not_b + alpha) / (not_n + alpha * nb)
-
-            llr = np.log(p_h / p_n)
-            table[:, gi] = llr
-            meta[str(grp)] = {"total": total, "head": head_n, "not_head": not_n}
-
-        return table, [str(g) for g in groups], meta
-
     def _alpha_for(self, level: str, group: str, total: int = 0) -> float:
         if not self.cfg.auto_alpha:
             if level == "industry" and str(group) in STRONG:
@@ -833,6 +807,47 @@ def _weights_for(ind: str) -> Tuple[float, float, float]:
 
 
 # ------------------------------------------------------------------
+# Online Expert Gate — adaptive outer-weighting of model contributions
+# ------------------------------------------------------------------
+
+class OnlineExpertGate:
+    """Per-model credibility weights via adaptive online gradient descent.
+
+    Each model is treated as an "expert".  On each date the gate observes
+    the realised return of each expert's top-N portfolio and updates weights
+    so that models with higher recent excess returns gain influence.
+
+    The learning rate is automatic: eta_t = sqrt(2 * log(M) / (1 + cum_var)),
+    where cum_var tracks the squared norm of the excess-return vector across
+    ALL models.  A single global eta avoids favouring low-variance models
+    (whose per-model cum_var would otherwise decay slower).
+    """
+
+    def __init__(self, models: list[str]):
+        self.models = list(models)
+        self.M = len(models)
+        self.w = np.full(self.M, 1.0 / self.M, dtype=float)
+        self._cum_var: float = 1e-4  # global — one learning rate for all experts
+        self._history: list[dict] = []
+
+    def update(self, model_returns: dict[str, float]) -> np.ndarray:
+        """Update weights from one day of per-model realised returns."""
+        r = np.array([float(model_returns.get(m, 0.0)) for m in self.models], dtype=float)
+        excess = r - r.mean()
+        self._cum_var += float(np.sum(excess ** 2))
+        eta = np.sqrt(2.0 * np.log(self.M) / max(self._cum_var, 1e-12))
+        self.w *= np.exp(eta * excess)
+        self.w /= self.w.sum()
+        self._history.append({
+            "w": self.w.copy(), "excess": excess.copy(), "eta": eta,
+        })
+        return self.w.copy()
+
+    def weights(self) -> dict[str, float]:
+        return dict(zip(self.models, self.w.tolist()))
+
+
+# ------------------------------------------------------------------
 # Top-level builder used by the runner
 # ------------------------------------------------------------------
 
@@ -842,6 +857,7 @@ def build_bayes_scores(
     config: BayesBlenderConfig | None = None,
     eval_dates: set[pd.Timestamp] | set[np.datetime64] | None = None,
     eval_burnin: int | None = None,
+    detailed: bool = False,
 ) -> pd.DataFrame:
     """
     Run rolling Bayes calibration across all dates in merged_ranked.
@@ -853,6 +869,9 @@ def build_bayes_scores(
 
     eval_burnin optionally enforces a common evaluation start across different
     rolling windows.
+
+    If detailed=True, returns per-model LLR contributions and ranks via
+    score_detailed() instead of the aggregated bayes_score.
     """
     cfg = config or BayesBlenderConfig(models=tuple(models))
     cal = IndustryBayesCalibrator(cfg)
@@ -861,20 +880,39 @@ def build_bayes_scores(
     effective_burnin = cfg.rolling_window if eval_burnin is None else max(cfg.rolling_window, int(eval_burnin))
     scores_list: list[pd.DataFrame] = []
 
+    def _day_ranks(date_idx: int):
+        """Extract single-day rank data for one date index."""
+        d = all_dates[date_idx]
+        df_day = merged_ranked[merged_ranked["time"] == d]
+        ranks = {}
+        for m in models:
+            rcol = f"{m}_r"
+            ranks[m] = df_day[["time", "stock_id", "industry_sw", rcol, "H"]].rename(columns={rcol: "rank_pct"})
+        return ranks
+
+    import time as _timer
+    _b_start = _timer.perf_counter()
     for i, t in enumerate(all_dates):
         if i < cfg.rolling_window:
             continue
 
-        w_start = all_dates[i - cfg.rolling_window]
-        w_end = all_dates[i - 1]
-        window = merged_ranked[(merged_ranked["time"] >= w_start) & (merged_ranked["time"] <= w_end)]
-
-        w_ranks = {}
-        for m in models:
-            rcol = f"{m}_r"
-            w_ranks[m] = window[["time", "stock_id", "industry_sw", rcol, "H"]].rename(columns={rcol: "rank_pct"})
-
-        cal.fit_window(w_ranks)
+        if i == cfg.rolling_window:
+            # First window: full rebuild
+            w_start = all_dates[i - cfg.rolling_window]
+            w_end = all_dates[i - 1]
+            window = merged_ranked[(merged_ranked["time"] >= w_start) & (merged_ranked["time"] <= w_end)]
+            w_ranks = {}
+            for m in models:
+                rcol = f"{m}_r"
+                w_ranks[m] = window[["time", "stock_id", "industry_sw", rcol, "H"]].rename(columns={rcol: "rank_pct"})
+            cal.fit_window(w_ranks)
+        else:
+            # Incremental: +newest day, -oldest day
+            new_idx = i - 1
+            drop_idx = i - cfg.rolling_window - 1
+            new_ranks = _day_ranks(new_idx)
+            drop_ranks = _day_ranks(drop_idx) if drop_idx >= 0 else None
+            cal.update_incremental(new_ranks, drop_ranks)
 
         if i < effective_burnin:
             continue
@@ -889,14 +927,165 @@ def build_bayes_scores(
                 merged_ranked["time"] == t, ["time", "stock_id", rcol]
             ].rename(columns={rcol: "rank_pct"})
 
-        scores = cal.score(today, t_ranks).reset_index()
-        scores.columns = ["stock_id", "bayes_score"]
-        scores["time"] = t
+        if detailed:
+            scores = cal.score_detailed(today, t_ranks)
+            scores["time"] = t
+        else:
+            scores = cal.score(today, t_ranks).reset_index()
+            scores.columns = ["stock_id", "bayes_score"]
+            scores["time"] = t
         scores_list.append(scores)
+        if (i + 1) % 100 == 0:
+            elapsed = _timer.perf_counter() - _b_start
+            done = len(scores_list)
+            total = max(len(eval_date_set) if eval_date_set else (len(all_dates) - effective_burnin), 1)
+            eta = elapsed / max(done, 1) * (total - done) if done < total else 0
+            print(f"  Bayes [{i+1}/{len(all_dates)}] {pd.Timestamp(t).date()}"
+                  f"  emitted={done}/{total}  elapsed={elapsed:.0f}s  ETA~{eta:.0f}s")
 
     if not scores_list:
-        return pd.DataFrame(columns=["stock_id", "bayes_score", "time"])
+        cols = ["stock_id", "bayes_score", "time"]
+        if detailed:
+            cols += [f"{m}_llr_blended" for m in models]
+        return pd.DataFrame(columns=cols)
     return pd.concat(scores_list, ignore_index=True)
+
+
+def apply_online_gate(
+    scores_detail: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    models: list[str] | None = None,
+    top_n: int = 50,
+    gate_burnin: int = 21,
+    reward_window: int = 1,
+    return_col: str = "return_1d",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply Online Expert Gate to per-model Bayes contributions.
+
+    Parameters
+    ----------
+    scores_detail:
+        Output of build_bayes_scores(..., detailed=True).
+        Must have columns: time, stock_id, bayes_score, {m}_rank, {m}_llr_blended.
+
+    returns_df:
+        Backtest returns with columns time, stock_id, return_col.
+
+    models:
+        Model names (inferred from columns if None).
+
+    top_n:
+        Top-N stocks per model for daily return computation.
+
+    gate_burnin:
+        Minimum days before gate weights leave uniform.
+
+    reward_window:
+        Rolling window (days) to smooth per-model daily returns before
+        feeding to the gate.  1 = daily (no smoothing), 5 = weekly.
+
+    return_col:
+        Return column name in returns_df.
+
+    Returns
+    -------
+    (gated_scores, gate_history)
+        gated_scores: time, stock_id, bayes_score (gated), bayes_score_raw,
+                      {m}_llr_blended, {m}_weight.
+        gate_history: per-date gate weights, excess returns, eta.
+    """
+    scores = scores_detail.copy()
+    scores["time"] = pd.to_datetime(scores["time"])
+    ret = returns_df.copy()
+    ret["time"] = pd.to_datetime(ret["time"])
+    ret["stock_id"] = ret["stock_id"].astype(str).str.strip().str.zfill(6)
+
+    if models is None:
+        contrib_cols = [c for c in scores.columns if c.endswith("_llr_blended")]
+        models = sorted(c.replace("_llr_blended", "") for c in contrib_cols)
+        if not models:
+            raise ValueError("No {m}_llr_blended columns found in scores_detail.")
+
+    gate = OnlineExpertGate(models)
+    all_dates = sorted(scores["time"].drop_duplicates())
+    return_dates = sorted(ret["time"].drop_duplicates())
+
+    # Map signal date → next return date (same logic as engine)
+    next_ret: dict[pd.Timestamp, pd.Timestamp] = {}
+    for d in all_dates:
+        future = [r for r in return_dates if r > d]
+        if future:
+            next_ret[d] = future[0]
+
+    gated_list: list[pd.DataFrame] = []
+    gate_rows: list[dict] = []
+    from collections import deque
+    _daily_ret_buf: dict[str, deque[float]] = {m: deque(maxlen=reward_window) for m in models}
+
+    for di, signal_date in enumerate(all_dates):
+        day = scores[scores["time"] == signal_date].copy()
+        ret_date = next_ret.get(signal_date)
+        ret_day = ret[ret["time"] == ret_date] if ret_date is not None else None
+
+        # Compute per-model daily return from previous signal date.
+        # Use RAW rank (not Bayes contribution) to avoid feedback loop with
+        # auto_weights.  Gate judges model quality independently; Bayes
+        # contribution handles industry/bin calibration.
+        if di > 0 and ret_day is not None:
+            prev_date = all_dates[di - 1]
+            prev_day = scores[scores["time"] == prev_date]
+            for m in models:
+                rank_col = f"{m}_rank"
+                if rank_col not in prev_day.columns:
+                    _daily_ret_buf[m].append(0.0)
+                    continue
+                top_ids = prev_day.nlargest(top_n, rank_col)["stock_id"].tolist()
+                top_rets = ret_day[ret_day["stock_id"].isin(top_ids)]
+                _daily_ret_buf[m].append(float(top_rets[return_col].mean()) if not top_rets.empty else 0.0)
+
+            # Feed rolling-mean return to gate once buffer is full.
+            if len(_daily_ret_buf[models[0]]) >= reward_window:
+                smoothed_rets = {m: np.mean(buf) for m, buf in _daily_ret_buf.items()}
+                gate.update(smoothed_rets)
+
+        # Build gated score = Σ w_m * S_m
+        w = gate.weights()
+        raw = day["bayes_score"].values if "bayes_score" in day.columns else np.zeros(len(day))
+        gated = np.zeros(len(day), dtype=float)
+        for m in models:
+            contrib_col = f"{m}_llr_blended"
+            if contrib_col in day.columns:
+                gated += float(w.get(m, 0.0)) * day[contrib_col].fillna(0.0).values
+
+        out = day[["time", "stock_id"]].copy()
+        out["bayes_score"] = gated
+        out["bayes_score_raw"] = raw
+        for m in models:
+            contrib_col = f"{m}_llr_blended"
+            if contrib_col in day.columns:
+                out[contrib_col] = day[contrib_col]
+            out[f"{m}_weight"] = float(w.get(m, 0.0))
+        if "industry_sw" in day.columns:
+            out["industry_sw"] = day["industry_sw"]
+        gated_list.append(out)
+
+        gate_rows.append({
+            "time": signal_date,
+            **{f"{m}_weight": float(w.get(m, 0.0)) for m in models},
+            **{f"{m}_contrib_ret": float(0.0) for m in models},  # filled below
+        })
+
+    gated_scores = pd.concat(gated_list, ignore_index=True) if gated_list else pd.DataFrame()
+    gate_history = pd.DataFrame(gate_rows) if gate_rows else pd.DataFrame()
+
+    # Fill contrib_ret from gate history
+    if not gate_history.empty and gate._history:
+        for gi, h in enumerate(gate._history):
+            if gi + 1 < len(gate_history):
+                for mi, m in enumerate(models):
+                    gate_history.loc[gi + 1, f"{m}_contrib_ret"] = float(h["excess"][mi])
+
+    return gated_scores, gate_history
 
 
 # ------------------------------------------------------------------

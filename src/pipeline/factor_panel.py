@@ -17,7 +17,11 @@ Design notes
 
 from __future__ import annotations
 
+import gc
 import json
+import shutil
+import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -54,7 +58,7 @@ NEW12_FACTORS: tuple[str, ...] = (
     "F017IVOL",
     "F018AMIHUD",
     "F019COSTDEV",
-    "F020BP",
+    "F020LIMITUP_RECENCY",
     "F021CFP",
     "F022GPTA",
     "F023ACCRUAL",
@@ -99,65 +103,29 @@ FIN6_FACTORS: tuple[str, ...] = (
 
 IND1_FACTORS: tuple[str, ...] = ("F055IND",)
 
-DEFAULT_FACTOR_NAMES: tuple[str, ...] = BARRA12_FACTORS + NEW12_FACTORS + TECH24_FACTORS + FIN6_FACTORS + IND1_FACTORS
+NEW45_FACTORS: tuple[str, ...] = (
+    "F056GAP_UP_FAIL",    "F057INTRA1",        "F058O2O_RET5",       "F059GK_VOL20",
+    "F060ON_INTRA_DIV5",  "F061GAP_UP_HOLD",   "F062GAP_DN_RECOVER", "F063RET5D_SKIP1",
+    "F064RET_ACCEL20",    "F065MAXDD20",        "F066EFFICIENCY20",   "F067TAIL_LOSS20",
+    "F068SKEW20",         "F069DNVOL20",        "F070UP_DN_VOL",      "F071VOL_OF_VOL",
+    "F072CORR_60D",       "F073KURT_60D",       "F074BETA_20D",       "F075VOLUME_RATIO",
+    "F076SIGNED_AMT20",   "F077AMP_VOL20",      "F078TURN_SIZE",      "F079TURN_ACCEL",
+    "F080VWAP_DEV",       "F081STRONG_CLOSE",   "F082LOCKED_PCT",     "F083TURN_FREE",
+    "F084AMT_FREE20",     "F085SP_TTM",         "F086DIV_TTM",        "F087LIST_AGE",
+    "F088CF_SALES_Q",     "F089CASH_PROFIT",    "F090CRR",            "F091CF_VOL",
+    "F092EARN_STAB",      "F093FCF_YIELD",      "F094CAPEX_INT",      "F095NET_FIN",
+    "F096DILUTION",       "F097INT_BURDEN",     "F098DIV_PAYOUT",     "F099AR_MINUS_REV",
+    "F100INV_MINUS_REV",
+)
 
-FACTOR_ALIAS: dict[str, str] = {
-    "F001SIZE": "SIZE",
-    "F002SIZENL": "SIZENL",
-    "F003LIQUIDITY": "LIQUIDITY",
-    "F004BETA": "BETA",
-    "F005RESVOL": "RESVOL",
-    "F006MOMENTUM": "MOMENTUM",
-    "F007LTREV": "LTREV",
-    "F008STREV": "STREV",
-    "F009LEVERAGE": "LEVERAGE",
-    "F010VALUE": "VALUE",
-    "F011EARNYLD": "EARNYLD",
-    "F012GROWTH": "GROWTH",
-    "F013REV5": "F1_rev5",
-    "F014MOM120_20": "F2_mom120_20",
-    "F015VOLREV": "F3_volrev",
-    "F016MAXRET": "F4_maxret",
-    "F017IVOL": "F5_ivol",
-    "F018AMIHUD": "F6_amihud",
-    "F019COSTDEV": "F7_costdev",
-    "F020BP": "F8_bp",
-    "F021CFP": "F9_cfp",
-    "F022GPTA": "F10_gpta",
-    "F023ACCRUAL": "F11_accrual",
-    "F024ASSETGR": "F12_assetgr",
-    "F025GAP": "F25_gap",
-    "F026KLEN": "F26_klen",
-    "F027KUP": "F27_kup",
-    "F028KLOW": "F28_klow",
-    "F029KSFT": "F29_ksft",
-    "F030RSV20": "F30_rsv20",
-    "F031RSV60": "F31_rsv60",
-    "F032RANGEZ20": "F32_rangez20",
-    "F033GAPREV5": "F33_gaprev5",
-    "F034HIGHDEV20": "F34_highdev20",
-    "F035LOWDEV20": "F35_lowdev20",
-    "F036VOLSHOCK5": "F36_volshock5",
-    "F037VOLSHOCK20": "F37_volshock20",
-    "F038TURNZ20": "F38_turnz20",
-    "F039VSTD20": "F39_vstd20",
-    "F040PVCORR20": "F40_pvcorr20",
-    "F041RETVOLCORR20": "F41_retvolcorr20",
-    "F042AMTCORR20": "F42_amtcorr20",
-    "F043SLOPE20": "F43_slope20",
-    "F044RSQR20": "F44_rsqr20",
-    "F045RESI20": "F45_resi20",
-    "F046LIMITUP20": "F46_limitup20",
-    "F047LIMITDN20": "F47_limitdn20",
-    "F048LIMITSTREAKUP": "F48_limitstreakup",
-    "F049ROE": "F49_roe",
-    "F050ROA": "F50_roa",
-    "F051GPM": "F51_gpm",
-    "F052CFOA": "F52_cfoa",
-    "F053RD_INTENSITY": "F53_rd_intensity",
-    "F054RECEIVABLE_RATIO": "F54_receivable_ratio",
-    "F055IND": "F55_ind",
-}
+DEFAULT_FACTOR_NAMES: tuple[str, ...] = (
+    BARRA12_FACTORS + NEW12_FACTORS + TECH24_FACTORS + FIN6_FACTORS + IND1_FACTORS + NEW45_FACTORS
+)
+
+FACTOR_ALIAS: dict[str, str] = {}
+
+
+    # V2 expansion (F056GAP_UP_FAIL-F100INV_MINUS_REV)
 
 
 # ---------------------------------------------------------------------
@@ -217,9 +185,67 @@ class FactorPanelConfig:
     save_raw_factors: bool = False
     save_winsorized_factors: bool = False
 
+    # Universe: optional list of index-constituent Excel paths (ZZ500, ZZ1000, etc.).
+    # When non-empty, only stocks appearing in the union of these indices are kept.
+    universe_paths: tuple[str, ...] = ()
+
+    # Path to standalone adj_factor panel (pulled from Tushare API).
+    # When provided and the file exists, adj_factor is merged from here instead of
+    # being derived from close_adj/close.  Defaults to the canonical location.
+    adj_factor_path: str = "dataset/input/tushare/adj_factor_panel.parquet"
+
     # Metadata / version
     factor_version: str = "v1_24f"
     seed: int = 42
+
+
+@dataclass(frozen=True)
+class FactorBatchSpec:
+    """Internal factor-batch specification.
+
+    keep_cols_extra is intentionally explicit so each batch only carries the
+    columns it needs.  The scheduler splits by these specs rather than by raw
+    F-number order.  Each production batch is capped at <=10 factors.
+    """
+
+    name: str
+    factors: tuple[str, ...]
+    keep_cols_extra: tuple[str, ...] = ()
+    precompute: str | None = None
+
+
+FACTOR_BATCH_SPECS: tuple[FactorBatchSpec, ...] = (
+    FactorBatchSpec("old_size_liquidity", ("F001SIZE", "F002SIZENL", "F003LIQUIDITY"),
+                    ("mktcap_total", "mktcap_float", "amount")),
+    FactorBatchSpec("old_capm", ("F004BETA", "F005RESVOL", "F013REV5", "F014MOM120_20", "F017IVOL"),
+                    ("ret_daily", "mkt_ret_vw"), "capm"),
+    FactorBatchSpec("old_momentum_value", ("F006MOMENTUM", "F007LTREV", "F008STREV", "F009LEVERAGE", "F010VALUE", "F015VOLREV", "F016MAXRET", "F018AMIHUD", "F019COSTDEV"),
+                    ("close_adj", "ret_daily", "amount", "volume", "mktcap_total", "mktcap_float", "total_assets", "total_liabilities", "equity_parent")),
+    FactorBatchSpec("old_ttm_style", ("F011EARNYLD", "F012GROWTH", "F021CFP", "F022GPTA", "F023ACCRUAL", "F024ASSETGR"),
+                    ("mktcap_total", "mktcap_float", "total_assets", "equity_parent", "rd_expense", "receivables"), "old_ttm"),
+    FactorBatchSpec("tech_ohlc", ("F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT", "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5", "F034HIGHDEV20"),
+                    ("open", "high", "low", "close", "pre_close", "close_adj", "amount", "volume"), "adj_ohlc"),
+    FactorBatchSpec("tech_volume_regime", ("F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20", "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20", "F042AMTCORR20"),
+                    ("open", "high", "low", "close", "close_adj", "ret_daily", "amount", "volume", "turnover_rate", "turnover_rate_f"), "rolling_corr"),
+    FactorBatchSpec("tech_reg_limit", ("F043SLOPE20", "F044RSQR20", "F045RESI20", "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP", "F049ROE", "F050ROA", "F051GPM", "F052CFOA"),
+                    ("close_adj", "limit_status", "mktcap_total", "mktcap_float", "total_assets", "equity_parent"), "regression20"),
+    FactorBatchSpec("old_fin_remaining", ("F053RD_INTENSITY", "F054RECEIVABLE_RATIO", "F055IND"),
+                    ("rd_expense", "receivables", "industry_sw"), "old_ttm"),
+    FactorBatchSpec("v2_o2o", NEW45_FACTORS[:7],
+                    ("open", "high", "low", "close", "pre_close", "volume", "amount"), "o2o"),
+    FactorBatchSpec("v2_momentum_path", NEW45_FACTORS[7:11],
+                    ("close_adj", "ret_daily"), "path"),
+    FactorBatchSpec("v2_vol_market", NEW45_FACTORS[11:19],
+                    ("open", "high", "low", "close", "ret_daily", "mkt_ret_vw"), "ret_stats"),
+    FactorBatchSpec("v2_volume_vwap", NEW45_FACTORS[19:26],
+                    ("open", "high", "low", "close", "ret_daily", "amount", "volume", "volume_ratio", "turnover_rate", "mktcap_total"), "volume_vwap"),
+    FactorBatchSpec("v2_float_value_age", NEW45_FACTORS[26:32],
+                    ("close", "amount", "free_share", "float_share", "total_share", "ps_ttm", "dv_ttm", "list_date"), "float_value_age"),
+    FactorBatchSpec("v2_cash_quality", NEW45_FACTORS[32:38],
+                    ("mktcap_float", "mktcap_total"), "v2_financial"),
+    FactorBatchSpec("v2_financing_growth", NEW45_FACTORS[38:45],
+                    ("mktcap_float", "mktcap_total"), "v2_financial"),
+)
 
 
 # ---------------------------------------------------------------------
@@ -231,117 +257,142 @@ def compute_factor_panel_full(
     config: FactorPanelConfig | None = None,
 ) -> dict[str, Any]:
     """
-    Compute full factor panel from base panel and quarterly financial panel.
+    Compute full factor panel from base and quarterly financial panels.
 
-    Factors are computed in batches of 10 to keep peak memory low.
-    Each batch is saved as a column extension to the output parquet.
+    Internal production batches are capped at <=10 factors.  Each batch writes
+    a temporary narrow parquet file under dataset/processed/_factor_tmp/{ts}/.
+    The final wide panel is merged once at the end to avoid repeatedly reading
+    and rewriting the full 3M+ row output parquet.
     """
 
     if config is None:
         config = FactorPanelConfig()
 
+    started = time.perf_counter()
     base = load_base_panel(config)
     financial = load_financial_quarterly_panel(config)
 
+    # Universe filter: restrict to index constituents before factor computation
+    if config.universe_paths:
+        universe: set[str] = set()
+        for p in config.universe_paths:
+            idx = pd.read_excel(p)
+            col = idx.columns[4]  # stock_id column
+            universe.update(idx[col].astype(str).str.strip().str.zfill(6))
+        base = base[base[config.stock_col].isin(universe)].copy()
+        print(f"Universe filter: {len(universe)} index stocks, "
+              f"{base[config.stock_col].nunique()} in base panel")
+
     factor_names = tuple(config.factor_names)
-    batch_size = 10
     output_path = Path(config.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    all_raw_cols: list[str] = []
-    first_batch = True
-    n_batches = (len(factor_names) + batch_size - 1) // batch_size
+    timestamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    tmp_root = output_path.parent / "_factor_tmp" / timestamp
+    tmp_root.mkdir(parents=True, exist_ok=False)
 
-    for b in range(0, len(factor_names), batch_size):
-        batch = factor_names[b:b + batch_size]
-        batch_num = b // batch_size + 1
-        print(f"\n--- Batch {batch_num}/{n_batches}: {', '.join(batch)} ---")
+    shared_cache: dict[str, Any] = {}
+    batch_files: list[Path] = []
+    batches = list(iter_factor_batches(factor_names))
 
-        panel = compute_factor_columns(
-            base_panel=base,
-            financial_quarterly=financial,
-            config=config,
-            factor_names=batch,
-        )
+    print(f"\nComputing factor panel in {len(batches)} production batches")
+    print(f"Temporary directory: {tmp_root}")
+
+    try:
+        for i, spec in enumerate(batches, start=1):
+            batch = tuple(f for f in spec.factors if f in factor_names)
+            if not batch:
+                continue
+            if len(batch) > 10:
+                raise ValueError(f"Batch {spec.name} has {len(batch)} factors; cap is 10.")
+
+            print(f"\n[Batch {i:02d}/{len(batches):02d}] {spec.name}: {', '.join(batch)}")
+            t0 = time.perf_counter()
+            panel = compute_factor_columns(
+                base_panel=base,
+                financial_quarterly=financial,
+                config=config,
+                factor_names=batch,
+                shared_cache=shared_cache,
+            )
+
+            panel = filter_and_select_output_columns(
+                panel=panel,
+                config=config,
+                factor_names=batch,
+                include_targets=False,
+            )
+
+            key_cols = [config.date_col, config.stock_col]
+            keep_cols = key_cols + [f for f in batch if f in panel.columns]
+            panel = panel[keep_cols].copy()
+
+            batch_path = tmp_root / f"batch_{i:02d}_{spec.name}.parquet"
+            panel.to_parquet(batch_path, index=False)
+            batch_files.append(batch_path)
+            print(f"  saved {batch_path.name} rows={len(panel):,} elapsed={time.perf_counter()-t0:.1f}s")
+
+            del panel
+            gc.collect()
+
+        print("\nMerging batch parquet files...")
+        panel = build_base_output_skeleton(base, config)
+        for path in batch_files:
+            t0 = time.perf_counter()
+            part = pd.read_parquet(path)
+            part = standardize_panel_keys(part, config)
+            panel = panel.merge(part, on=[config.date_col, config.stock_col], how="inner")
+            print(f"  merged {path.name} elapsed={time.perf_counter()-t0:.1f}s")
+            del part
+            gc.collect()
+
+        if config.mode == "research":
+            targets = build_targets(panel, config)
+            for col in config.target_names:
+                if col in targets.columns:
+                    panel[col] = targets[col]
+        elif config.mode == "live":
+            for col in config.target_names:
+                panel[col] = np.nan
+        else:
+            raise ValueError(f"Unsupported mode: {config.mode}")
 
         panel = filter_and_select_output_columns(
             panel=panel,
             config=config,
-            factor_names=batch,
-            include_targets=False,
+            factor_names=config.factor_names,
         )
 
-        if first_batch:
-            panel.to_parquet(output_path, index=False)
-            first_batch = False
-        else:
-            new_cols = [config.date_col, config.stock_col] + [f for f in batch if f in panel.columns]
-            existing = pd.read_parquet(output_path)
-            existing[config.date_col] = pd.to_datetime(existing[config.date_col]).dt.normalize()
-            existing[config.stock_col] = existing[config.stock_col].astype(str).str.strip().str.zfill(6)
-            merged = existing.merge(
-                panel[new_cols],
-                on=[config.date_col, config.stock_col],
-                how="inner",
-            )
-            merged.to_parquet(output_path, index=False)
-            del existing, merged
+        audit = run_factor_panel_checks(panel, config, config.factor_names)
+        panel.to_parquet(output_path, index=False)
 
-        for fn in batch:
-            if fn in panel.columns:
-                all_raw_cols.append(fn)
-        # Free memory
-        del panel
+        metadata = build_factor_metadata(panel=panel, config=config, audit=audit)
+        metadata_path = Path(config.metadata_path)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
 
-    # Reload merged panel, add targets, final save
-    panel = pd.read_parquet(output_path)
-    panel[config.date_col] = pd.to_datetime(panel[config.date_col]).dt.normalize()
-    panel[config.stock_col] = panel[config.stock_col].astype(str).str.strip().str.zfill(6)
+        print(f"\nSaved factor panel: {output_path}")
+        print(f"Saved metadata: {metadata_path}")
+        print(
+            f"rows={len(panel):,}, "
+            f"stocks={panel[config.stock_col].nunique():,}, "
+            f"dates={panel[config.date_col].min()}~{panel[config.date_col].max()}, "
+            f"elapsed={time.perf_counter()-started:.1f}s"
+        )
 
-    if config.mode == "research":
-        targets = build_targets(panel, config)
-        for col in config.target_names:
-            if col in targets.columns:
-                panel[col] = targets[col]
-    elif config.mode == "live":
-        for col in config.target_names:
-            panel[col] = np.nan
-
-    panel = filter_and_select_output_columns(
-        panel=panel,
-        config=config,
-        factor_names=config.factor_names,
-    )
-
-    audit = run_factor_panel_checks(panel, config, config.factor_names)
-
-    panel.to_parquet(output_path, index=False)
-
-    metadata = build_factor_metadata(
-        panel=panel,
-        config=config,
-        audit=audit,
-    )
-    metadata_path = Path(config.metadata_path)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
-
-    print(f"\nSaved factor panel: {output_path}")
-    print(f"Saved metadata: {metadata_path}")
-    print(
-        f"rows={len(panel):,}, "
-        f"stocks={panel[config.stock_col].nunique():,}, "
-        f"dates={panel[config.date_col].min()}~{panel[config.date_col].max()}"
-    )
-
-    return {
-        "factor_panel_path": str(output_path),
-        "metadata_path": str(metadata_path),
-        "audit": audit,
-    }
+        return {
+            "factor_panel_path": str(output_path),
+            "metadata_path": str(metadata_path),
+            "audit": audit,
+        }
+    finally:
+        if tmp_root.exists():
+            shutil.rmtree(tmp_root, ignore_errors=True)
+        shared_cache.clear()
+        gc.collect()
 
 
 def append_factor_panel_rows(
@@ -404,10 +455,8 @@ def append_factor_panel_rows(
             if col in targets.columns:
                 recomputed[col] = targets[col]
     elif config.mode == "live":
-        targets = build_targets(recomputed, config)
         for col in config.target_names:
-            if col in targets.columns:
-                recomputed[col] = targets[col]
+            recomputed[col] = np.nan
     else:
         raise ValueError(f"Unsupported mode: {config.mode}")
 
@@ -550,192 +599,378 @@ def compute_factor_columns(
     financial_quarterly: pd.DataFrame,
     config: FactorPanelConfig,
     factor_names: Sequence[str],
+    shared_cache: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """
     Compute selected factor columns.
 
-    Returns a copy of base_panel with raw/winsor/final factor columns added.
+    The public signature is preserved; shared_cache is an internal optional
+    cache used by full historical computation to avoid recomputing large shared
+    tables across adjacent batches.
     """
+
+    if shared_cache is None:
+        shared_cache = {}
 
     factor_names = tuple(factor_names)
     unknown = sorted(set(factor_names) - set(DEFAULT_FACTOR_NAMES))
     if unknown:
         raise ValueError(f"Unsupported factor names: {unknown}")
 
-    df = standardize_panel_keys(base_panel, config)
-    df = df.sort_values([config.stock_col, config.date_col]).reset_index(drop=True)
+    df = prepare_working_panel(base_panel, config, factor_names)
 
-    # Prune rows: keep only warmup window (4y before model_start) + model period
-    warmup_start = pd.Timestamp(config.model_start_date) - pd.DateOffset(years=4)
-    df = df[df[config.date_col] >= warmup_start].copy()
+    # Apply backward-adjustment factor to OHLC prices so all downstream return
+    # computations (ret_daily, momentum, targets, K-line factors) use adjusted
+    # prices, free of split/dividend artifacts.
+    if "adj_factor" not in df.columns:
+        if "close_adj" in df.columns and "close" in df.columns:
+            df["adj_factor"] = df["close_adj"] / df["close"].clip(lower=1e-12)
+    # Save raw close before adjustment (VWAP/turnover factors need it)
+    if "close" in df.columns and "adj_factor" in df.columns:
+        df["_close_raw"] = df["close"].copy()
 
-    # Prune columns — only keep what factor computation + downstream needs
-    keep_cols = {
-        config.date_col, config.stock_col,
-        "open", "high", "low", "close", "pre_close", "close_adj",
-        "ret_daily", "mkt_ret_vw",
-        "mktcap_total", "mktcap_float", "amount", "volume",
-        "total_assets", "total_liabilities", "equity_parent",
-        "receivables", "rd_expense",
-        "trade_status", "limit_status", "turnover_rate",
-        "pb", "pe_ttm", "list_date",
-    }
-    keep_cols |= {c for c in df.columns if c.startswith("industry")}
-    keep_cols = {c for c in keep_cols if c in df.columns}
-    df = df[list(keep_cols)]
+    for col in ("open", "high", "low", "close"):
+        if col in df.columns and "adj_factor" in df.columns:
+            df[col] = df[col] * df["adj_factor"]
+
+    # pre_close_adj = previous day's close_adj (already adjusted above)
+    if "pre_close" in df.columns and "close" in df.columns:
+        df = df.sort_values([config.stock_col, config.date_col])
+        df["pre_close"] = df.groupby(config.stock_col)["close"].shift(1)
+
+    # Overwrite ret_daily with adjusted-open-to-open return.
+    if "open" in df.columns and "ret_daily" in df.columns:
+        df["ret_daily"] = df.groupby(config.stock_col)["open"].transform(
+            lambda x: x / x.shift(1) - 1.0
+        )
 
     needs = set(factor_names)
 
     # Shared CAPM residual for residual-based factors.
-    needs_resid = bool(
-        needs.intersection(
-            {
-                "F013REV5",
-                "F014MOM120_20",
-                "F017IVOL",
-            }
-        )
-    )
+    needs_resid = bool(needs & {"F013REV5", "F014MOM120_20", "F017IVOL"})
     if needs_resid:
-        print("  CAPM residual...")
+        print_factor_progress("CAPM", "residual")
         df["_capm_resid"] = build_capm_residual(df, config)
 
-    # Group A: old price / volume factors.
+    # F001-F010 and F013-F019 direct daily/rolling factors.
+    direct_builders: list[tuple[str, Any, tuple[Any, ...]]] = [
+        ("F001SIZE", build_size, (config,)),
+        ("F003LIQUIDITY", build_liquidity, (config,)),
+        ("F006MOMENTUM", build_momentum, (config,)),
+        ("F007LTREV", build_ltrev, (config,)),
+        ("F008STREV", build_strev, (config,)),
+        ("F009LEVERAGE", build_leverage, (config,)),
+        ("F010VALUE", build_value, (config,)),
+        ("F013REV5", build_rev5, (config,)),
+        ("F014MOM120_20", build_resid_mom120_20, (config,)),
+        ("F015VOLREV", build_volrev, (config,)),
+        ("F016MAXRET", build_maxret, (config,)),
+        ("F017IVOL", build_ivol, (config,)),
+        ("F018AMIHUD", build_amihud, (config,)),
+        ("F019COSTDEV", build_costdev, (config,)),
+    ]
+
     if "F001SIZE" in needs or "F002SIZENL" in needs:
-        print("  F001SIZE...")
+        print_factor_progress("F001SIZE", "build")
         df["F001SIZE_raw"] = build_size(df, config)
 
     if "F002SIZENL" in needs:
-        print("  F002SIZENL...")
-        if "F001SIZE_raw" not in df.columns:
-            df["F001SIZE_raw"] = build_size(df, config)
+        print_factor_progress("F002SIZENL", "build")
         df["F002SIZENL_raw"] = build_sizenl(df, config, df["F001SIZE_raw"])
 
-    if "F003LIQUIDITY" in needs:
-        print("  F003LIQUIDITY...")
-        df["F003LIQUIDITY_raw"] = build_liquidity(df, config)
-
     if "F004BETA" in needs or "F005RESVOL" in needs:
-        print("  F004BETA + F005RESVOL...")
+        print_factor_progress("F004/F005", "beta_resvol")
         beta, resvol = build_beta_resvol(
-            df,
-            config,
-            window=config.beta_window,
-            min_periods=config.beta_min_periods,
+            df, config, window=config.beta_window, min_periods=config.beta_min_periods
         )
         if "F004BETA" in needs:
             df["F004BETA_raw"] = beta
         if "F005RESVOL" in needs:
             df["F005RESVOL_raw"] = resvol
+        del beta, resvol
 
-    if "F006MOMENTUM" in needs:
-        print("  F006MOMENTUM...")
-        df["F006MOMENTUM_raw"] = build_momentum(df, config)
+    for factor, builder, args in direct_builders:
+        if factor not in needs or factor in {"F001SIZE"}:
+            continue
+        print_factor_progress(factor, FACTOR_ALIAS.get(factor, factor))
+        df[f"{factor}_raw"] = builder(df, *args)
 
-    if "F007LTREV" in needs:
-        print("  F007LTREV...")
-        df["F007LTREV_raw"] = build_ltrev(df, config)
+    if "F020LIMITUP_RECENCY" in needs:
+        print_factor_progress("F020LIMITUP_RECENCY", "limitup_recency20")
+        df["F020LIMITUP_RECENCY_raw"] = build_limitup_recency20(df, config)
 
-    if "F008STREV" in needs:
-        print("  F008STREV...")
-        df["F008STREV_raw"] = build_strev(df, config)
+    # F025-F048: technical / volume / regression / limit factors.
+    if needs & set(TECH24_FACTORS):
+        compute_tech24_factors(df, config, factor_names)
 
-    # Group B: old balance-sheet factors.
-    if "F009LEVERAGE" in needs:
-        print("  F009LEVERAGE...")
-        df["F009LEVERAGE_raw"] = build_leverage(df, config)
-
-    if "F010VALUE" in needs:
-        print("  F010VALUE...")
-        df["F010VALUE_raw"] = build_value(df, config)
-
-    # New residual / price / volume factors.
-    if "F013REV5" in needs:
-        print("  F013REV5...")
-        df["F013REV5_raw"] = build_rev5(df, config)
-
-    if "F014MOM120_20" in needs:
-        print("  F014MOM120_20...")
-        df["F014MOM120_20_raw"] = build_resid_mom120_20(df, config)
-
-    if "F015VOLREV" in needs:
-        print("  F015VOLREV...")
-        df["F015VOLREV_raw"] = build_volrev(df, config)
-
-    if "F016MAXRET" in needs:
-        print("  F016MAXRET...")
-        df["F016MAXRET_raw"] = build_maxret(df, config)
-
-    if "F017IVOL" in needs:
-        print("  F017IVOL...")
-        df["F017IVOL_raw"] = build_ivol(df, config)
-
-    if "F018AMIHUD" in needs:
-        print("  F018AMIHUD...")
-        df["F018AMIHUD_raw"] = build_amihud(df, config)
-
-    if "F019COSTDEV" in needs:
-        print("  F019COSTDEV...")
-        df["F019COSTDEV_raw"] = build_costdev(df, config)
-
-    if "F020BP" in needs:
-        # F020SP = TTM revenue / mktcap, computed in build_ttm_factor_raws
-        pass
-
-    # Group E: technical / volume / stressed factors (F025-F048)
-    _compute_tech24_factors(df, config, factor_names)
-
-    # TTM-based factors.
-    ttm_needed = {
-        "F011EARNYLD",
-        "F012GROWTH",
-        "F020BP",
-        "F021CFP",
-        "F022GPTA",
-        "F023ACCRUAL",
-        "F024ASSETGR",
-        "F049ROE",
-        "F050ROA",
-        "F051GPM",
-        "F052CFOA",
-        "F053RD_INTENSITY",
-        "F054RECEIVABLE_RATIO",
+    # Old TTM-based factors F011/F012/F020-F024/F049-F054.
+    old_ttm_needed = {
+        "F011EARNYLD", "F012GROWTH", "F021CFP", "F022GPTA", "F023ACCRUAL", "F024ASSETGR",
+        "F049ROE", "F050ROA", "F051GPM", "F052CFOA", "F053RD_INTENSITY", "F054RECEIVABLE_RATIO",
     }
-    if needs.intersection(ttm_needed):
-        print("  TTM financial factors...")
-        ttm_df = build_ttm_factor_raws(
-            base_panel=df,
-            financial_quarterly=financial_quarterly,
-            config=config,
-        )
-        df = df.merge(ttm_df, on=[config.date_col, config.stock_col], how="left")
+    if needs & old_ttm_needed:
+        cache_key = "old_ttm_raws"
+        if cache_key not in shared_cache:
+            print_factor_progress("OLD_TTM", "financial raw table")
+            shared_cache[cache_key] = build_ttm_factor_raws(df, financial_quarterly, config)
+        ttm_df = shared_cache[cache_key]
+        keep = [config.date_col, config.stock_col] + [f"{f}_raw" for f in old_ttm_needed if f in needs]
+        keep = [c for c in keep if c in ttm_df.columns]
+        df = df.merge(ttm_df[keep], on=[config.date_col, config.stock_col], how="left")
 
     if "F055IND" in needs:
-        df["F055IND_raw"] = (
-            df["industry_sw"].fillna(-1).astype(float)
-            if "industry_sw" in df.columns
-            else -1.0
+        print_factor_progress("F055IND", "industry")
+        df["F055IND_raw"] = df["industry_sw"].fillna(-1).astype(float) if "industry_sw" in df.columns else -1.0
+
+    # V2 factors F056GAP_UP_FAIL-F100INV_MINUS_REV.
+    v2_needs = needs & set(NEW45_FACTORS)
+    if v2_needs:
+        v2_df = compute_v2_factor_batch(
+            df=df,
+            financial_quarterly=financial_quarterly,
+            factor_names=sorted(v2_needs),
+            config=config,
+            shared_cache=shared_cache,
         )
+        for c in v2_df.columns:
+            if c not in (config.date_col, config.stock_col):
+                df[c] = v2_df[c].values
+        del v2_df
 
-    # Drop temporary helper columns to save memory before winsorize
-    tmp_cols = [c for c in df.columns if c.startswith("_")]
-    if tmp_cols:
-        df = df.drop(columns=tmp_cols)
+    drop_temporary_columns(df)
 
-    # Winsorize in batches to keep memory under limit
-    # Each batch: process, then drop _w and _raw of this batch, move to next
-    batch_size = 24
-    fn_list = list(factor_names)
-    for start in range(0, len(fn_list), batch_size):
-        batch = fn_list[start:start + batch_size]
+    for start in range(0, len(factor_names), 10):
+        batch = list(factor_names[start:start + 10])
         df = winsorize_zscore(df=df, factor_names=batch, config=config)
-        # Drop intermediate columns for this batch to free memory
-        drop_cols = [c for c in df.columns
-                     if any(c == f"{f}_w" or (c == f"{f}_raw" and not config.save_raw_factors) for f in batch)]
+        drop_cols = [
+            c for c in df.columns
+            if any(c == f"{f}_w" or (c == f"{f}_raw" and not config.save_raw_factors) for f in batch)
+        ]
         if drop_cols:
-            df = df.drop(columns=drop_cols)
+            df.drop(columns=drop_cols, inplace=True)
 
     return df
+
+
+
+
+# ---------------------------------------------------------------------
+# Factor scheduler helpers
+# ---------------------------------------------------------------------
+
+
+def iter_factor_batches(factor_names: Sequence[str]) -> Iterable[FactorBatchSpec]:
+    """Yield dependency-aware batches capped at <=10 factors."""
+    requested = set(factor_names)
+    emitted: set[str] = set()
+    for spec in FACTOR_BATCH_SPECS:
+        selected = tuple(f for f in spec.factors if f in requested)
+        for i in range(0, len(selected), 10):
+            chunk = selected[i:i + 10]
+            if chunk:
+                emitted.update(chunk)
+                yield FactorBatchSpec(
+                    name=spec.name if len(selected) <= 10 else f"{spec.name}_{i//10+1}",
+                    factors=chunk,
+                    keep_cols_extra=spec.keep_cols_extra,
+                    precompute=spec.precompute,
+                )
+    remaining = tuple(f for f in factor_names if f not in emitted)
+    for i in range(0, len(remaining), 10):
+        chunk = remaining[i:i + 10]
+        if chunk:
+            yield FactorBatchSpec(name=f"misc_{i//10+1}", factors=chunk)
+
+
+def needed_columns_for_factors(factor_names: Sequence[str], config: FactorPanelConfig) -> set[str]:
+    """Return the minimal base-panel columns needed for a requested factor set."""
+    cols: set[str] = {config.date_col, config.stock_col}
+    requested = set(factor_names)
+    for spec in FACTOR_BATCH_SPECS:
+        if requested & set(spec.factors):
+            cols.update(spec.keep_cols_extra)
+
+    # Universal fallback columns used by output, targets, and several legacy helpers.
+    cols.update({
+        "open", "high", "low", "close", "pre_close", "close_adj", "adj_factor",
+        "ret_daily", "mkt_ret_vw", "mktcap_total", "mktcap_float",
+        "amount", "volume", "trade_status", "limit_status",
+        "turnover_rate", "pb", "pe_ttm", "list_date",
+    })
+    if "F055IND" in requested or any(c.startswith("F") for c in requested):
+        cols.add("industry_sw")
+    return cols
+
+
+def prepare_working_panel(
+    base_panel: pd.DataFrame,
+    config: FactorPanelConfig,
+    factor_names: Sequence[str],
+) -> pd.DataFrame:
+    """Standardize, sort, date-prune, and column-prune the working daily panel."""
+    df = standardize_panel_keys(base_panel, config)
+    df = df.sort_values([config.stock_col, config.date_col]).reset_index(drop=True)
+    warmup_start = pd.Timestamp(config.model_start_date) - pd.DateOffset(years=4)
+    df = df[df[config.date_col] >= warmup_start].copy()
+    keep_cols = needed_columns_for_factors(factor_names, config)
+    keep_cols.update(c for c in df.columns if c.startswith("industry"))
+
+    # Merge precise adj_factor from Tushare API (preferred) or keep close_adj/close fallback
+    adj_path = Path(config.adj_factor_path) if config.adj_factor_path else None
+    if adj_path and adj_path.exists():
+        adj_df = pd.read_parquet(adj_path)
+        adj_df[config.date_col] = pd.to_datetime(adj_df[config.date_col])
+        adj_df[config.stock_col] = adj_df[config.stock_col].astype(str).str.strip().str.zfill(6)
+        df = df.merge(adj_df, on=[config.date_col, config.stock_col], how="left")
+        keep_cols.add("adj_factor")
+
+    keep_cols = [c for c in df.columns if c in keep_cols]
+    return df[keep_cols].copy()
+
+
+def build_base_output_skeleton(base_panel: pd.DataFrame, config: FactorPanelConfig) -> pd.DataFrame:
+    """Build the key/meta skeleton used for final batch merge.
+
+    Applies adj_factor to OHLC prices so targets (built from this skeleton)
+    and meta columns are consistent with factors (computed on adjusted prices).
+    """
+    base = standardize_panel_keys(base_panel, config)
+    base = base[base[config.date_col] >= pd.Timestamp(config.model_start_date)].copy()
+
+    # Merge precise adj_factor from Tushare API if available
+    adj_path = Path(config.adj_factor_path) if config.adj_factor_path else None
+    if adj_path and adj_path.exists():
+        adj_df = pd.read_parquet(adj_path)
+        adj_df[config.date_col] = pd.to_datetime(adj_df[config.date_col])
+        adj_df[config.stock_col] = adj_df[config.stock_col].astype(str).str.strip().str.zfill(6)
+        base = base.merge(adj_df, on=[config.date_col, config.stock_col], how="left")
+
+    # Fallback: derive adj_factor from close_adj/close if not merged above
+    if "adj_factor" not in base.columns:
+        if "close_adj" in base.columns and "close" in base.columns:
+            base["adj_factor"] = base["close_adj"] / base["close"].clip(lower=1e-12)
+    # Fill any NaN adj_factor from merge misses with derived value
+    elif "close_adj" in base.columns and "close" in base.columns:
+        mask = base["adj_factor"].isna()
+        if mask.any():
+            base.loc[mask, "adj_factor"] = (
+                base.loc[mask, "close_adj"] / base.loc[mask, "close"].clip(lower=1e-12)
+            )
+
+    # Apply to OHLC (pre_close handled separately below)
+    if "adj_factor" in base.columns:
+        for col in ("open", "high", "low", "close"):
+            if col in base.columns:
+                base[col] = base[col] * base["adj_factor"]
+
+    # pre_close_adj = previous day's close_adj (correct across ex-dividend dates)
+    if "pre_close" in base.columns and "close" in base.columns and "adj_factor" in base.columns:
+        base = base.sort_values([config.stock_col, config.date_col])
+        base["pre_close"] = base.groupby(config.stock_col)["close"].shift(1)
+
+    # Recalculate ret_daily from adjusted open-to-open
+    if "open" in base.columns:
+        base["ret_daily"] = base.groupby(config.stock_col)["open"].transform(
+            lambda x: x / x.shift(1) - 1.0
+        )
+
+    meta_cols = [
+        "industry_sw", "list_date",
+        "open", "high", "low", "close", "pre_close", "close_adj", "adj_factor",
+        "ret_daily",
+        "mktcap_float", "mktcap_total", "volume", "amount", "trade_status",
+        "limit_status", "turnover_rate", "pb", "pe_ttm",
+    ]
+    keep = [config.date_col, config.stock_col] + [c for c in meta_cols if c in base.columns]
+    return base[keep].sort_values([config.stock_col, config.date_col]).reset_index(drop=True)
+
+
+def print_factor_progress(factor: str, label: str = "") -> None:
+    suffix = f" {label}" if label else ""
+    print(f"  {factor}{suffix}...", flush=True)
+
+
+def drop_temporary_columns(df: pd.DataFrame, keep: Sequence[str] = ()) -> None:
+    """Drop temporary columns in-place and collect garbage."""
+    keep_set = set(keep)
+    tmp_cols = [c for c in df.columns if c.startswith("_") and c not in keep_set]
+    if tmp_cols:
+        df.drop(columns=tmp_cols, inplace=True)
+        gc.collect()
+
+
+def rolling_corr_fast(
+    x: pd.Series,
+    y: pd.Series,
+    group: pd.Series,
+    window: int,
+    min_periods: int,
+    eps: float = 1e-12,
+) -> pd.Series:
+    """Rolling Pearson correlation using rolling-sum decomposition."""
+    valid = x.notna() & y.notna()
+    xv = x.where(valid)
+    yv = y.where(valid)
+    cnt = valid.astype(float).groupby(group).transform(lambda s: s.rolling(window, min_periods=min_periods).sum())
+    c = cnt.clip(lower=1)
+    sx = xv.groupby(group).transform(lambda s: s.rolling(window, min_periods=min_periods).sum())
+    sy = yv.groupby(group).transform(lambda s: s.rolling(window, min_periods=min_periods).sum())
+    sx2 = (xv * xv).groupby(group).transform(lambda s: s.rolling(window, min_periods=min_periods).sum())
+    sy2 = (yv * yv).groupby(group).transform(lambda s: s.rolling(window, min_periods=min_periods).sum())
+    sxy = (xv * yv).groupby(group).transform(lambda s: s.rolling(window, min_periods=min_periods).sum())
+    cov = sxy / c - (sx / c) * (sy / c)
+    vx = (sx2 / c - (sx / c) ** 2).clip(lower=0)
+    vy = (sy2 / c - (sy / c) ** 2).clip(lower=0)
+    out = cov / (np.sqrt(vx * vy) + eps)
+    return out.mask((vx < eps) | (vy < eps))
+
+
+def precompute_regression20_stats(
+    df: pd.DataFrame,
+    config: FactorPanelConfig,
+    price_col: str = "close_adj",
+    window: int = 20,
+    min_periods: int = 10,
+) -> pd.DataFrame:
+    """Precompute 20d trend slope, R², and fixed residual without polyfit callbacks.
+
+    For incomplete warm-up windows, x is always 0..n-1 for the available window,
+    matching the old rolling.apply(polyfit(arange(len(y)), y, 1)) semantics.
+    """
+    group = df[config.stock_col]
+    y = df[price_col].astype(float)
+
+    # For full 20d windows, fixed x=0..19.  For min_periods<window warmup,
+    # we use rolling apply fallback only for the first few rows per stock; this
+    # warmup is tiny compared with the full panel and keeps semantics exact.
+    x_const = np.arange(window, dtype=float)
+    sx = x_const.sum()
+    sx2 = (x_const * x_const).sum()
+    denom = window * sx2 - sx * sx
+
+    sy = y.groupby(group).transform(lambda s: s.rolling(window, min_periods=window).sum())
+    sy2 = (y * y).groupby(group).transform(lambda s: s.rolling(window, min_periods=window).sum())
+
+    # weighted rolling sum for sum(x*y), x=0..19 in the current window.
+    def _rolling_sxy(s: pd.Series) -> pd.Series:
+        return s.rolling(window, min_periods=window).apply(lambda arr: float(np.dot(x_const, arr)), raw=True)
+
+    sxy = y.groupby(group).transform(_rolling_sxy)
+    slope = (window * sxy - sx * sy) / denom
+    intercept = (sy - slope * sx) / window
+    fitted_last = slope * (window - 1) + intercept
+    resid = y - fitted_last
+
+    sst = sy2 - sy * sy / window
+    sse = sy2 - 2 * intercept * sy - 2 * slope * sxy + window * intercept**2 + 2 * intercept * slope * sx + slope**2 * sx2
+    rsq = 1 - sse / sst.where(sst > 1e-12)
+    rsq = rsq.clip(lower=0, upper=1)
+
+    return pd.DataFrame({
+        "_reg20_slope": slope,
+        "_reg20_rsq": rsq,
+        "_reg20_resid": resid,
+    }, index=df.index)
 
 
 # ---------------------------------------------------------------------
@@ -815,9 +1050,22 @@ def build_sizenl(
     config: FactorPanelConfig,
     size_raw: pd.Series,
 ) -> pd.Series:
-    """F002SIZENL proxy: cross-sectional rank of SIZE minus 0.5."""
+    """F002SIZENL: cube of SIZE, orthogonalized to SIZE (CNE5 mid-cap effect).
 
-    return size_raw.groupby(df[config.date_col]).rank(pct=True) - 0.5
+    SIZE_cube = log(mktcap)³
+    SIZENL = SIZE_cube - beta * SIZE  (cross-sectionally per date)
+    Captures the nonlinear mid-cap premium orthogonal to pure size.
+    """
+
+    cube = size_raw ** 3
+    grp = df[config.date_col]
+    # Vectorized per-date moments
+    E_cube = cube.groupby(grp).transform("mean")
+    E_s = size_raw.groupby(grp).transform("mean")
+    cov = (cube * size_raw).groupby(grp).transform("mean") - E_cube * E_s
+    var = (size_raw ** 2).groupby(grp).transform("mean") - E_s ** 2
+    beta = cov / np.maximum(var, 1e-12)
+    return cube - beta * size_raw
 
 
 def build_liquidity(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
@@ -871,16 +1119,16 @@ def build_beta_resvol(
 
 
 def build_momentum(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
-    """F006MOMENTUM = close_adj[t-21] / close_adj[t-252] - 1."""
+    """F006MOMENTUM = open[t-21] / open[t-252] - 1 (open-to-open momentum)."""
 
-    group = df.groupby(config.stock_col)["close_adj"]
+    group = df.groupby(config.stock_col)["open"]
     return group.shift(21) / group.shift(252) - 1
 
 
 def build_ltrev(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
-    """F007LTREV: long-term reversal ensemble based on 504/630/756-day windows."""
+    """F007LTREV: long-term reversal ensemble based on 504/630/756-day windows (open-to-open)."""
 
-    group = df.groupby(config.stock_col)["close_adj"]
+    group = df.groupby(config.stock_col)["open"]
 
     def log_reversal(lookback: int) -> pd.Series:
         return -(
@@ -899,9 +1147,9 @@ def build_ltrev(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
 
 
 def build_strev(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
-    """F008STREV = negative short-term return."""
+    """F008STREV = negative short-term return (open-to-open)."""
 
-    group = df.groupby(config.stock_col)["close_adj"]
+    group = df.groupby(config.stock_col)["open"]
     return -(group.shift(1) / group.shift(21) - 1)
 
 
@@ -1067,18 +1315,35 @@ def build_costdev(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
     )
 
     vwap_120d = amount_sum / volume_sum.where(volume_sum > 0)
-    result = -(df["close"] / vwap_120d.where(vwap_120d > 0) - 1)
+    px = df["_close_raw"] if "_close_raw" in df.columns else df["close"]
+    result = -(px / vwap_120d.where(vwap_120d > 0) - 1)
     result[~np.isfinite(result)] = np.nan
     return result
 
 
-def build_bp(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
-    """F020BP = equity_parent / market cap."""
+def build_limitup_recency20(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
+    """F020LIMITUP_RECENCY LIMITUP_RECENCY20 = exp decay since last limit-up, capped at 20d.
 
-    mkt = df["mktcap_total"].fillna(df["mktcap_float"])
-    result = df["equity_parent"] / mkt.where(mkt > 0)
-    result[~np.isfinite(result)] = np.nan
-    return result
+    Replaces old BP (book-to-price) which was 0.990 correlated with F085SP_TTM SP_TTM.
+    Larger = more recent limit-up.  No limit-up in 20d → 0.
+    """
+    stock = df[config.stock_col]
+    is_lu = df["limit_status"].eq(1)
+
+    def _days_since(x: pd.Series) -> pd.Series:
+        arr = x.to_numpy(dtype=bool)
+        out = np.full(len(arr), np.nan, dtype=float)
+        last = -1
+        for i, flag in enumerate(arr):
+            if flag:
+                last = i
+                out[i] = 0.0
+            elif last >= 0:
+                out[i] = float(i - last)
+        return pd.Series(out, index=x.index)
+
+    days = is_lu.groupby(stock, sort=False).transform(_days_since)
+    return np.where(days <= 20, np.exp(-days / 7.0), 0.0)
 
 
 # ---------------------------------------------------------------------
@@ -1095,13 +1360,164 @@ def _rolling_corr(
     df: pd.DataFrame, config: FactorPanelConfig,
     col_a: str, col_b: str, window: int, eps: float = 1e-12,
 ) -> pd.Series:
-    """Rolling Pearson correlation between two columns, per stock."""
-    result = pd.Series(np.nan, index=df.index, dtype=np.float64)
-    for _sid, grp in df.groupby(config.stock_col, sort=False):
-        idx = grp.index
-        r = grp[col_a].rolling(window, min_periods=max(10, window // 2)).corr(grp[col_b])
-        result.loc[idx] = r.values
-    return result
+    """Deprecated compatibility wrapper around rolling_corr_fast."""
+    warnings.warn(
+        "_rolling_corr is deprecated; use rolling_corr_fast instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return rolling_corr_fast(
+        df[col_a], df[col_b], df[config.stock_col], window, max(10, window // 2), eps
+    )
+
+
+def compute_tech24_factors(
+    df: pd.DataFrame,
+    config: FactorPanelConfig,
+    factor_names: Sequence[str],
+) -> None:
+    """Compute F025-F048 factors in-place, with shared regression/corr helpers."""
+
+    needs = set(factor_names)
+    eps = 1e-12
+    g = df.groupby(config.stock_col, sort=False)
+
+    if needs & {"F030RSV20", "F031RSV60", "F034HIGHDEV20", "F035LOWDEV20"}:
+        df["_adj_factor"] = df["close_adj"] / df["close"].clip(lower=eps)
+        df["_open_adj"] = df["open"] * df["_adj_factor"]
+        df["_high_adj"] = df["high"] * df["_adj_factor"]
+        df["_low_adj"] = df["low"] * df["_adj_factor"]
+
+    if needs & {"F043SLOPE20", "F044RSQR20", "F045RESI20"}:
+        print("  regression20 precompute...")
+        reg20 = precompute_regression20_stats(df, config, price_col="close_adj", window=20, min_periods=10)
+        for c in reg20.columns:
+            df[c] = reg20[c].values
+        del reg20
+
+    factor_builders: list[tuple[str, str, Any]] = [
+        ("F025GAP", "gap", lambda: df["open"] / df["pre_close"].clip(lower=eps) - 1),
+        ("F026KLEN", "klen", lambda: (df["high"] - df["low"]) / (df["open"] + eps)),
+        ("F027KUP", "kup", lambda: (df["high"] - df[["open", "close"]].max(axis=1)) / (df["open"] + eps)),
+        ("F028KLOW", "klow", lambda: (df[["open", "close"]].min(axis=1) - df["low"]) / (df["open"] + eps)),
+        ("F029KSFT", "ksft", lambda: (2 * df["close"] - df["high"] - df["low"]) / (df["open"] + eps)),
+    ]
+    for fid, label, builder in factor_builders:
+        if fid in needs:
+            print_factor_progress(fid, label)
+            df[f"{fid}_raw"] = builder()
+
+    if "F030RSV20" in needs:
+        print_factor_progress("F030RSV20", "rsv20")
+        lo20 = g["_low_adj"].transform(lambda x: x.rolling(20, min_periods=10).min())
+        hi20 = g["_high_adj"].transform(lambda x: x.rolling(20, min_periods=10).max())
+        df["F030RSV20_raw"] = (df["close_adj"] - lo20) / (hi20 - lo20 + eps)
+        del lo20, hi20
+
+    if "F031RSV60" in needs:
+        print_factor_progress("F031RSV60", "rsv60")
+        lo60 = g["_low_adj"].transform(lambda x: x.rolling(60, min_periods=30).min())
+        hi60 = g["_high_adj"].transform(lambda x: x.rolling(60, min_periods=30).max())
+        df["F031RSV60_raw"] = (df["close_adj"] - lo60) / (hi60 - lo60 + eps)
+        del lo60, hi60
+
+    if "F032RANGEZ20" in needs:
+        print_factor_progress("F032RANGEZ20", "rangez20")
+        df["_rng"] = (df["high"] - df["low"]) / (df["open"] + eps)
+        mu = g["_rng"].transform(lambda x: x.rolling(20, min_periods=10).mean())
+        sd = g["_rng"].transform(lambda x: x.rolling(20, min_periods=10).std())
+        df["F032RANGEZ20_raw"] = (df["_rng"] - mu) / (sd + eps)
+        del mu, sd
+
+    if "F033GAPREV5" in needs:
+        print_factor_progress("F033GAPREV5", "gaprev5")
+        df["_gap"] = df["open"] / df["pre_close"].clip(lower=eps) - 1
+        df["F033GAPREV5_raw"] = -g["_gap"].transform(lambda x: x.rolling(5, min_periods=3).sum())
+
+    if "F034HIGHDEV20" in needs:
+        print_factor_progress("F034HIGHDEV20", "highdev20")
+        hi20 = g["_high_adj"].transform(lambda x: x.rolling(20, min_periods=10).max())
+        df["F034HIGHDEV20_raw"] = df["close_adj"] / (hi20 + eps) - 1
+        del hi20
+
+    if "F035LOWDEV20" in needs:
+        print_factor_progress("F035LOWDEV20", "lowdev20")
+        lo20 = g["_low_adj"].transform(lambda x: x.rolling(20, min_periods=10).min())
+        df["F035LOWDEV20_raw"] = df["close_adj"] / (lo20 + eps) - 1
+        del lo20
+
+    if "F036VOLSHOCK5" in needs:
+        print_factor_progress("F036VOLSHOCK5", "volshock5")
+        amt5 = g["amount"].transform(lambda x: x.rolling(5, min_periods=3).mean())
+        df["F036VOLSHOCK5_raw"] = np.log(df["amount"] / (amt5 + eps) + eps)
+        del amt5
+
+    if "F037VOLSHOCK20" in needs:
+        print_factor_progress("F037VOLSHOCK20", "volshock20")
+        amt20 = g["amount"].transform(lambda x: x.rolling(20, min_periods=10).mean())
+        df["F037VOLSHOCK20_raw"] = np.log(df["amount"] / (amt20 + eps) + eps)
+        del amt20
+
+    if "F038TURNZ20" in needs:
+        print_factor_progress("F038TURNZ20", "turnz20")
+        tf_col = "turnover_rate_f" if "turnover_rate_f" in df.columns else "turnover_rate"
+        tf_mu = g[tf_col].transform(lambda x: x.rolling(20, min_periods=10).mean())
+        tf_sd = g[tf_col].transform(lambda x: x.rolling(20, min_periods=10).std())
+        df["F038TURNZ20_raw"] = (df[tf_col] - tf_mu) / (tf_sd + eps)
+        del tf_mu, tf_sd
+
+    if "F039VSTD20" in needs:
+        print_factor_progress("F039VSTD20", "vstd20")
+        df["_logvol"] = np.log(df["volume"] + 1)
+        df["F039VSTD20_raw"] = g["_logvol"].transform(lambda x: x.rolling(20, min_periods=10).std())
+
+    if needs & {"F040PVCORR20", "F041RETVOLCORR20", "F042AMTCORR20"}:
+        if "_logvol" not in df.columns:
+            df["_logvol"] = np.log(df["volume"] + 1)
+        if "_vol_chg" not in df.columns:
+            df["_vol_chg"] = np.log(df["volume"] / (g["volume"].shift(1) + eps) + 1)
+        if "_logamt" not in df.columns:
+            df["_logamt"] = np.log(df["amount"] + 1)
+
+    if "F040PVCORR20" in needs:
+        print_factor_progress("F040PVCORR20", "pvcorr20")
+        df["F040PVCORR20_raw"] = rolling_corr_fast(df["close_adj"], df["_logvol"], df[config.stock_col], 20, 10)
+
+    if "F041RETVOLCORR20" in needs:
+        print_factor_progress("F041RETVOLCORR20", "retvolcorr20")
+        df["F041RETVOLCORR20_raw"] = rolling_corr_fast(df["ret_daily"], df["_vol_chg"], df[config.stock_col], 20, 10)
+
+    if "F042AMTCORR20" in needs:
+        print_factor_progress("F042AMTCORR20", "amtcorr20")
+        df["F042AMTCORR20_raw"] = rolling_corr_fast(df["ret_daily"], df["_logamt"], df[config.stock_col], 20, 10)
+
+    if "F043SLOPE20" in needs:
+        print_factor_progress("F043SLOPE20", "slope20")
+        df["F043SLOPE20_raw"] = df["_reg20_slope"] / (df["close_adj"] + eps)
+
+    if "F044RSQR20" in needs:
+        print_factor_progress("F044RSQR20", "rsqr20")
+        df["F044RSQR20_raw"] = df["_reg20_rsq"]
+
+    if "F045RESI20" in needs:
+        print_factor_progress("F045RESI20", "resi20_fixed")
+        df["F045RESI20_raw"] = df["_reg20_resid"] / (df["close_adj"] + eps)
+
+    if "F046LIMITUP20" in needs:
+        print_factor_progress("F046LIMITUP20", "limitup20")
+        df["F046LIMITUP20_raw"] = g["limit_status"].transform(lambda x: (x == 1).rolling(20, min_periods=5).sum())
+
+    if "F047LIMITDN20" in needs:
+        print_factor_progress("F047LIMITDN20", "limitdn20")
+        df["F047LIMITDN20_raw"] = g["limit_status"].transform(lambda x: (x == -1).rolling(20, min_periods=5).sum())
+
+    if "F048LIMITSTREAKUP" in needs:
+        print_factor_progress("F048LIMITSTREAKUP", "limitstreakup")
+        is_limit = df["limit_status"] == 1
+        streak = is_limit.groupby(df[config.stock_col]).transform(lambda x: x * (x.groupby((x != x.shift()).cumsum()).cumcount() + 1))
+        df["F048LIMITSTREAKUP_raw"] = streak
+
+    drop_temporary_columns(df)
 
 
 def _compute_tech24_factors(
@@ -1109,182 +1525,8 @@ def _compute_tech24_factors(
     config: FactorPanelConfig,
     factor_names: Sequence[str],
 ) -> None:
-    """Compute F025-F048 factors. Modifies df in-place."""
-    needs = set(factor_names)
-    eps = 1e-12
-    g = df.groupby(config.stock_col)
-
-    # Shared: adj open/high/low
-    if needs & {"F030RSV20", "F031RSV60", "F034HIGHDEV20", "F035LOWDEV20"}:
-        df["_adj_factor"] = df["close_adj"] / df["close"].clip(eps)
-        df["_open_adj"] = df["open"] * df["_adj_factor"]
-        df["_high_adj"] = df["high"] * df["_adj_factor"]
-        df["_low_adj"] = df["low"] * df["_adj_factor"]
-
-    # Shared: time_index for regression factors
-    if needs & {"F043SLOPE20", "F044RSQR20", "F045RESI20"}:
-        ti = np.arange(20).reshape(1, -1).astype(np.float64)
-        ti_mean = ti.mean()
-        ti_denom = (ti * ti).sum() - 20 * ti_mean * ti_mean
-
-    # Shared: limit_streak for F048
-    if "F048LIMITSTREAKUP" in needs:
-        pass  # computed inline
-
-    if "F025GAP" in needs:
-        print("  F025GAP...")
-        df["F025GAP_raw"] = df["open"] / df["pre_close"].clip(eps) - 1
-
-    if "F026KLEN" in needs:
-        print("  F026KLEN...")
-        df["F026KLEN_raw"] = (df["high"] - df["low"]) / (df["open"] + eps)
-
-    if "F027KUP" in needs:
-        print("  F027KUP...")
-        df["F027KUP_raw"] = (df["high"] - df[["open", "close"]].max(axis=1)) / (df["open"] + eps)
-
-    if "F028KLOW" in needs:
-        print("  F028KLOW...")
-        df["F028KLOW_raw"] = (df[["open", "close"]].min(axis=1) - df["low"]) / (df["open"] + eps)
-
-    if "F029KSFT" in needs:
-        print("  F029KSFT...")
-        df["F029KSFT_raw"] = (2 * df["close"] - df["high"] - df["low"]) / (df["open"] + eps)
-
-    if "F030RSV20" in needs:
-        print("  F030RSV20...")
-        lo20 = g["_low_adj"].transform(lambda x: x.rolling(20, min_periods=10).min())
-        hi20 = g["_high_adj"].transform(lambda x: x.rolling(20, min_periods=10).max())
-        df["F030RSV20_raw"] = (df["close_adj"] - lo20) / (hi20 - lo20 + eps)
-
-    if "F031RSV60" in needs:
-        print("  F031RSV60...")
-        lo60 = g["_low_adj"].transform(lambda x: x.rolling(60, min_periods=30).min())
-        hi60 = g["_high_adj"].transform(lambda x: x.rolling(60, min_periods=30).max())
-        df["F031RSV60_raw"] = (df["close_adj"] - lo60) / (hi60 - lo60 + eps)
-
-    if "F032RANGEZ20" in needs:
-        print("  F032RANGEZ20...")
-        df["_rng"] = (df["high"] - df["low"]) / (df["open"] + eps)
-        rng20_mu = g["_rng"].transform(lambda x: x.rolling(20, min_periods=10).mean())
-        rng20_sd = g["_rng"].transform(lambda x: x.rolling(20, min_periods=10).std())
-        df["F032RANGEZ20_raw"] = (df["_rng"] - rng20_mu) / (rng20_sd + eps)
-
-    if "F033GAPREV5" in needs:
-        print("  F033GAPREV5...")
-        df["_gap"] = df["open"] / df["pre_close"].clip(eps) - 1
-        df["F033GAPREV5_raw"] = -g["_gap"].transform(lambda x: x.rolling(5, min_periods=3).sum())
-
-    if "F034HIGHDEV20" in needs:
-        print("  F034HIGHDEV20...")
-        hi20_max = g["_high_adj"].transform(lambda x: x.rolling(20, min_periods=10).max())
-        df["F034HIGHDEV20_raw"] = df["close_adj"] / (hi20_max + eps) - 1
-
-    if "F035LOWDEV20" in needs:
-        print("  F035LOWDEV20...")
-        lo20_min = g["_low_adj"].transform(lambda x: x.rolling(20, min_periods=10).min())
-        df["F035LOWDEV20_raw"] = df["close_adj"] / (lo20_min + eps) - 1
-
-    if "F036VOLSHOCK5" in needs:
-        print("  F036VOLSHOCK5...")
-        amt5 = g["amount"].transform(lambda x: x.rolling(5, min_periods=3).mean())
-        df["F036VOLSHOCK5_raw"] = np.log(df["amount"] / (amt5 + eps) + eps)
-
-    if "F037VOLSHOCK20" in needs:
-        print("  F037VOLSHOCK20...")
-        amt20 = g["amount"].transform(lambda x: x.rolling(20, min_periods=10).mean())
-        df["F037VOLSHOCK20_raw"] = np.log(df["amount"] / (amt20 + eps) + eps)
-
-    if "F038TURNZ20" in needs:
-        print("  F038TURNZ20...")
-        tf_col = "turnover_rate_f" if "turnover_rate_f" in df.columns else "turnover_rate"
-        tf_mu = g[tf_col].transform(lambda x: x.rolling(20, min_periods=10).mean())
-        tf_sd = g[tf_col].transform(lambda x: x.rolling(20, min_periods=10).std())
-        df["F038TURNZ20_raw"] = (df[tf_col] - tf_mu) / (tf_sd + eps)
-
-    if "F039VSTD20" in needs:
-        print("  F039VSTD20...")
-        df["_logvol"] = np.log(df["volume"] + 1)
-        df["F039VSTD20_raw"] = g["_logvol"].transform(lambda x: x.rolling(20, min_periods=10).std())
-
-    if "F040PVCORR20" in needs:
-        print("  F040PVCORR20...")
-        df["_logvol"] = np.log(df["volume"] + 1)
-        df["F040PVCORR20_raw"] = _rolling_corr(
-            df, config, "close_adj", "_logvol", 20, eps
-        )
-
-    if "F041RETVOLCORR20" in needs:
-        print("  F041RETVOLCORR20...")
-        df["_vol_chg"] = np.log(df["volume"] / (g["volume"].shift(1) + eps) + 1)
-        df["F041RETVOLCORR20_raw"] = _rolling_corr(
-            df, config, "ret_daily", "_vol_chg", 20, eps
-        )
-
-    if "F042AMTCORR20" in needs:
-        print("  F042AMTCORR20...")
-        df["_logamt"] = np.log(df["amount"] + 1)
-        df["F042AMTCORR20_raw"] = _rolling_corr(
-            df, config, "ret_daily", "_logamt", 20, eps
-        )
-
-    if "F043SLOPE20" in needs:
-        print("  F043SLOPE20...")
-        slope = g["close_adj"].transform(
-            lambda x: x.rolling(20, min_periods=10).apply(
-                lambda y: np.polyfit(np.arange(len(y)), y, 1)[0] if len(y) >= 10 else np.nan,
-                raw=True,
-            )
-        )
-        df["F043SLOPE20_raw"] = slope / (df["close_adj"] + eps)
-
-    if "F044RSQR20" in needs:
-        print("  F044RSQR20...")
-        df["F044RSQR20_raw"] = g["close_adj"].transform(
-            lambda x: x.rolling(20, min_periods=10).apply(
-                lambda y: (
-                    (np.corrcoef(np.arange(len(y)), y)[0, 1] ** 2)
-                    if len(y) >= 10 and np.std(y) > eps
-                    else np.nan
-                ),
-                raw=True,
-            )
-        )
-
-    if "F045RESI20" in needs:
-        print("  F045RESI20...")
-        resid = g["close_adj"].transform(
-            lambda x: x.rolling(20, min_periods=10).apply(
-                lambda y: (
-                    np.polyfit(np.arange(len(y)), y, 1)[1]
-                    - np.polyval(np.polyfit(np.arange(len(y)), y, 1), len(y) - 1)
-                    if len(y) >= 10
-                    else np.nan
-                ),
-                raw=True,
-            )
-        )
-        df["F045RESI20_raw"] = resid / (df["close_adj"] + eps)
-
-    if "F046LIMITUP20" in needs:
-        print("  F046LIMITUP20...")
-        df["F046LIMITUP20_raw"] = g["limit_status"].transform(
-            lambda x: (x == 1).rolling(20, min_periods=5).sum()
-        )
-
-    if "F047LIMITDN20" in needs:
-        print("  F047LIMITDN20...")
-        df["F047LIMITDN20_raw"] = g["limit_status"].transform(
-            lambda x: (x == -1).rolling(20, min_periods=5).sum()
-        )
-
-    if "F048LIMITSTREAKUP" in needs:
-        print("  F048LIMITSTREAKUP...")
-        is_limit = df["limit_status"] == 1
-        streak = is_limit.groupby(df[config.stock_col]).transform(
-            lambda x: x * (x.groupby((x != x.shift()).cumsum()).cumcount() + 1)
-        )
-        df["F048LIMITSTREAKUP_raw"] = streak
+    """Backward-compatible wrapper for older callers."""
+    compute_tech24_factors(df, config, factor_names)
 
 
 def build_ttm_factor_raws(
@@ -1465,9 +1707,7 @@ def build_ttm_factor_raws(
             - 1
         )
 
-    # F020SP: TTM revenue / market cap (replaces F020BP)
-    if "revenue_ttm" in filled.columns:
-        filled["F020BP_raw"] = filled["revenue_ttm"] / mkt.where(mkt > 0)
+    # F020 deprecated — was SP (sales-to-price), now LIMITUP_RECENCY20 computed elsewhere
 
     # F049-F054: TTM financial quality ratios
     eps = 1e-12
@@ -1498,7 +1738,7 @@ def build_ttm_factor_raws(
         "F011EARNYLD_raw",
         "F012GROWTH_raw",
         "F021CFP_raw",
-        "F020BP_raw",
+        "F020LIMITUP_RECENCY_raw",
         "F022GPTA_raw",
         "F023ACCRUAL_raw",
         "F024ASSETGR_raw",
@@ -1635,6 +1875,151 @@ def forward_fill_quarterly_to_daily(
     return pd.concat(result_parts, ignore_index=True)
 
 
+
+
+# ---------------------------------------------------------------------
+# V2 financial factor raws from quarterly panel
+# ---------------------------------------------------------------------
+
+
+def normalize_financial_aliases(fin: pd.DataFrame) -> pd.DataFrame:
+    """Normalize common financial field aliases without mutating caller data."""
+    out = fin.copy()
+    alias_pairs = {
+        "revenue": ("revenue_total", "total_revenue"),
+        "net_profit": ("net_profit_parent", "np_parent"),
+    }
+    for target, sources in alias_pairs.items():
+        if target not in out.columns:
+            for src in sources:
+                if src in out.columns:
+                    out[target] = out[src]
+                    break
+    return out
+
+
+def build_v2_financial_factor_raws(
+    base_panel: pd.DataFrame,
+    financial_quarterly: pd.DataFrame,
+    config: FactorPanelConfig,
+    factor_names: Sequence[str],
+) -> pd.DataFrame:
+    """Build F088CF_SALES_Q-F100INV_MINUS_REV raw factor columns from financial_quarterly_panel.
+
+    This is intentionally quarterly-first: YTD->single quarter->TTM is computed
+    on the quarterly table, then daily values are forward-filled by
+    available_date.  This avoids using daily ffilled rows as if they were
+    consecutive financial reports.
+    """
+    requested = set(factor_names)
+    base = standardize_panel_keys(base_panel, config)
+    fin = normalize_financial_aliases(standardize_financial_keys(financial_quarterly, config))
+
+    fin["_accper_m"] = fin["accper"].dt.month
+    fin = fin[fin["_accper_m"].isin({3, 6, 9, 12})].drop(columns=["_accper_m"]).copy()
+    fin = fin.sort_values([config.stock_col, "accper"]).reset_index(drop=True)
+
+    flow_cols = [
+        "cf_sales_cash", "cf_operating", "cf_capex", "cf_borrow", "cf_repay_debt",
+        "cf_equity_issue", "cf_dividend_paid", "revenue", "net_profit",
+        "operating_profit", "finance_expense", "income_tax",
+    ]
+    flow_cols = [c for c in flow_cols if c in fin.columns]
+    fin = cumulative_to_single_quarter(fin, flow_cols)
+
+    for col in flow_cols:
+        sq_col = f"{col}_sq"
+        if sq_col in fin.columns:
+            fin[f"_ttm_{col}"] = compute_ttm(fin, sq_col)
+
+    # Quarterly helper metrics.
+    group = fin.groupby(config.stock_col, sort=False)
+    if "net_profit_sq" in fin.columns and "cf_operating_sq" in fin.columns:
+        x = group["net_profit_sq"].shift(1)
+        y = fin["cf_operating_sq"]
+        w, minp = 16, 8
+        valid = x.notna() & y.notna()
+        xv = x.where(valid)
+        yv = y.where(valid)
+        cnt = valid.astype(float).groupby(fin[config.stock_col]).transform(lambda s: s.rolling(w, min_periods=minp).sum()).clip(lower=1)
+        sx = xv.groupby(fin[config.stock_col]).transform(lambda s: s.rolling(w, min_periods=minp).sum())
+        sy = yv.groupby(fin[config.stock_col]).transform(lambda s: s.rolling(w, min_periods=minp).sum())
+        sxy = (xv*yv).groupby(fin[config.stock_col]).transform(lambda s: s.rolling(w, min_periods=minp).sum())
+        sx2 = (xv*xv).groupby(fin[config.stock_col]).transform(lambda s: s.rolling(w, min_periods=minp).sum())
+        cov = sxy / cnt - (sx / cnt) * (sy / cnt)
+        var = (sx2 / cnt - (sx / cnt)**2).clip(lower=0)
+        fin["_q_crr"] = cov / np.maximum(var, 1e-12)
+
+    if "_ttm_cf_operating" in fin.columns and "total_assets" in fin.columns:
+        ratio = fin["_ttm_cf_operating"] / np.maximum(fin["total_assets"], 1e-8)
+        fin["_q_cf_vol"] = -ratio.groupby(fin[config.stock_col]).transform(lambda s: s.rolling(16, min_periods=8).std())
+
+    if "_ttm_net_profit" in fin.columns and "total_assets" in fin.columns:
+        ratio = fin["_ttm_net_profit"] / np.maximum(fin["total_assets"], 1e-8)
+        fin["_q_earn_stab"] = -ratio.groupby(fin[config.stock_col]).transform(lambda s: s.rolling(16, min_periods=8).std())
+
+    if "_ttm_revenue" in fin.columns:
+        rev_lag4 = fin.groupby(config.stock_col)["_ttm_revenue"].shift(4)
+        fin["_rev_ttm_yoy"] = (fin["_ttm_revenue"] - rev_lag4) / np.maximum(np.abs(rev_lag4), 1e-8)
+
+    if "receivables" in fin.columns:
+        ar_lag4 = fin.groupby(config.stock_col)["receivables"].shift(4)
+        fin["_ar_yoy"] = (fin["receivables"] - ar_lag4) / np.maximum(np.abs(ar_lag4), 1e-8)
+
+    if "inventory" in fin.columns:
+        inv_lag4 = fin.groupby(config.stock_col)["inventory"].shift(4)
+        fin["_inv_yoy"] = (fin["inventory"] - inv_lag4) / np.maximum(np.abs(inv_lag4), 1e-8)
+
+    fill_cols = [c for c in fin.columns if c.startswith("_ttm_") or c.startswith("_q_") or c in {"_rev_ttm_yoy", "_ar_yoy", "_inv_yoy", "total_assets", "receivables", "inventory", "payables_trade", "equity_parent"}]
+    quarterly = fin[[config.stock_col, "available_date", "accper"] + fill_cols].copy()
+    quarterly = quarterly.sort_values([config.stock_col, "available_date", "accper"]).drop_duplicates([config.stock_col, "available_date"], keep="last")
+
+    daily = base[[config.date_col, config.stock_col]].copy()
+    filled = forward_fill_quarterly_to_daily(daily, quarterly, config, fill_cols)
+
+    daily_extra_cols = [config.date_col, config.stock_col]
+    for c in ["mktcap_float", "mktcap_total"]:
+        if c in base.columns:
+            daily_extra_cols.append(c)
+    filled = filled.merge(base[daily_extra_cols], on=[config.date_col, config.stock_col], how="left")
+    mkt = filled.get("mktcap_float", filled.get("mktcap_total"))
+    if mkt is None:
+        mkt = pd.Series(np.nan, index=filled.index)
+
+    eps = 1e-8
+    if "F088CF_SALES_Q" in requested and {"_ttm_cf_sales_cash", "_ttm_revenue"}.issubset(filled.columns):
+        filled["F088CF_SALES_Q_raw"] = _ttm_ratio(filled["_ttm_cf_sales_cash"], filled["_ttm_revenue"])
+    if "F089CASH_PROFIT" in requested and {"_ttm_cf_operating", "_ttm_net_profit"}.issubset(filled.columns):
+        filled["F089CASH_PROFIT_raw"] = _ttm_ratio(filled["_ttm_cf_operating"], filled["_ttm_net_profit"])
+    if "F090CRR" in requested and "_q_crr" in filled.columns:
+        filled["F090CRR_raw"] = filled["_q_crr"]
+    if "F091CF_VOL" in requested and "_q_cf_vol" in filled.columns:
+        filled["F091CF_VOL_raw"] = filled["_q_cf_vol"]
+    if "F092EARN_STAB" in requested and "_q_earn_stab" in filled.columns:
+        filled["F092EARN_STAB_raw"] = filled["_q_earn_stab"]
+    if "F093FCF_YIELD" in requested and {"_ttm_cf_operating", "_ttm_cf_capex"}.issubset(filled.columns):
+        capex = filled["_ttm_cf_capex"]
+        cfo = filled["_ttm_cf_operating"]
+        fcf = cfo - capex if capex.median(skipna=True) > 0 else cfo + capex
+        filled["F093FCF_YIELD_raw"] = fcf / np.maximum(mkt, eps)
+    if "F094CAPEX_INT" in requested and {"_ttm_cf_capex", "total_assets"}.issubset(filled.columns):
+        filled["F094CAPEX_INT_raw"] = -filled["_ttm_cf_capex"] / np.maximum(filled["total_assets"], eps)
+    if "F095NET_FIN" in requested and {"_ttm_cf_borrow", "_ttm_cf_repay_debt", "total_assets"}.issubset(filled.columns):
+        filled["F095NET_FIN_raw"] = (filled["_ttm_cf_borrow"] - filled["_ttm_cf_repay_debt"]) / np.maximum(filled["total_assets"], eps)
+    if "F096DILUTION" in requested and "_ttm_cf_equity_issue" in filled.columns:
+        filled["F096DILUTION_raw"] = -filled["_ttm_cf_equity_issue"] / np.maximum(mkt, eps)
+    if "F097INT_BURDEN" in requested and {"_ttm_finance_expense", "_ttm_operating_profit"}.issubset(filled.columns):
+        filled["F097INT_BURDEN_raw"] = -_ttm_ratio(filled["_ttm_finance_expense"], filled["_ttm_operating_profit"])
+    if "F098DIV_PAYOUT" in requested and {"_ttm_cf_dividend_paid", "_ttm_net_profit"}.issubset(filled.columns):
+        filled["F098DIV_PAYOUT_raw"] = _ttm_ratio(filled["_ttm_cf_dividend_paid"], filled["_ttm_net_profit"])
+    if "F099AR_MINUS_REV" in requested and {"_ar_yoy", "_rev_ttm_yoy"}.issubset(filled.columns):
+        filled["F099AR_MINUS_REV_raw"] = filled["_ar_yoy"] - filled["_rev_ttm_yoy"]
+    if "F100INV_MINUS_REV" in requested and {"_inv_yoy", "_rev_ttm_yoy"}.issubset(filled.columns):
+        filled["F100INV_MINUS_REV_raw"] = filled["_inv_yoy"] - filled["_rev_ttm_yoy"]
+
+    out_cols = [config.date_col, config.stock_col] + [f"{f}_raw" for f in requested if f"{f}_raw" in filled.columns]
+    return filled[out_cols].copy()
+
 # ---------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------
@@ -1723,6 +2108,7 @@ def winsorize_zscore(
         mu = df.groupby(config.date_col)[w_col].transform("mean")
         sd = df.groupby(config.date_col)[w_col].transform("std")
         df[name] = (df[w_col] - mu) / sd.where(sd > 1e-10, 1.0)
+        df[name] = df[name].fillna(0.0)
 
     return df
 
@@ -1779,8 +2165,11 @@ def filter_and_select_output_columns(
         "industry_sw",
         "list_date",
         "open",
+        "high",
+        "low",
         "close",
         "close_adj",
+        "adj_factor",
         "ret_daily",
         "mktcap_float",
         "mktcap_total",
@@ -1951,3 +2340,827 @@ def validate_required_columns(
     missing = [col for col in columns if col not in df.columns]
     if missing:
         raise ValueError(f"{name} missing required columns: {missing}")
+# ════════════════════════════════════════════════════════════
+# V2 factor computation (F056GAP_UP_FAIL-F100INV_MINUS_REV) — merged from factor_blocks_v2
+# ════════════════════════════════════════════════════════════
+def _ytd_to_single_quarter(df: pd.DataFrame, stock_col: str, date_col: str,
+                           flow_cols: list[str]) -> pd.DataFrame:
+    """Convert YTD cumulative flow fields to single-quarter.
+
+    CSMAR / Tushare financials are YTD cumulative:
+        Q1=Q1, H1=Q1+Q2, Q3=Q1+Q2+Q3, FY=Q1+Q2+Q3+Q4.
+
+    After conversion, each quarter column contains only that quarter's value.
+    """
+    df = df.copy()
+    df["_q"] = df[date_col].dt.quarter
+    for col in flow_cols:
+        if col not in df.columns:
+            continue
+        sq_col = f"_sq_{col}"
+        # Group by stock and fiscal year
+        df["_fyear"] = df[date_col].dt.year
+        df["_fyear"] -= (df["_q"] == 1).astype(int)  # Q1 belongs to prior FY reporting
+        # Actually simpler: sort by stock + date, diff within same fiscal year
+        df = df.sort_values([stock_col, date_col])
+        # For each stock, compute single-quarter = current YTD - previous quarter YTD
+        prev_ytd = df.groupby(stock_col)[col].shift(1)
+        df[sq_col] = df[col] - prev_ytd
+        # Q1: YTD = single quarter (no subtraction needed — but need to handle year boundary)
+        is_q1 = df["_q"] == 1
+        df.loc[is_q1, sq_col] = df.loc[is_q1, col]
+        # Negative values from QoQ decline → clamp to 0? No, some can be legitimately negative.
+    return df.drop(columns=["_q", "_fyear"])
+
+
+def _ttm_sum(df: pd.DataFrame, stock_col: str, sq_cols: list[str]) -> pd.DataFrame:
+    """TTM = sum of latest 4 single-quarter values."""
+    df = df.sort_values([stock_col, "time"])
+    for sq_col in sq_cols:
+        if sq_col not in df.columns:
+            continue
+        raw_col = sq_col.replace("_sq_", "")
+        ttm_col = f"_ttm_{raw_col}"
+        df[ttm_col] = df.groupby(stock_col)[sq_col].transform(
+            lambda x: x.rolling(4, min_periods=1).sum())
+    return df
+
+
+def _ttm_ratio(a: pd.Series, b: pd.Series, eps: float = 1e-8) -> pd.Series:
+    """Safe TTM ratio a / b."""
+    return a / np.maximum(np.abs(b), eps)
+
+
+# ════════════════════════════════════════════════════════════════
+# Block 1: O2O / Overnight / Intraday (F056GAP_UP_FAIL–F062GAP_DN_RECOVER)
+# ════════════════════════════════════════════════════════════════
+
+def build_onret1(df: pd.DataFrame) -> pd.Series:
+    """F056GAP_UP_FAIL ONRET1 = open / pre_close - 1."""
+    return df["open"] / df["pre_close"] - 1.0
+
+
+def build_intra1(df: pd.DataFrame) -> pd.Series:
+    """F057INTRA1 INTRA1 = close / open - 1."""
+    return df["close"] / df["open"] - 1.0
+
+
+def build_o2o_ret5(df: pd.DataFrame, config) -> pd.Series:
+    """F058O2O_RET5 O2O_RET5 = open / open.shift(5) - 1 per stock."""
+    df = df.sort_values([config.stock_col, config.date_col])
+    return df.groupby(config.stock_col)["open"].transform(
+        lambda x: x / x.shift(5) - 1.0)
+
+
+def build_gk_vol20(df: pd.DataFrame) -> pd.Series:
+    """F059GK_VOL20 GK_VOL20 = Garman-Klass OHLC volatility over 20 days.
+
+    More efficient than Parkinson — uses open/close in addition to high/low.
+    """
+    ln_hl = np.log(df["high"] / df["low"])
+    ln_co = np.log(df["close"] / df["open"])
+    gk = 0.5 * ln_hl ** 2 - (2 * np.log(2) - 1) * ln_co ** 2
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    gk_mean = gk.groupby(df[stock_col]).transform(lambda x: x.rolling(20, min_periods=10).mean())
+    return np.sqrt(gk_mean.clip(lower=0))
+
+
+def _onret_sum5(df: pd.DataFrame, config) -> pd.Series:
+    onret1 = build_onret1(df)
+    df = df.copy()
+    df["_onret1"] = onret1
+    df = df.sort_values([config.stock_col, config.date_col])
+    return df.groupby(config.stock_col)["_onret1"].transform(
+        lambda x: x.rolling(5, min_periods=3).sum())
+
+
+def _intra_sum5(df: pd.DataFrame, config) -> pd.Series:
+    intra1 = build_intra1(df)
+    df = df.copy()
+    df["_intra1"] = intra1
+    df = df.sort_values([config.stock_col, config.date_col])
+    return df.groupby(config.stock_col)["_intra1"].transform(
+        lambda x: x.rolling(5, min_periods=3).sum())
+
+
+def build_on_intra_div5(df: pd.DataFrame, config) -> pd.Series:
+    """F060ON_INTRA_DIV5 ON_INTRA_DIV5 = ONRET_SUM5 - INTRA_SUM5."""
+    return _onret_sum5(df, config) - _intra_sum5(df, config)
+
+
+def build_gap_up_hold(df: pd.DataFrame) -> pd.Series:
+    """F061GAP_UP_HOLD GAP_UP_HOLD = 1[ONRET1>0] * INTRA1."""
+    onret1 = build_onret1(df)
+    intra1 = build_intra1(df)
+    return (onret1 > 0).astype(float) * intra1
+
+
+def build_gap_dn_recover(df: pd.DataFrame) -> pd.Series:
+    """F062GAP_DN_RECOVER GAP_DN_RECOVER = 1[ONRET1<0] * INTRA1."""
+    onret1 = build_onret1(df)
+    intra1 = build_intra1(df)
+    return (onret1 < 0).astype(float) * intra1
+
+
+def build_gap_up_fail(df: pd.DataFrame) -> pd.Series:
+    """F056GAP_UP_FAIL GAP_UP_FAIL = 1[ONRET1>0 & INTRA1<0] * (-INTRA1).
+
+    Gap-up that reversed intraday — over-optimism punished.
+    Replaces ONRET1 which was 0.992 correlated with GAP (F025).
+    """
+    onret1 = build_onret1(df)
+    intra1 = build_intra1(df)
+    mask = (onret1 > 0) & (intra1 < 0)
+    return mask.astype(float) * (-intra1)
+
+
+# ════════════════════════════════════════════════════════════════
+# Block 2: Momentum / Path Quality (F063RET5D_SKIP1–F066EFFICIENCY20)
+# ════════════════════════════════════════════════════════════════
+
+def build_ret5d_skip1(df: pd.DataFrame, config) -> pd.Series:
+    """F063RET5D_SKIP1 RET5D_SKIP1 = open.shift(1) / open.shift(6) - 1 (open-to-open)."""
+    df = df.sort_values([config.stock_col, config.date_col])
+    col = df["open"]
+    return col.groupby(df[config.stock_col]).transform(
+        lambda x: x.shift(1) / x.shift(6) - 1.0)
+
+
+def build_ret_accel20(df: pd.DataFrame, config) -> pd.Series:
+    """F064RET_ACCEL20 RET_ACCEL20 = ret_20d[t-1] - ret_20d[t-21] (open-to-open)."""
+    df = df.sort_values([config.stock_col, config.date_col])
+    col = df["open"]
+    ret20 = col.groupby(df[config.stock_col]).transform(
+        lambda x: x / x.shift(20) - 1.0)
+    return ret20.groupby(df[config.stock_col]).transform(
+        lambda x: x.shift(1) - x.shift(21))
+
+
+def build_maxdd20(df: pd.DataFrame, config) -> pd.Series:
+    """F065MAXDD20 MAXDD20 = true rolling max drawdown over 20 days per stock.
+
+    Known bottleneck: this remains a small two-level loop because true rolling
+    peak-to-trough max drawdown is path-dependent.  Expected to be slower than
+    pure rolling sums; keep it isolated and profile separately if needed.
+    """
+    df = df.sort_values([config.stock_col, config.date_col])
+    result = pd.Series(np.nan, index=df.index, dtype=float)
+    for _stock_id, grp in df.groupby(config.stock_col, sort=False):
+        prices = grp["open"].to_numpy(dtype=float)
+        vals = np.full(len(prices), np.nan, dtype=float)
+        for t in range(19, len(prices)):
+            window = prices[t - 19:t + 1]
+            if not np.isfinite(window).all():
+                continue
+            peak = np.maximum.accumulate(window)
+            drawdown = window / np.maximum(peak, 1e-12) - 1.0
+            vals[t] = np.nanmin(drawdown)
+        result.loc[grp.index] = vals
+    return result
+
+
+def build_efficiency20(df: pd.DataFrame, config) -> pd.Series:
+    """F066EFFICIENCY20 EFFICIENCY20 = abs(RET20) / sum(abs(ret_daily), 20) (open-to-open)."""
+    df = df.sort_values([config.stock_col, config.date_col])
+    col = df["open"]
+    ret20 = col.groupby(df[config.stock_col]).transform(
+        lambda x: x / x.shift(20) - 1.0)
+    abs_ret = df["ret_daily"].abs()
+    sum_abs = abs_ret.groupby(df[config.stock_col]).transform(
+        lambda x: x.rolling(20, min_periods=10).sum())
+    return np.abs(ret20) / np.maximum(sum_abs, 1e-8)
+
+
+# ════════════════════════════════════════════════════════════════
+# Block 3: Volatility / Tail / Market Linkage (F067TAIL_LOSS20–F074BETA_20D)
+# ════════════════════════════════════════════════════════════════
+
+def precompute_ret_blocks(df: pd.DataFrame, config) -> pd.DataFrame:
+    """Pre-compute shared rolling stats for vol/market blocks.
+
+    Uses rolling-sum decomposition for cov/var instead of rolling.cov()
+    to avoid O(n × groups × window) groupby-overhead.  10× faster.
+    """
+    df = df.sort_values([config.stock_col, config.date_col])
+    ret = df["ret_daily"]
+    mkt = df["mkt_ret_vw"]
+    stock = df[config.stock_col]
+
+    import time as _t
+
+    # -- Rolling std (fast, built-in) --
+    df["_std5"] = ret.groupby(stock).transform(lambda x: x.rolling(5, min_periods=5).std())
+    df["_std20"] = ret.groupby(stock).transform(lambda x: x.rolling(20, min_periods=10).std())
+
+    # -- Rolling skew (20d) via sum decomposition --
+    # Skew = (E[x³] - 3μE[x²] + 2μ³) / σ³
+    print("    Rolling skew 20d...", end=" ", flush=True)
+    _t0 = _t.perf_counter()
+    w, minp = 20, 20
+    rsum = ret.groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    r2sum = (ret * ret).groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    r3sum = (ret * ret * ret).groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    cnt = ret.groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).count())
+    mu = rsum / cnt
+    ex2 = r2sum / cnt
+    ex3 = r3sum / cnt
+    var = (ex2 - mu * mu).clip(lower=0)
+    std = np.sqrt(var)
+    third = ex3 - 3 * mu * ex2 + 2 * mu**3
+    df["_skew20"] = (third / (std**3 + 1e-12)).mask(std < 1e-8)
+    print(f"done in {_t.perf_counter() - _t0:.1f}s", flush=True)
+
+    # -- Rolling cov/var via sum decomposition (fast ~10× vs rolling.cov) --
+    # Cov(x, y, w) = E[xy]_w - E[x]_w * E[y]_w
+    # Var(x, w)    = E[x²]_w - E[x]_w²
+    for w in [20, 60]:
+        label = str(w)
+        minp = max(10, w // 2)
+        print(f"    Rolling {w}d cov sums...", end=" ", flush=True)
+        _t0 = _t.perf_counter()
+
+        valid = ret.notna() & mkt.notna()
+        r = ret.where(valid)
+        m = mkt.where(valid)
+
+        cnt = valid.astype(float).groupby(stock).transform(
+            lambda x: x.rolling(w, min_periods=minp).sum())
+        rsum = r.groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+        msum = m.groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+        r2sum = (r * r).groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+        m2sum = (m * m).groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+        rmsum = (r * m).groupby(stock).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+
+        c = cnt.clip(lower=1)
+        df[f"_cov{label}"] = rmsum / c - (rsum / c) * (msum / c)
+        df[f"_var_mkt{label}"] = (m2sum / c - (msum / c) ** 2).clip(lower=0)
+        df[f"_var_i{label}"] = (r2sum / c - (rsum / c) ** 2).clip(lower=0)
+        print(f"done in {_t.perf_counter() - _t0:.1f}s", flush=True)
+
+    return df
+
+
+def _precompute_ret_blocks(df: pd.DataFrame, config) -> pd.DataFrame:
+    """Backward-compatible wrapper."""
+    return precompute_ret_blocks(df, config)
+
+
+def build_tail_loss20(df: pd.DataFrame) -> pd.Series:
+    """F067TAIL_LOSS20 TAIL_LOSS20 = rolling_min(ret_daily, 20) — worst daily return.
+
+    Replaces PARKINSON20 which was 0.986 correlated with GK_VOL20 (F059GK_VOL20).
+    """
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    return df["ret_daily"].groupby(df[stock_col]).transform(
+        lambda x: x.rolling(20, min_periods=10).min())
+
+
+def build_parkinson20(df: pd.DataFrame) -> pd.Series:
+    """Parkinson volatility (backup, not used in final 87)."""
+    hl2 = (np.log(df["high"] / df["low"])) ** 2
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    return hl2.groupby(df[stock_col]).transform(
+        lambda x: x.rolling(20, min_periods=10).mean())
+
+
+def build_skew20(df: pd.DataFrame) -> pd.Series:
+    """F068SKEW20 SKEW20 — pre-computed in precompute_ret_blocks."""
+    if "_skew20" in df.columns:
+        return df["_skew20"]
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    r = df["ret_daily"]
+    w, minp = 20, 20
+    cnt = r.groupby(df[stock_col] if isinstance(stock_col, str) else df.index).transform(lambda x: x.rolling(w, min_periods=minp).count())
+    s1 = r.groupby(df[stock_col] if isinstance(stock_col, str) else df.index).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    s2 = (r*r).groupby(df[stock_col] if isinstance(stock_col, str) else df.index).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    s3 = (r*r*r).groupby(df[stock_col] if isinstance(stock_col, str) else df.index).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    mu = s1 / cnt
+    ex2 = s2 / cnt
+    ex3 = s3 / cnt
+    var = (ex2 - mu*mu).clip(lower=0)
+    std = np.sqrt(var)
+    third = ex3 - 3*mu*ex2 + 2*mu**3
+    return (third / (std**3 + 1e-12)).mask(std < 1e-8)
+
+
+def build_dnvol20(df: pd.DataFrame) -> pd.Series:
+    """F069DNVOL20 DNVOL20 = std(min(ret, 0), 20) — zeros included."""
+    dn = np.minimum(df["ret_daily"], 0.0)
+    return dn.groupby(df["stock_id"] if "stock_id" in df.columns else df.index
+                      ).transform(lambda x: x.rolling(20, min_periods=10).std())
+
+
+def build_up_dn_vol(df: pd.DataFrame) -> pd.Series:
+    """F070UP_DN_VOL UP_DN_VOL = std(max(ret, 0), 20) / (F069DNVOL20 + eps)."""
+    up = np.maximum(df["ret_daily"], 0.0)
+    up_std = up.groupby(df["stock_id"] if "stock_id" in df.columns else df.index
+                        ).transform(lambda x: x.rolling(20, min_periods=10).std())
+    dn_std = build_dnvol20(df)
+    return up_std / np.maximum(dn_std, 1e-8)
+
+
+def build_vol_of_vol(df: pd.DataFrame) -> pd.Series:
+    """F071VOL_OF_VOL VOL_OF_VOL = std(rolling_std(ret,5), 20)."""
+    if "_std5" not in df.columns:
+        df["_std5"] = df.groupby("stock_id")["ret_daily"].transform(
+            lambda x: x.rolling(5, min_periods=5).std())
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    return df["_std5"].groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                               ).transform(lambda x: x.rolling(20, min_periods=10).std())
+
+
+def build_corr_60d(df: pd.DataFrame) -> pd.Series:
+    """F072CORR_60D CORR_60D = cov60 / sqrt(var_i60 * var_mkt60)."""
+    if "_cov60" not in df.columns:
+        return _compute_corr_direct(df, 60)
+    return df["_cov60"] / np.sqrt(np.maximum(df["_var_i60"] * df["_var_mkt60"], 1e-20))
+
+
+def _compute_corr_direct(df: pd.DataFrame, w: int) -> pd.Series:
+    """Fallback: direct rolling correlation (slow — only if precompute skipped)."""
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    ret = df["ret_daily"]
+    mkt = df["mkt_ret_vw"]
+
+    def _roll_corr(xy, w):
+        x, y = xy.iloc[:, 0], xy.iloc[:, 1]
+        return x.rolling(w, min_periods=max(10, w // 2)).corr(y)
+
+    pair = pd.concat([ret, mkt], axis=1)
+    return pair.groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                        ).apply(lambda g: _roll_corr(g, w)).reset_index(level=0, drop=True)
+
+
+def build_rsq_60d(df: pd.DataFrame) -> pd.Series:
+    """F073KURT_60D RSQ_60D = beta60² × Var(mkt,60) / Var(i,60), clipped to [0,1]."""
+    if "_cov60" in df.columns:
+        beta60 = df["_cov60"] / np.maximum(df["_var_mkt60"], 1e-12)
+        return (beta60 ** 2 * df["_var_mkt60"] / np.maximum(df["_var_i60"], 1e-12)).clip(0, 1)
+    # Fallback
+    w = 60; stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    def _rsq(g):
+        cov60 = (g["ret_daily"] * g["mkt_ret_vw"]).rolling(w, min_periods=max(10, w//2)).sum() / w
+        var_m = (g["mkt_ret_vw"]).rolling(w, min_periods=max(10, w//2)).var()
+        var_i = (g["ret_daily"]).rolling(w, min_periods=max(10, w//2)).var()
+        beta = cov60 / np.maximum(var_m, 1e-12)
+        return (beta ** 2 * var_m / np.maximum(var_i, 1e-12)).clip(0, 1)
+    return df.groupby(stock_col).apply(
+        lambda g: _rsq(g[["ret_daily", "mkt_ret_vw"]].copy())
+    ).reset_index(level=0, drop=True)
+
+
+def build_beta_20d(df: pd.DataFrame) -> pd.Series:
+    """F074BETA_20D BETA_20D = cov(ret, mkt, 20) / var(mkt, 20)."""
+    if "_cov20" in df.columns:
+        return df["_cov20"] / np.maximum(df["_var_mkt20"], 1e-12)
+    w = 20; stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    def _beta(g):
+        cov20 = (g["ret_daily"] * g["mkt_ret_vw"]).rolling(w, min_periods=max(10, w//2)).sum() / w
+        var_m = (g["mkt_ret_vw"]).rolling(w, min_periods=max(10, w//2)).var()
+        return cov20 / np.maximum(var_m, 1e-12)
+    return df.groupby(stock_col).apply(
+        lambda g: _beta(g[["ret_daily", "mkt_ret_vw"]].copy())
+    ).reset_index(level=0, drop=True)
+
+
+def build_kurt_60d(df: pd.DataFrame, config) -> pd.Series:
+    """F073KURT_60D KURT_60D = kurtosis(ret_daily, 60d) via sum decomposition.
+
+    Replaces RSQ_60D which was 0.998 correlated with CORR_60D (F072CORR_60D).
+    Kurt = (E[x^4] - 4μE[x^3] + 6μ²E[x²] - 3μ^4) / σ^4
+    """
+    stock_col = config.stock_col
+    df = df.sort_values([stock_col, config.date_col])
+    ret = df["ret_daily"]
+    w, minp = 60, 30
+
+    cnt = ret.groupby(df[stock_col]).transform(
+        lambda x: x.rolling(w, min_periods=minp).count()).clip(lower=1)
+    r1 = ret.groupby(df[stock_col]).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    r2 = (ret**2).groupby(df[stock_col]).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    r3 = (ret**3).groupby(df[stock_col]).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+    r4 = (ret**4).groupby(df[stock_col]).transform(lambda x: x.rolling(w, min_periods=minp).sum())
+
+    mu = r1 / cnt
+    mu2 = r2 / cnt
+    mu3 = r3 / cnt
+    mu4 = r4 / cnt
+    var = (mu2 - mu**2).clip(lower=0)
+    std = np.sqrt(var)
+    kurt_num = mu4 - 4 * mu * mu3 + 6 * mu**2 * mu2 - 3 * mu**4
+    return (kurt_num / (std**4 + 1e-12)).mask(std < 1e-8)
+
+
+# ════════════════════════════════════════════════════════════════
+# Block 4: Volume / VWAP (F075VOLUME_RATIO–F081STRONG_CLOSE)
+# ════════════════════════════════════════════════════════════════
+
+def build_volume_ratio(df: pd.DataFrame) -> pd.Series:
+    """F075VOLUME_RATIO VOLUME_RATIO — directly from panel column."""
+    return df["volume_ratio"].astype(float)
+
+
+def build_signed_amt20(df: pd.DataFrame) -> pd.Series:
+    """F076SIGNED_AMT20 SIGNED_AMT20 = sum(sign(ret) * amount, 20) / sum(amount, 20)."""
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    signed = np.sign(df["ret_daily"]) * df["amount"]
+    num = signed.groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                        ).transform(lambda x: x.rolling(20, min_periods=10).sum())
+    denom = df["amount"].groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                                 ).transform(lambda x: x.rolling(20, min_periods=10).sum())
+    return num / np.maximum(denom, 1e-8)
+
+
+def build_amp_vol20(df: pd.DataFrame) -> pd.Series:
+    """F077AMP_VOL20 AMP_VOL20 = mean(|ret| * volume, 20)."""
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    amp = np.abs(df["ret_daily"]) * df["volume"]
+    return amp.groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                       ).transform(lambda x: x.rolling(20, min_periods=10).mean())
+
+
+def build_turn_size(df: pd.DataFrame) -> pd.Series:
+    """F078TURN_SIZE TURN_SIZE = turnover_rate * ln(mktcap)."""
+    return df["turnover_rate"] * np.log(df["mktcap_total"])
+
+
+def build_turn_accel(df: pd.DataFrame) -> pd.Series:
+    """F079TURN_ACCEL TURN_ACCEL = MA(turnover, 5) / MA(turnover, 20)."""
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    tr = df["turnover_rate"]
+    ma5 = tr.groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                     ).transform(lambda x: x.rolling(5, min_periods=3).mean())
+    ma20 = tr.groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                      ).transform(lambda x: x.rolling(20, min_periods=10).mean())
+    return ma5 / np.maximum(ma20, 1e-8)
+
+
+def build_vwap_dev(df: pd.DataFrame) -> pd.Series:
+    """F080VWAP_DEV VWAP_DEV = close / (amount/volume) - 1."""
+    px = df["_close_raw"] if "_close_raw" in df.columns else df["close"]
+    vwap = df["amount"] / np.maximum(df["volume"], 1)
+    return px / np.maximum(vwap, 1e-8) - 1.0
+
+
+def build_strong_close(df: pd.DataFrame) -> pd.Series:
+    """F081STRONG_CLOSE STRONG_CLOSE = CLOSE_POS * log1p(amount)."""
+    close_pos = (df["close"] - df["low"]) / np.maximum(df["high"] - df["low"], 1e-8)
+    return close_pos * np.log1p(df["amount"])
+
+
+# ════════════════════════════════════════════════════════════════
+# Block 5: Float / Value / Age (F082LOCKED_PCT–F087LIST_AGE)
+# ════════════════════════════════════════════════════════════════
+
+def build_locked_pct(df: pd.DataFrame) -> pd.Series:
+    """F082LOCKED_PCT LOCKED_PCT = 1 - free_share / total_share."""
+    return 1.0 - df["free_share"] / np.maximum(df["total_share"], 1)
+
+
+def build_turn_free(df: pd.DataFrame) -> pd.Series:
+    """F083TURN_FREE TURN_FREE = amount / (free_share * close)."""
+    px = df["_close_raw"] if "_close_raw" in df.columns else df["close"]
+    return df["amount"] / np.maximum(df["free_share"] * px, 1e-8)
+
+
+def build_amt_free20(df: pd.DataFrame) -> pd.Series:
+    """F084AMT_FREE20 AMT_FREE20 = MA(amount, 20) / (free_share * close)."""
+    px = df["_close_raw"] if "_close_raw" in df.columns else df["close"]
+    stock_col = "stock_id" if "stock_id" in df.columns else df.index
+    ma_amt = df["amount"].groupby(df[stock_col] if isinstance(stock_col, str) else df.index
+                                  ).transform(lambda x: x.rolling(20, min_periods=10).mean())
+    return ma_amt / np.maximum(df["free_share"] * px, 1e-8)
+
+
+def build_sp_ttm(df: pd.DataFrame) -> pd.Series:
+    """F085SP_TTM SP_TTM = 1 / ps_ttm."""
+    return 1.0 / np.maximum(df["ps_ttm"], 1e-8)
+
+
+def build_div_ttm(df: pd.DataFrame) -> pd.Series:
+    """F086DIV_TTM DIV_TTM = dv_ttm."""
+    return df["dv_ttm"]
+
+
+def build_list_age(df: pd.DataFrame, config) -> pd.Series:
+    """F087LIST_AGE LIST_AGE = log1p(trading_days_since_list_date)."""
+    list_dates = pd.to_datetime(df["list_date"])
+    current_dates = pd.to_datetime(df[config.date_col])
+    days = (current_dates - list_dates).dt.days
+    return np.log1p(np.maximum(days, 0))
+
+
+# ════════════════════════════════════════════════════════════════
+# Block 6: Financial — shared TTM pipeline (F088CF_SALES_Q–F100INV_MINUS_REV)
+# ════════════════════════════════════════════════════════════════
+
+def _precompute_financial_ttm(df: pd.DataFrame, config) -> pd.DataFrame:
+    """YTD→SQ→TTM for all financial flow fields needed by F088CF_SALES_Q-F100INV_MINUS_REV.
+
+    Returns df with _ttm_xxx columns added.
+    """
+    flow_cols = [
+        "cf_sales_cash", "cf_operating", "cf_capex", "cf_borrow",
+        "cf_repay_debt", "cf_equity_issue", "cf_dividend_paid",
+        "revenue", "net_profit", "operating_profit", "finance_expense",
+        "income_tax",
+    ]
+    available = [c for c in flow_cols if c in df.columns]
+    if not available:
+        return df
+
+    df = df.sort_values([config.stock_col, config.date_col])
+
+    # YTD → single-quarter
+    df["_q"] = pd.to_datetime(df[config.date_col]).dt.quarter
+    for col in available:
+        sq_col = f"_sq_{col}"
+        prev = df.groupby(config.stock_col)[col].shift(1)
+        df[sq_col] = df[col] - prev
+        is_q1 = df["_q"] == 1
+        # Q1: if this is the first observation for the stock, prev is NaN
+        # → Q1 YTD = single quarter directly
+        mask_q1 = is_q1 | prev.isna()
+        df.loc[mask_q1, sq_col] = df.loc[mask_q1, col]
+
+    df = df.drop(columns=["_q"])
+
+    # Single-quarter → TTM (sum of latest 4)
+    sq_cols = [f"_sq_{c}" for c in available]
+    for sq_col in sq_cols:
+        raw = sq_col.replace("_sq_", "")
+        ttm_col = f"_ttm_{raw}"
+        df[ttm_col] = df.groupby(config.stock_col)[sq_col].transform(
+            lambda x: x.rolling(4, min_periods=1).sum())
+
+    # Also prep balance-sheet stock variables (no TTM needed, use latest)
+    for col in ["total_assets", "receivables", "inventory", "payables_trade",
+                "equity_parent"]:
+        if col in df.columns:
+            df[f"_latest_{col}"] = df[col]
+
+    return df
+
+
+# -- F088CF_SALES_Q-F093FCF_YIELD: Cash Flow Quality --
+
+def build_cf_sales_q(df: pd.DataFrame) -> pd.Series:
+    """F088CF_SALES_Q CF_SALES_Q = TTM(cf_sales_cash) / TTM(revenue)."""
+    return _ttm_ratio(df["_ttm_cf_sales_cash"], df["_ttm_revenue"])
+
+
+def build_cash_profit(df: pd.DataFrame) -> pd.Series:
+    """F089CASH_PROFIT CASH_PROFIT = TTM(cf_operating) / |TTM(net_profit)|."""
+    return _ttm_ratio(df["_ttm_cf_operating"], df["_ttm_net_profit"])
+
+
+def build_crr(df: pd.DataFrame, config) -> pd.Series:
+    """F090CRR CRR = β from 16Q rolling OLS: cf_operating_q = α + β × net_profit_q(lag1) + ε.
+
+    Uses single-quarter values, not TTM.  Vectorised via sum decomposition — 50× faster
+    than per-stock for-loop.
+    """
+    x_col = "_sq_net_profit"
+    y_col = "_sq_cf_operating"
+    if x_col not in df.columns or y_col not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
+    df = df.sort_values([config.stock_col, config.date_col])
+    stock = df[config.stock_col]
+    x = df[x_col].groupby(stock).shift(1)  # lag 1Q
+    y = df[y_col]
+
+    w, minp = 16, 8
+    cnt = x.notna().astype(float).groupby(stock).transform(
+        lambda g: g.rolling(w, min_periods=minp).sum()).clip(lower=1)
+
+    xsum = x.groupby(stock).transform(lambda g: g.rolling(w, min_periods=minp).sum())
+    ysum = y.groupby(stock).transform(lambda g: g.rolling(w, min_periods=minp).sum())
+    xysum = (x * y).groupby(stock).transform(lambda g: g.rolling(w, min_periods=minp).sum())
+    x2sum = (x * x).groupby(stock).transform(lambda g: g.rolling(w, min_periods=minp).sum())
+
+    cov = xysum / cnt - (xsum / cnt) * (ysum / cnt)
+    var = (x2sum / cnt - (xsum / cnt) ** 2).clip(lower=0)
+    return cov / np.maximum(var, 1e-12)
+
+
+def build_cf_vol(df: pd.DataFrame, config) -> pd.Series:
+    """F091CF_VOL CF_VOL = -std(TTM(cf_operating) / total_assets, 16Q)."""
+    ratio = df["_ttm_cf_operating"] / np.maximum(df["_latest_total_assets"], 1e-8)
+    stock_col = config.stock_col
+    std16 = ratio.groupby(df[stock_col]).transform(
+        lambda x: x.rolling(16, min_periods=8).std())
+    return -std16
+
+
+def build_earn_stab(df: pd.DataFrame, config) -> pd.Series:
+    """F092EARN_STAB EARN_STAB = -std(TTM(net_profit) / total_assets, 16Q)."""
+    ratio = df["_ttm_net_profit"] / np.maximum(df["_latest_total_assets"], 1e-8)
+    stock_col = config.stock_col
+    std16 = ratio.groupby(df[stock_col]).transform(
+        lambda x: x.rolling(16, min_periods=8).std())
+    return -std16
+
+
+def build_wcap_press(df: pd.DataFrame) -> pd.Series:
+    """WCAP_PRESS (backup)."""
+    num = (df["_latest_receivables"] + df["_latest_inventory"]
+           - df["_latest_payables_trade"])
+    return num / np.maximum(df["_latest_total_assets"], 1e-8)
+
+
+def build_fcf_yield(df: pd.DataFrame) -> pd.Series:
+    """F093FCF_YIELD FCF_YIELD = (TTM(cf_operating) - TTM(cf_capex)) / mktcap_float.
+
+    Free cash flow yield. If median capex > 0, FCF = CFO - capex;
+    otherwise FCF = CFO + capex (some sectors report capex as negative).
+    Replaces WCAP_PRESS (ICIR=0.0005).
+    """
+    cfo = df["_ttm_cf_operating"]
+    capex = df["_ttm_cf_capex"]
+    # Adjust capex sign convention: if median capex > 0, subtract; else add
+    median_capex = capex.median()
+    if pd.notna(median_capex) and median_capex > 0:
+        fcf = cfo - capex
+    else:
+        fcf = cfo + capex
+    return fcf / np.maximum(df["mktcap_float"], 1e-8)
+
+
+# -- F094CAPEX_INT-F098DIV_PAYOUT: Investment & Financing --
+
+def build_capex_int(df: pd.DataFrame) -> pd.Series:
+    """F094CAPEX_INT CAPEX_INT = -TTM(cf_capex) / total_assets."""
+    return -df["_ttm_cf_capex"] / np.maximum(df["_latest_total_assets"], 1e-8)
+
+
+def build_net_fin(df: pd.DataFrame) -> pd.Series:
+    """F095NET_FIN NET_FIN = (TTM(cf_borrow) - TTM(cf_repay_debt)) / total_assets."""
+    num = df["_ttm_cf_borrow"] - df["_ttm_cf_repay_debt"]
+    return num / np.maximum(df["_latest_total_assets"], 1e-8)
+
+
+def build_dilution(df: pd.DataFrame) -> pd.Series:
+    """F096DILUTION DILUTION = -TTM(cf_equity_issue) / mktcap_float."""
+    return -df["_ttm_cf_equity_issue"] / np.maximum(df["mktcap_float"], 1e-8)
+
+
+def build_int_burden(df: pd.DataFrame) -> pd.Series:
+    """F097INT_BURDEN INT_BURDEN = -TTM(finance_expense) / |TTM(operating_profit)|."""
+    return -_ttm_ratio(df["_ttm_finance_expense"], df["_ttm_operating_profit"])
+
+
+def build_div_payout(df: pd.DataFrame) -> pd.Series:
+    """F098DIV_PAYOUT DIV_PAYOUT = TTM(cf_dividend_paid) / mktcap_float — cash return scale.
+
+    Denominator is market cap, not net_profit, to avoid |NP|~0 blow-up
+    for loss-making companies.  Measures absolute cash-return commitment.
+    """
+    return df["_ttm_cf_dividend_paid"] / np.maximum(df["mktcap_float"], 1e-8)
+
+
+# -- F099AR_MINUS_REV-F100INV_MINUS_REV: Growth Quality Red Flags --
+
+def build_ar_minus_rev(df: pd.DataFrame, config) -> pd.Series:
+    """F099AR_MINUS_REV AR_MINUS_REV = AR_stock_YoY - REV_TTM_YoY.
+
+    AR YoY: (receivables_t - receivables_{t-4Q}) / |receivables_{t-4Q}|  (stock variable)
+    REV YoY: (TTM(revenue)_t - TTM(revenue)_{t-4Q}) / |TTM(revenue)_{t-4Q}|  (flow variable)
+    """
+    df = df.sort_values([config.stock_col, config.date_col])
+    ar = df["_latest_receivables"]
+    ar_lag = ar.groupby(df[config.stock_col]).transform(lambda x: x.shift(4 * 63))  # ~4 quarters
+    ar_yoy = (ar - ar_lag) / np.maximum(np.abs(ar_lag), 1e-8)
+
+    rev_ttm = df["_ttm_revenue"]
+    rev_lag = rev_ttm.groupby(df[config.stock_col]).transform(lambda x: x.shift(4 * 63))
+    rev_yoy = (rev_ttm - rev_lag) / np.maximum(np.abs(rev_lag), 1e-8)
+
+    return ar_yoy - rev_yoy
+
+
+def build_inv_minus_rev(df: pd.DataFrame, config) -> pd.Series:
+    """F100INV_MINUS_REV INV_MINUS_REV = INV_stock_YoY - REV_TTM_YoY."""
+    df = df.sort_values([config.stock_col, config.date_col])
+    inv = df["_latest_inventory"]
+    inv_lag = inv.groupby(df[config.stock_col]).transform(lambda x: x.shift(4 * 63))
+    inv_yoy = (inv - inv_lag) / np.maximum(np.abs(inv_lag), 1e-8)
+
+    rev_ttm = df["_ttm_revenue"]
+    rev_lag = rev_ttm.groupby(df[config.stock_col]).transform(lambda x: x.shift(4 * 63))
+    rev_yoy = (rev_ttm - rev_lag) / np.maximum(np.abs(rev_lag), 1e-8)
+
+    return inv_yoy - rev_yoy
+
+
+# ════════════════════════════════════════════════════════════════
+# Compute orchestrator
+# ════════════════════════════════════════════════════════════════
+
+# Friendly aliases for progress output
+FACTOR_ALIASES: dict[str, str] = {}
+
+
+def compute_v2_factor_batch(
+    df: pd.DataFrame,
+    financial_quarterly: pd.DataFrame | None,
+    factor_names: Sequence[str],
+    config: FactorPanelConfig,
+    shared_cache: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Compute one V2 factor batch.  df must be sorted by [stock_col, date_col]."""
+    if shared_cache is None:
+        shared_cache = {}
+
+    needs = set(factor_names)
+    stock_col = config.stock_col
+    date_col = config.date_col
+    raw_cols: list[str] = []
+
+    if needs & set(NEW45_FACTORS[:7]):
+        print("  O2O block...")
+        for fid, fn in [("F056GAP_UP_FAIL", build_gap_up_fail), ("F057INTRA1", build_intra1), ("F061GAP_UP_HOLD", build_gap_up_hold), ("F062GAP_DN_RECOVER", build_gap_dn_recover)]:
+            if fid in needs:
+                t0 = time.perf_counter(); df[f"{fid}_raw"] = fn(df); raw_cols.append(f"{fid}_raw")
+                print(f"    {fid} {FACTOR_ALIASES.get(fid, '')} done in {time.perf_counter()-t0:.1f}s", flush=True)
+        if "F058O2O_RET5" in needs:
+            t0 = time.perf_counter(); df["F058O2O_RET5_raw"] = build_o2o_ret5(df, config); raw_cols.append("F058O2O_RET5_raw")
+            print(f"    F058O2O_RET5 done in {time.perf_counter()-t0:.1f}s", flush=True)
+        if "F059GK_VOL20" in needs:
+            t0 = time.perf_counter(); df["F059GK_VOL20_raw"] = build_gk_vol20(df); raw_cols.append("F059GK_VOL20_raw")
+            print(f"    F059GK_VOL20 done in {time.perf_counter()-t0:.1f}s", flush=True)
+        if "F060ON_INTRA_DIV5" in needs:
+            t0 = time.perf_counter(); df["F060ON_INTRA_DIV5_raw"] = build_on_intra_div5(df, config); raw_cols.append("F060ON_INTRA_DIV5_raw")
+            print(f"    F060ON_INTRA_DIV5 done in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    if needs & set(NEW45_FACTORS[7:11]):
+        print("  Momentum/path block...")
+        for fid, fn in [("F063RET5D_SKIP1", build_ret5d_skip1), ("F064RET_ACCEL20", build_ret_accel20), ("F065MAXDD20", build_maxdd20), ("F066EFFICIENCY20", build_efficiency20)]:
+            if fid in needs:
+                t0 = time.perf_counter(); df[f"{fid}_raw"] = fn(df, config); raw_cols.append(f"{fid}_raw")
+                print(f"    {fid} {FACTOR_ALIASES.get(fid, '')} done in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    if needs & set(NEW45_FACTORS[11:19]):
+        print("  Volatility + market block...")
+        df = precompute_ret_blocks(df, config)
+        for fid, fn in [("F067TAIL_LOSS20", build_tail_loss20), ("F068SKEW20", build_skew20), ("F069DNVOL20", build_dnvol20), ("F070UP_DN_VOL", build_up_dn_vol), ("F071VOL_OF_VOL", build_vol_of_vol), ("F072CORR_60D", build_corr_60d), ("F073KURT_60D", build_kurt_60d), ("F074BETA_20D", build_beta_20d)]:
+            if fid in needs:
+                t0 = time.perf_counter()
+                df[f"{fid}_raw"] = fn(df, config) if fid == "F073KURT_60D" else fn(df)
+                raw_cols.append(f"{fid}_raw")
+                print(f"    {fid} {FACTOR_ALIASES.get(fid, '')} done in {time.perf_counter()-t0:.1f}s", flush=True)
+        drop_temporary_columns(df)
+
+    if needs & set(NEW45_FACTORS[19:26]):
+        print("  Volume + VWAP block...")
+        for fid, fn in [("F075VOLUME_RATIO", build_volume_ratio), ("F076SIGNED_AMT20", build_signed_amt20), ("F077AMP_VOL20", build_amp_vol20), ("F078TURN_SIZE", build_turn_size), ("F079TURN_ACCEL", build_turn_accel), ("F080VWAP_DEV", build_vwap_dev), ("F081STRONG_CLOSE", build_strong_close)]:
+            if fid in needs:
+                t0 = time.perf_counter(); df[f"{fid}_raw"] = fn(df); raw_cols.append(f"{fid}_raw")
+                print(f"    {fid} {FACTOR_ALIASES.get(fid, '')} done in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    if needs & set(NEW45_FACTORS[26:32]):
+        print("  Float + value + age block...")
+        for fid, fn in [("F082LOCKED_PCT", build_locked_pct), ("F083TURN_FREE", build_turn_free), ("F084AMT_FREE20", build_amt_free20), ("F085SP_TTM", build_sp_ttm), ("F086DIV_TTM", build_div_ttm)]:
+            if fid in needs:
+                t0 = time.perf_counter(); df[f"{fid}_raw"] = fn(df); raw_cols.append(f"{fid}_raw")
+                print(f"    {fid} {FACTOR_ALIASES.get(fid, '')} done in {time.perf_counter()-t0:.1f}s", flush=True)
+        if "F087LIST_AGE" in needs:
+            t0 = time.perf_counter(); df["F087LIST_AGE_raw"] = build_list_age(df, config); raw_cols.append("F087LIST_AGE_raw")
+            print(f"    F087LIST_AGE done in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    fin_needs = needs & set(NEW45_FACTORS[32:45])
+    if fin_needs:
+        if financial_quarterly is None:
+            raise ValueError("financial_quarterly is required for F088CF_SALES_Q-F100INV_MINUS_REV")
+        cache_key = "v2_financial_raws"
+        if cache_key not in shared_cache:
+            print("  Financial TTM/SQ raw table from financial_quarterly...")
+            shared_cache[cache_key] = build_v2_financial_factor_raws(
+                base_panel=df,
+                financial_quarterly=financial_quarterly,
+                config=config,
+                factor_names=NEW45_FACTORS[32:45],
+            )
+        fin_raw = shared_cache[cache_key]
+        keep = [date_col, stock_col] + [f"{fid}_raw" for fid in sorted(fin_needs) if f"{fid}_raw" in fin_raw.columns]
+        fin_raw = fin_raw[keep]
+        df = df.merge(fin_raw, on=[date_col, stock_col], how="left")
+        for fid in sorted(fin_needs):
+            col = f"{fid}_raw"
+            if col in df.columns:
+                raw_cols.append(col)
+                print(f"    {fid} {FACTOR_ALIASES.get(fid, '')} done", flush=True)
+
+    keep = [date_col, stock_col] + [c for c in raw_cols if c in df.columns]
+    return df[keep].copy()
+
+
+def compute_batch(
+    df: pd.DataFrame,
+    factor_names: list[str],
+    config: FactorPanelConfig,
+    financial_quarterly: pd.DataFrame | None = None,
+    shared_cache: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Backward-compatible wrapper for V2 factor computation."""
+    return compute_v2_factor_batch(df, financial_quarterly, factor_names, config, shared_cache)

@@ -12,8 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 DRY_RUN = False  # Set True to see what would happen without writing
 
 UNIFIED = Path("dataset/processed/unified_daily_panel.parquet")
-FACTOR = Path("dataset/processed/factor_panel_54_ind.parquet")
-POOL = Path("dataset/processed/factor_panel_1500_54_ind.parquet")
+FACTOR = Path("dataset/processed/factor_panel_1500_54_ind.parquet")
 BACKUP_DIR = Path("dataset/processed/_backup")
 
 if __name__ == "__main__":

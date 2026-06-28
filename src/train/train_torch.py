@@ -154,40 +154,32 @@ def _compute_valid_cumret(
 ) -> dict:
     """Compute cumulative return of daily top-N equal-weight portfolio on valid set.
 
-    Signal at date t uses the next trading day's ret_daily (forward return t→t+1),
-    matching the backtest engine's _get_next_return_date logic.
+    Uses 1d_next_raw[t] = open(t+2)/open(t+1)-1, the same open-to-open return as
+    the backtest engine. Signal at date t → buy open(t+1), sell open(t+2).
+    No date-shift needed: 1d_next_raw at signal date t IS the forward return.
     """
-    if "ret_daily" not in meta.columns or "stock_id" not in meta.columns:
+    fwd_col = "1d_next_raw"
+    if fwd_col not in meta.columns or "stock_id" not in meta.columns:
         return {"cumret": np.nan, "sharpe": np.nan, "n_dates": 0}
 
     df = pd.DataFrame({
         "time": pd.to_datetime(meta[date_col].values),
         "stock_id": meta["stock_id"].astype(str).values,
         "y_pred": y_pred,
-        "ret_daily": meta["ret_daily"].values,
+        fwd_col: meta[fwd_col].values,
     })
-    df = df.dropna(subset=["y_pred", "ret_daily"])
+    df = df.dropna(subset=["y_pred", fwd_col])
 
-    # Forward-return lookup: (date, stock_id) -> ret_daily at that date
-    # ret_daily[t+1] = return from t to t+1 → this is what we earn on signal at t
-    fwd_ret = df.set_index(["time", "stock_id"])["ret_daily"]
-
-    # Map each signal date to the next available trading date
-    all_dates = np.sort(df["time"].unique())
-    next_date = {pd.Timestamp(all_dates[i]): pd.Timestamp(all_dates[i + 1])
-                 for i in range(len(all_dates) - 1)}
+    # 1d_next_raw[t] IS the forward return — no next-date mapping needed
+    fwd_ret = df.set_index(["time", "stock_id"])[fwd_col]
 
     daily_rets = []
     for signal_date, g in df.groupby("time", sort=True):
-        rd = next_date.get(pd.Timestamp(signal_date))
-        if rd is None:
-            continue
         top = g.nlargest(top_n, "y_pred")
         day_rets = []
         for sid in top["stock_id"]:
             try:
-                r = fwd_ret.loc[(rd, sid)]
-                # Defensive handling for accidental duplicate (date, stock_id) rows.
+                r = fwd_ret.loc[(pd.Timestamp(signal_date), sid)]
                 if isinstance(r, pd.Series):
                     r = r.iloc[0] if len(r) else np.nan
                 r = float(r)

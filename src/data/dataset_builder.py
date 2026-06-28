@@ -251,6 +251,8 @@ class PanelDatasetBuilder:
         self,
         df: pd.DataFrame,
         output_meta_cols: Optional[Sequence[str]] = None,
+        end_filter_col: Optional[str] = None,
+        end_filter_value: Optional[object] = None,
     ) -> BuiltDataset:
         """
         Build a sequence dataset for models such as DLinear, TSMixer, PatchTST,
@@ -270,11 +272,25 @@ class PanelDatasetBuilder:
 
         A sample is skipped if its feature window or target contains NaN or Inf.
         This method does not fill missing values or modify feature values.
+
+        If end_filter_col / end_filter_value are provided, windows may still use
+        earlier rows as historical context, but only samples whose window-end row
+        matches the filter are materialized. This is used to build train / valid /
+        test sequence datasets split-aware, without first building one full X and
+        then copying subsets with boolean indexing.
         """
 
         prepared = self._prepare_dataframe(df)
         resolved_meta_cols = self._resolve_output_meta_cols(prepared, output_meta_cols)
         self._validate_numeric_feature_target(prepared)
+
+        if (end_filter_col is None) != (end_filter_value is None):
+            raise ValueError(
+                "end_filter_col and end_filter_value must be provided together"
+            )
+
+        if end_filter_col is not None and end_filter_col not in prepared.columns:
+            raise ValueError(f"Input DataFrame is missing end_filter_col: {end_filter_col}")
 
         n_features = len(self.feature_cols)
 
@@ -301,6 +317,11 @@ class PanelDatasetBuilder:
                 np.isfinite(windows).all(axis=(1, 2))
                 & np.isfinite(window_targets)
             )
+
+            if end_filter_col is not None:
+                end_values = group[end_filter_col].to_numpy()[self.seq_len - 1:]
+                valid &= (end_values == end_filter_value)
+
             total_valid += int(valid.sum())
 
         if total_valid == 0:
@@ -335,6 +356,10 @@ class PanelDatasetBuilder:
                 np.isfinite(windows).all(axis=(1, 2))
                 & np.isfinite(window_targets)
             )
+
+            if end_filter_col is not None:
+                end_values = group[end_filter_col].to_numpy()[self.seq_len - 1:]
+                valid &= (end_values == end_filter_value)
 
             n_valid = int(valid.sum())
             if n_valid == 0:
@@ -378,9 +403,9 @@ class PanelDatasetBuilder:
             )
         
         return BuiltDataset(
-            X=dataset.X[mask].copy(),
-            y=dataset.y[mask].copy(),
-            meta=dataset.meta.loc[mask].reset_index(drop=True).copy(),
+            X=dataset.X[mask],   # boolean indexing already copies
+            y=dataset.y[mask],
+            meta=dataset.meta.loc[mask].reset_index(drop=True),
         )
 
     def split_built_dataset(
@@ -615,6 +640,38 @@ class PanelDatasetBuilder:
 
         return self._split_built_dataset_by_label(dataset, split_col)
 
+    @staticmethod
+    def _drop_temp_split_col(
+        dataset: Optional[BuiltDataset],
+        split_col: str,
+    ) -> Optional[BuiltDataset]:
+        """Remove the temporary split label from a BuiltDataset meta frame."""
+
+        if dataset is None:
+            return None
+
+        if split_col in dataset.meta.columns:
+            dataset.meta = dataset.meta.drop(columns=[split_col]).reset_index(drop=True)
+        else:
+            dataset.meta = dataset.meta.reset_index(drop=True)
+
+        return dataset
+
+    @staticmethod
+    def _log_sequence_split(split_name: str, dataset: Optional[BuiltDataset]) -> None:
+        """Print a compact memory diagnostic for a built sequence split."""
+
+        if dataset is None:
+            print(f"[sequence build] split={split_name}: None")
+            return
+
+        x_gib = dataset.X.nbytes / (1024 ** 3)
+        print(
+            f"[sequence build] split={split_name}: "
+            f"X.shape={dataset.X.shape}, X_mem={x_gib:.2f} GiB, "
+            f"y.shape={dataset.y.shape}, meta_rows={len(dataset.meta)}"
+        )
+
     def build_sequence_splits_from_frames(
         self,
         train_df: pd.DataFrame,
@@ -624,10 +681,12 @@ class PanelDatasetBuilder:
         """
         Build sequence splits from already-separated train / valid / test frames.
 
-        This compatibility method is useful when data is stored in separate files.
-        The frames are temporarily concatenated before sequence construction, so
-        validation and test samples can use historical observations from earlier
-        frames while still being assigned back to their original split labels.
+        The frames are temporarily concatenated so validation and test samples can
+        use historical observations from earlier frames. Unlike the older
+        implementation, this method does not build one full sequence dataset and
+        then split it with boolean indexing. It materializes each split directly:
+        a window can use rows from the combined panel as history, but the window
+        end row must belong to the requested split.
         """
 
         combined, split_col = self._concat_frames_with_split_label(
@@ -639,12 +698,39 @@ class PanelDatasetBuilder:
         extended_meta_cols = self._deduplicate_preserve_order(
             self.output_meta_cols + [split_col]
         )
-        dataset = self.build_sequence_dataset(
+
+        train_data = self.build_sequence_dataset(
             combined,
             output_meta_cols=extended_meta_cols,
+            end_filter_col=split_col,
+            end_filter_value="train",
         )
+        train_data = self._drop_temp_split_col(train_data, split_col)
+        self._log_sequence_split("train", train_data)
 
-        return self._split_built_dataset_by_label(dataset, split_col)
+        valid_data = None
+        if valid_df is not None:
+            valid_data = self.build_sequence_dataset(
+                combined,
+                output_meta_cols=extended_meta_cols,
+                end_filter_col=split_col,
+                end_filter_value="valid",
+            )
+            valid_data = self._drop_temp_split_col(valid_data, split_col)
+            self._log_sequence_split("valid", valid_data)
+
+        test_data = None
+        if test_df is not None:
+            test_data = self.build_sequence_dataset(
+                combined,
+                output_meta_cols=extended_meta_cols,
+                end_filter_col=split_col,
+                end_filter_value="test",
+            )
+            test_data = self._drop_temp_split_col(test_data, split_col)
+            self._log_sequence_split("test", test_data)
+
+        return train_data, valid_data, test_data
 
 if __name__ == "__main__":
     # Minimal smoke test for both tabular and sequence dataset construction.

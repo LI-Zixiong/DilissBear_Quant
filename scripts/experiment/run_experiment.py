@@ -22,129 +22,63 @@ if __name__ == "__main__":
         # ──────────────────────────────────────────────────────────
         target_col="5d_next_raw",                # model learns this
         return_col="return_1d",                  # backtest PnL column
-        backtest_return_mode="column",           # "column" = ret_daily, "next_target" = 1d_next_raw
-        backtest_return_source="ret_daily",
+        backtest_return_mode="next_target",       # open-to-open: 1d_next_raw → return_1d
+        backtest_return_source="1d_next_raw",
 
         # ──────────────────────────────────────────────────────────
-        # Factors — 12-factor V1 selection (2026-05-29)
+        # Factors — Full 100-factor set (2026-06-25)
         # ──────────────────────────────────────────────────────────
-        # Full 54-factor V1 set (2026-06-01)
         feature_cols=(
-            "F001SIZE", "F002SIZENL", "F003LIQUIDITY", "F004BETA",
-            "F005RESVOL", "F006MOMENTUM", "F007LTREV", "F008STREV",
-            "F009LEVERAGE", "F010VALUE", "F011EARNYLD", "F012GROWTH",
-            "F013REV5", "F014MOM120_20", "F015VOLREV", "F016MAXRET",
-            "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
-            "F021CFP", "F022GPTA", "F023ACCRUAL", "F024ASSETGR",
-            "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
-            "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
-            "F034HIGHDEV20", "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
-            "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
-            "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
-            "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
-            "F049ROE", "F050ROA", "F051GPM", "F052CFOA",
-            "F053RD_INTENSITY", "F054RECEIVABLE_RATIO",
-            "F055IND",
+            "F001SIZE", "F002SIZENL", "F003LIQUIDITY", "F004BETA", "F005RESVOL",
+            "F006MOMENTUM", "F007LTREV", "F008STREV", "F009LEVERAGE", "F010VALUE",
+            "F011EARNYLD", "F012GROWTH", "F013REV5", "F014MOM120_20", "F015VOLREV",
+            "F016MAXRET", "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020LIMITUP_RECENCY", "F021CFP",
+            "F022GPTA", "F023ACCRUAL", "F024ASSETGR", "F025GAP", "F026KLEN", "F027KUP",
+            "F028KLOW", "F029KSFT", "F030RSV20", "F031RSV60", "F032RANGEZ20",
+            "F033GAPREV5", "F034HIGHDEV20", "F035LOWDEV20", "F036VOLSHOCK5",
+            "F037VOLSHOCK20", "F038TURNZ20", "F039VSTD20", "F040PVCORR20",
+            "F041RETVOLCORR20", "F042AMTCORR20", "F043SLOPE20", "F044RSQR20",
+            "F045RESI20", "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
+            "F049ROE", "F050ROA", "F051GPM", "F052CFOA", "F053RD_INTENSITY",
+            "F054RECEIVABLE_RATIO", "F055IND", "F056GAP_UP_FAIL", "F057INTRA1", "F058O2O_RET5", "F059GK_VOL20", "F060ON_INTRA_DIV5",
+            "F061GAP_UP_HOLD", "F062GAP_DN_RECOVER", "F063RET5D_SKIP1", "F064RET_ACCEL20", "F065MAXDD20", "F066EFFICIENCY20", "F067TAIL_LOSS20", "F068SKEW20", "F069DNVOL20",
+            "F070UP_DN_VOL", "F071VOL_OF_VOL", "F072CORR_60D", "F073KURT_60D", "F074BETA_20D", "F075VOLUME_RATIO", "F076SIGNED_AMT20", "F077AMP_VOL20", "F078TURN_SIZE",
+            "F079TURN_ACCEL", "F080VWAP_DEV", "F081STRONG_CLOSE", "F082LOCKED_PCT", "F083TURN_FREE", "F084AMT_FREE20", "F085SP_TTM", "F086DIV_TTM", "F087LIST_AGE",
+            "F088CF_SALES_Q", "F089CASH_PROFIT", "F090CRR", "F091CF_VOL", "F092EARN_STAB", "F093FCF_YIELD", "F094CAPEX_INT", "F095NET_FIN", "F096DILUTION",
+            "F097INT_BURDEN", "F098DIV_PAYOUT", "F099AR_MINUS_REV", "F100INV_MINUS_REV"
         ),
-        meta_cols=("industry_sw", "list_date", "ret_daily"),
+        meta_cols=("industry_sw", "list_date", "ret_daily", "1d_next_raw"),
 
         # ──────────────────────────────────────────────────────────
-        # Active models
+        # Active models — full benchmark
         # ──────────────────────────────────────────────────────────
-        #  Current default: LightGBM + Xgboost +DLinear + GatedDWTCN (2026-06-04)
-        model_names=("lightgbm", "xgboost", "dlinear", "gated_dwtcn"),
+        model_names=("lightgbm", "xgboost", "dlinear", "gated_dwtcn",),
 
-        #  To run a single model (e.g. LGBM only):
-        #  model_names=("lightgbm",)
-
-        #  To restore the full five-model benchmark:
-        #  model_names=("lightgbm", "xgboost", "dlinear", "itransformer", "tsmixer"),
-
-        # ──────────────────────────────────────────────────────────
-        # Per-model factor sets (2026-06-04 audit, ZZ500+1000 universe)
-        #   LGBM / iTransformer / TSMixer: |ICIR| >= 0.02, corr < 0.98  (46 factors)
-        #   DLinear: |ICIR| >= 0.10, corr < 0.85  (~31 factors, see audit_dlinear)
-        # ──────────────────────────────────────────────────────────
         model_feature_signs={},
+        # LGBM: 100 factors minus limit-up/down (leaf-wise growth can't handle them)
         model_feature_cols={
-            "lightgbm": (
-                "F002SIZENL", "F003LIQUIDITY", "F004BETA",
-                "F005RESVOL", "F007LTREV", "F008STREV",
-                "F010VALUE", "F011EARNYLD", "F012GROWTH",
-                "F013REV5", "F015VOLREV", "F016MAXRET",
-                "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
-                "F021CFP", "F023ACCRUAL", "F024ASSETGR",
-                "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
-                "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
-                "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
-                "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
-                "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
-                # "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
-                "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
-                "F055IND",
-            ),
-            "itransformer": (
-                "F002SIZENL", "F003LIQUIDITY", "F004BETA",
-                "F005RESVOL", "F007LTREV", "F008STREV",
-                "F010VALUE", "F011EARNYLD", "F012GROWTH",
-                "F013REV5", "F015VOLREV", "F016MAXRET",
-                "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
-                "F021CFP", "F023ACCRUAL", "F024ASSETGR",
-                "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
-                "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
-                "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
-                "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
-                "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
-                "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
-                "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
-                "F055IND",
-            ),
-            "tsmixer": (
-                "F002SIZENL", "F003LIQUIDITY", "F004BETA",
-                "F005RESVOL", "F007LTREV", "F008STREV",
-                "F010VALUE", "F011EARNYLD", "F012GROWTH",
-                "F013REV5", "F015VOLREV", "F016MAXRET",
-                "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
-                "F021CFP", "F023ACCRUAL", "F024ASSETGR",
-                "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
-                "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
-                "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
-                "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
-                "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
-                "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
-                "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
-                "F055IND",
-            ),
-            # DLinear (30-factor, current active)
-            "dlinear": (
-                "F039VSTD20", "F041RETVOLCORR20",
-                "F016MAXRET", "F040PVCORR20",
-                "F017IVOL", "F018AMIHUD", "F002SIZENL",
-                "F026KLEN", "F028KLOW", "F035LOWDEV20",
-                "F008STREV", "F019COSTDEV", "F042AMTCORR20",
-                "F031RSV60",
-                "F005RESVOL", "F003LIQUIDITY", "F025GAP",
-                "F027KUP", "F013REV5", "F010VALUE",
-                "F038TURNZ20", "F033GAPREV5", "F029KSFT",
-                "F021CFP", "F020BP", "F023ACCRUAL",
-                "F030RSV20", "F015VOLREV", "F011EARNYLD",
-                "F007LTREV", "F052CFOA",
-            ),
-            "gated_dwtcn": (
-                "F002SIZENL", "F003LIQUIDITY", "F004BETA",
-                "F005RESVOL", "F007LTREV", "F008STREV",
-                "F010VALUE", "F011EARNYLD", "F012GROWTH",
-                "F013REV5", "F015VOLREV", "F016MAXRET",
-                "F017IVOL", "F018AMIHUD", "F019COSTDEV", "F020BP",
-                "F021CFP", "F023ACCRUAL", "F024ASSETGR",
-                "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
-                "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
-                "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
-                "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
-                "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
-                "F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP",
-                "F051GPM", "F052CFOA", "F054RECEIVABLE_RATIO",
-                "F055IND",
+            "lightgbm": tuple(
+                f for f in (
+                    "F001SIZE", "F002SIZENL", "F003LIQUIDITY", "F004BETA", "F005RESVOL",
+                    "F006MOMENTUM", "F007LTREV", "F008STREV", "F009LEVERAGE", "F010VALUE",
+                    "F011EARNYLD", "F012GROWTH", "F013REV5", "F014MOM120_20", "F015VOLREV",
+                    "F016MAXRET", "F017IVOL", "F018AMIHUD", "F019COSTDEV",
+                    "F021CFP", "F022GPTA", "F023ACCRUAL", "F024ASSETGR",
+                    "F025GAP", "F026KLEN", "F027KUP", "F028KLOW", "F029KSFT",
+                    "F030RSV20", "F031RSV60", "F032RANGEZ20", "F033GAPREV5",
+                    "F034HIGHDEV20", "F035LOWDEV20", "F036VOLSHOCK5", "F037VOLSHOCK20",
+                    "F038TURNZ20", "F039VSTD20", "F040PVCORR20", "F041RETVOLCORR20",
+                    "F042AMTCORR20", "F043SLOPE20", "F044RSQR20", "F045RESI20",
+                    "F049ROE", "F050ROA", "F051GPM", "F052CFOA",
+                    "F053RD_INTENSITY", "F054RECEIVABLE_RATIO", "F055IND",
+                    "F056GAP_UP_FAIL", "F057INTRA1", "F058O2O_RET5", "F059GK_VOL20", "F060ON_INTRA_DIV5", "F061GAP_UP_HOLD", "F062GAP_DN_RECOVER",
+                    "F063RET5D_SKIP1", "F064RET_ACCEL20", "F065MAXDD20", "F066EFFICIENCY20", "F067TAIL_LOSS20", "F068SKEW20", "F069DNVOL20",
+                    "F070UP_DN_VOL", "F071VOL_OF_VOL", "F072CORR_60D", "F073KURT_60D", "F074BETA_20D", "F075VOLUME_RATIO", "F076SIGNED_AMT20",
+                    "F077AMP_VOL20", "F078TURN_SIZE", "F079TURN_ACCEL", "F080VWAP_DEV", "F081STRONG_CLOSE", "F082LOCKED_PCT", "F083TURN_FREE",
+                    "F084AMT_FREE20", "F085SP_TTM", "F086DIV_TTM", "F087LIST_AGE", "F088CF_SALES_Q", "F089CASH_PROFIT", "F090CRR",
+                    "F091CF_VOL", "F092EARN_STAB", "F093FCF_YIELD", "F094CAPEX_INT", "F095NET_FIN", "F096DILUTION", "F097INT_BURDEN",
+                    "F098DIV_PAYOUT", "F099AR_MINUS_REV", "F100INV_MINUS_REV"
+                ) if f not in ("F046LIMITUP20", "F047LIMITDN20", "F048LIMITSTREAKUP", "F020LIMITUP_RECENCY")
             ),
         },
 
@@ -183,7 +117,7 @@ if __name__ == "__main__":
                 "max_depth":             5,
                 "learning_rate":         0.02,
                 "subsample":             0.8,
-                "colsample_bytree":      0.12,
+                "colsample_bytree":      0.20,
                 "early_stopping_rounds": None,
             },
 

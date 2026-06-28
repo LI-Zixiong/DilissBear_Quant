@@ -65,6 +65,10 @@ class RealBacktestConfig:
     max_stocks: int = 50                 # max new buys per entry day
     pred_col: str = "bayes_score"
 
+    # Rank-aware slippage (bps). Bin3 signals are most crowded → highest buy slip.
+    buy_slippage_bps: dict[int, float] | None = None  # {bin: bps}, e.g. {1:5,2:10,3:15}
+    sell_slippage_bps: float = 3.0  # uniform sell slip in basis points
+
     # Trading realism switches
     block_limit_up_buy: bool = True
     block_limit_down_sell: bool = True
@@ -100,6 +104,8 @@ class RealBacktestConfig:
             raise ValueError(f"position_sizing must be 'fixed' or 'budget', got {self.position_sizing}")
         if not (0.0 < self.cash_ratio <= 1.0):
             raise ValueError(f"cash_ratio must be in (0, 1], got {self.cash_ratio}")
+        if self.buy_slippage_bps is None:
+            self.buy_slippage_bps = {1: 3, 2: 5, 3: 8}
 
 
 def _is_finite_positive(x: Any) -> bool:
@@ -318,8 +324,11 @@ def _allocate_by_budget(
 
         # Compute target lots for each stock (round to nearest integer)
         stock_plans = []
+        slip_bps = config.buy_slippage_bps.get(bi, 0)
+        slip_rate = slip_bps / 10000.0
         for _, row in grp.iterrows():
-            price_per_lot = float(row["open"]) * lot_size
+            fill_price = float(row["open"]) * (1.0 + slip_rate)
+            price_per_lot = fill_price * lot_size
             if price_per_lot <= 0:
                 continue
             raw_lots = per_stock / price_per_lot
@@ -327,7 +336,7 @@ def _allocate_by_budget(
             entry_gross = n_lots * price_per_lot
             stock_plans.append({
                 "stock_id": str(row["stock_id"]),
-                "open": float(row["open"]),
+                "open": fill_price,
                 "score": float(row["score"]),
                 "rank_pct": float(row["rank_pct"]),
                 "bin": bi,
@@ -452,9 +461,12 @@ def _build_buy_targets(
                     continue
                 if sid in buy_targets:
                     continue
+                slip_bps_fixed = config.buy_slippage_bps.get(bi, 0)
+                slip_rate_fixed = slip_bps_fixed / 10000.0
+                fill_fixed = float(stock["open"]) * (1.0 + slip_rate_fixed)
                 buy_targets[sid] = {
                     "lots": n_lots, "shares": n_lots * config.lot_size,
-                    "open": float(stock["open"]),
+                    "open": fill_fixed,
                     "score": float(stock["score"]),
                     "rank_pct": float(stock["rank_pct"]), "bin": bi,
                     "signal_date": signal_date, "target_exit_date": target_exit_date,
@@ -580,9 +592,12 @@ def run_real_backtest(
             if target is not None:
                 # ── Smart hold: stock still in buy list, only trade delta ──
                 delta_lots = target["lots"] - pos["lots"]
-                px = float(row["open"]) if row is not None and _is_finite_positive(row.get("open")) else pos.get("last_price", pos["entry_open"])
+                raw_px = float(row["open"]) if row is not None and _is_finite_positive(row.get("open")) else pos.get("last_price", pos["entry_open"])
 
                 if delta_lots > 0:
+                    # Need more: buy delta lots (buy slip applied)
+                    buy_slip = config.buy_slippage_bps.get(pos.get("bin", 2), 10) / 10000.0
+                    px = raw_px * (1.0 + buy_slip)
                     # Need more: buy delta lots at buy commission (万3)
                     delta_shares = delta_lots * config.lot_size
                     delta_gross = delta_shares * px
@@ -608,7 +623,9 @@ def run_real_backtest(
                             "score": pos["score"],
                         })
                 elif delta_lots < 0:
-                    # Need fewer: sell excess at sell commission (万8)
+                    # Need fewer: sell excess (sell slip applied)
+                    sell_slip = config.sell_slippage_bps / 10000.0
+                    px = raw_px * (1.0 - sell_slip)
                     excess_lots = -delta_lots
                     excess_shares = excess_lots * config.lot_size
                     gross_sell = excess_shares * px
@@ -655,7 +672,7 @@ def run_real_backtest(
                 n_blocked_sells += 1
                 continue
 
-            sell_open = float(row["open"])
+            sell_open = float(row["open"]) * (1.0 - config.sell_slippage_bps / 10000.0)
             gross_sell = pos["shares"] * sell_open
             sell_commission = _commission(gross_sell, config)
             stamp_tax = gross_sell * config.stamp_tax_rate
@@ -892,6 +909,8 @@ if __name__ == "__main__":
         commission_rate=0.0003,
         stamp_tax_rate=0.0005,
         min_commission=0.0,
+        buy_slippage_bps={1: 3, 2: 5, 3: 8},
+        sell_slippage_bps=3,
     )
     result = run_real_backtest(scores, prices, config)
     s = result["summary"]

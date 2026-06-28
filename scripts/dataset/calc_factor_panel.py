@@ -15,8 +15,8 @@ def main() -> None:
     config = FactorPanelConfig(
         base_panel_path="dataset/processed/unified_daily_panel.parquet",
         financial_panel_path="dataset/processed/financial_quarterly_panel.parquet",
-        output_path="dataset/processed/factor_panel_54_ind.parquet",
-        metadata_path="dataset/processed/factor_panel_54_metadata.json",
+        output_path="dataset/processed/factor_panel_1500_54_ind.parquet",
+        metadata_path="dataset/processed/factor_panel_1500_54_ind_metadata.json",
 
         model_start_date="2015-06-01",
         date_col="time",
@@ -64,8 +64,14 @@ def main() -> None:
         save_raw_factors=False,
         save_winsorized_factors=False,
 
-        factor_version="v1_24f",
+        factor_version="v1_100f",
         seed=42,
+
+        # ZZ500+ZZ1000 universe (~1500 stocks). Leave empty for full universe.
+        universe_paths=(
+            "dataset/input/zz500.xls",
+            "dataset/input/zz1000.xls",
+        ),
     )
 
     compute_factor_panel_full(config)

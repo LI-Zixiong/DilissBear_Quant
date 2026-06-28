@@ -26,7 +26,7 @@ class DataPaths:
     universe: Path = Path("dataset/processed/factor_panel_1500_54_ind.parquet")
 
     # ── Experiment outputs ──
-    experiment_dir: Path = Path("dataset/output/experiment_004")
+    experiment_dir: Path = Path("dataset/output/experiment_005")
     tuning_dir: Path = Path("dataset/output/tuning")
 
     # ── Ensemble outputs (separate from model predictions) ──

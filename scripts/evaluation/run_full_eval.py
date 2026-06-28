@@ -24,7 +24,8 @@ from src.backtest.ensemble_methods import (
     single_model, equal_weight, dual_model, rank_ridge, prepare_predictions,
 )
 from src.backtest.bayes_blender import (
-    BayesBlenderConfig, IndustryBayesCalibrator, _clean_industry,
+    BayesBlenderConfig, build_bayes_scores, apply_online_gate,
+    _clean_industry, _weights_for, _sector_for,
 )
 from src.backtest.ensemble_utils import normalize_keys, backtest_score, smooth_predictions
 from src.experiment.config import ExperimentConfig
@@ -93,22 +94,33 @@ def _load_valid_predictions(cfg: EvalConfig) -> pd.DataFrame:
 
 
 def _load_returns(cfg: EvalConfig) -> pd.DataFrame:
-    panel = pd.read_parquet(cfg.returns_path)
+    """Load open-to-open returns (1d_next_raw mapped to next trading date)."""
+    panel = pd.read_parquet(cfg.factor_path, columns=["time", "stock_id", "1d_next_raw"])
     panel = normalize_keys(panel)
-    ret = panel[["time", "stock_id", "ret_daily"]].rename(columns={"ret_daily": "return_1d"}).copy()
-    ret["return_1d"] = pd.to_numeric(ret["return_1d"], errors="coerce")
-    return ret.dropna(subset=["return_1d"]).sort_values(["time", "stock_id"]).reset_index(drop=True)
+    panel["1d_next_raw"] = pd.to_numeric(panel["1d_next_raw"], errors="coerce")
+    panel = panel.dropna(subset=["1d_next_raw"])
+    panel = panel.sort_values(["time", "stock_id"])
+
+    # Map 1d_next_raw at signal T → return_1d at T+1 (next trading date)
+    dates = sorted(panel["time"].drop_duplicates())
+    next_date = {dates[i]: dates[i + 1] for i in range(len(dates) - 1)}
+    panel["time"] = panel["time"].map(next_date)
+    panel = panel.dropna(subset=["time"])
+    panel["time"] = pd.to_datetime(panel["time"])
+    return panel.rename(columns={"1d_next_raw": "return_1d"})[["time", "stock_id", "return_1d"]].reset_index(drop=True)
 
 
 def _load_returns_and_prices(cfg: EvalConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load returns + prices in one read (same source parquet)."""
+    """Load open-to-open returns + open/pre_close prices."""
     panel = pd.read_parquet(cfg.returns_path)
     panel = normalize_keys(panel)
-    ret = panel[["time", "stock_id", "ret_daily"]].rename(columns={"ret_daily": "return_1d"}).copy()
-    ret["return_1d"] = pd.to_numeric(ret["return_1d"], errors="coerce")
-    ret = ret.dropna(subset=["return_1d"]).sort_values(["time", "stock_id"]).reset_index(drop=True)
+
+    # Prices from unified daily panel
     prices = panel[["time", "stock_id", "open", "pre_close"]].copy()
     prices[["open", "pre_close"]] = prices[["open", "pre_close"]].astype(float)
+
+    # Returns from factor panel (open-to-open)
+    ret = _load_returns(cfg)
     return ret, prices
 
 
@@ -127,121 +139,84 @@ def _load_prices(cfg: EvalConfig) -> pd.DataFrame:
     return prices
 
 
-# ── Bayes runner ─────────────────────────────────────────────
+# ── Bayes+Gate runner ──────────────────────────────────────────
 
-def _run_bayes_v1(
+def _run_bayes_v2(
     predictions: pd.DataFrame,
     returns: pd.DataFrame,
     ind_panel: pd.DataFrame,
     cfg: EvalConfig,
+    use_gate: bool = True,
+    half_life: int = 252,
 ) -> dict:
+    """Bayes hl=252 + OnlineExpertGate.  Uses build_bayes_scores + apply_online_gate."""
     # Need valid warmup for rolling calibration
     valid_preds = _load_valid_predictions(cfg)
     all_preds = pd.concat([valid_preds, predictions], ignore_index=True)
     all_preds = all_preds.sort_values(["time", "stock_id"]).reset_index(drop=True)
 
-    # Smooth + rank on combined data
+    # Smooth + calculate daily ranks
     all_data = smooth_predictions(all_preds, MODELS, cfg.smooth_window)
-    from src.backtest.ensemble_utils import add_daily_model_ranks
-    all_data = add_daily_model_ranks(all_data, MODELS)
+    for m in MODELS:
+        all_data[f"{m}_r"] = all_data.groupby("time")[m].rank(pct=True)
     all_data = all_data.merge(ind_panel, on=["time", "stock_id"], how="left")
 
-    # Forward return + H
-    dates = np.sort(all_data["time"].unique())
-    next_date = {pd.Timestamp(dates[i]): pd.Timestamp(dates[i+1]) for i in range(len(dates)-1)}
-    all_data["return_date"] = all_data["time"].map(next_date)
-    all_data = all_data.dropna(subset=["return_date"])
-    fwd = returns.rename(columns={"time": "return_date"})
-    all_data = all_data.merge(
-        fwd[["return_date", "stock_id", "return_1d"]],
-        on=["return_date", "stock_id"], how="inner",
-    )
-    all_data["H"] = all_data.groupby("time")["return_1d"].transform(
-        lambda x: (x.rank(pct=True) > 0.95).astype(int))
+    # H = top 5% of 1d_next_raw (open-to-open).  Load from factor panel.
+    if "1d_next_raw" not in all_data.columns:
+        h_panel = pd.read_parquet(cfg.factor_path, columns=["time", "stock_id", "1d_next_raw"])
+        h_panel = normalize_keys(h_panel)
+        h_panel["1d_next_raw"] = pd.to_numeric(h_panel["1d_next_raw"], errors="coerce")
+        all_data = all_data.merge(h_panel, on=["time", "stock_id"], how="left")
+    all_data["H"] = all_data.groupby("time")["1d_next_raw"].transform(
+        lambda x: (x.rank(pct=True) >= 0.95).astype(int))
 
     # Only eval split dates
     test_time_set = set(predictions["time"].unique())
     eval_dates = set(all_data.loc[all_data["time"].isin(test_time_set), "time"].unique())
 
-    all_dates = sorted(all_data["time"].unique())
-    cal_cfg = BayesBlenderConfig(rolling_window=cfg.bayes_window, llr_clip=cfg.bayes_clip)
-    cal = IndustryBayesCalibrator(cal_cfg)
-    import time as _time; _b_start = _time.perf_counter()
+    bayes_cfg = BayesBlenderConfig(
+        models=tuple(MODELS),
+        rolling_window=63, half_life=half_life,
+        auto_alpha=True, auto_clip=True, auto_weights=True,
+        clip_percentile=85.0, use_sector=True,
+    )
 
-    scores_list = []
-    first_eval = True
-    for i, t in enumerate(all_dates):
-        if t not in eval_dates or i < cfg.bayes_window:
-            continue
+    # Build Bayes scores
+    merged_ranked = all_data[["time", "stock_id", "industry_sw", "H"]
+                             + [f"{m}_r" for m in MODELS]].dropna(subset=["H"])
+    if use_gate:
+        scores_detail = build_bayes_scores(
+            merged_ranked=merged_ranked, models=MODELS, config=bayes_cfg,
+            eval_dates=eval_dates, eval_burnin=252, detailed=True,
+        )
+        scores_detail = normalize_keys(scores_detail)
+        final_scores, gate_hist = apply_online_gate(
+            scores_detail=scores_detail, returns_df=returns,
+            models=MODELS, top_n=cfg.top_n, gate_burnin=63, reward_window=1,
+            return_col="return_1d",
+        )
+        gate_out = cfg.output_dir / f"bayes_gate_history_{cfg.eval_split}.csv"
+        gate_hist.to_csv(gate_out, index=False)
+    else:
+        final_scores = build_bayes_scores(
+            merged_ranked=merged_ranked, models=MODELS, config=bayes_cfg,
+            eval_dates=eval_dates, eval_burnin=252,
+        )
+        final_scores = normalize_keys(final_scores)
 
-        if first_eval:
-            # Init with full window
-            win = all_data[(all_data["time"] >= all_dates[i - cfg.bayes_window]) &
-                             (all_data["time"] <= all_dates[i - 1])]
-            full_ranks = {}
-            for m in MODELS:
-                full_ranks[m] = win[["time", "stock_id", "industry_sw", f"{m}_r", "H"]].rename(
-                    columns={f"{m}_r": "rank_pct"})
-            cal.update_incremental(full_ranks, None)  # full init
-            first_eval = False
-        else:
-            # Incremental: +yesterday, -oldest
-            evict_idx = i - cfg.bayes_window - 1
-            drop_ranks = None
-            if evict_idx >= 0:
-                evict_t = all_dates[evict_idx]
-                drop_ranks = {}
-                for m in MODELS:
-                    drop_ranks[m] = all_data.loc[
-                        all_data["time"] == evict_t,
-                        ["time", "stock_id", "industry_sw", f"{m}_r", "H"]
-                    ].rename(columns={f"{m}_r": "rank_pct"})
-
-            new_idx = i - 1
-            new_ranks = {}
-            for m in MODELS:
-                new_ranks[m] = all_data.loc[
-                    all_data["time"] == all_dates[new_idx],
-                    ["time", "stock_id", "industry_sw", f"{m}_r", "H"]
-                ].rename(columns={f"{m}_r": "rank_pct"})
-
-            cal.update_incremental(new_ranks, drop_ranks)
-
-        today = all_data.loc[all_data["time"] == t, ["time", "stock_id", "industry_sw"]]
-        t_ranks = {}
-        for m in MODELS:
-            t_ranks[m] = all_data.loc[all_data["time"] == t,
-                         ["time", "stock_id", f"{m}_r"]].rename(columns={f"{m}_r": "rank_pct"})
-        scores = cal.score(today, t_ranks)
-        scores = scores.reset_index()
-        scores.columns = ["stock_id", "bayes_score"]
-        scores["time"] = t
-        scores_list.append(scores)
-        if (i + 1) % 100 == 0:
-            elapsed = _time.perf_counter() - _b_start
-            eta = elapsed / (i - cfg.bayes_window + 1) * (len(all_dates) - i) if i > cfg.bayes_window else 0
-            print(f"  Bayes [{i+1}/{len(all_dates)}] {t.date()}  elapsed={elapsed:.0f}s  ETA~{eta:.0f}s")
-
-    all_scores = pd.concat(scores_list, ignore_index=True)
-    all_scores["stock_id"] = all_scores["stock_id"].astype(str).str.strip().str.zfill(6)
-
-    # Save daily Bayes scores
+    # Save
     score_out = cfg.output_dir / f"bayes_scores_{cfg.eval_split}.parquet"
-    all_scores.to_parquet(score_out, index=False)
-
-    # Save daily auto params (clip + weights + level budgets)
-    if cal.params_history:
-        params_df = pd.DataFrame(cal.params_history)
-        params_out = cfg.output_dir / "bayes_v1_daily_params.csv"
-        params_df.to_csv(params_out, index=False, float_format="%.6f")
+    final_scores.to_parquet(score_out, index=False)
 
     pfolio = PortfolioConfig(
         strategy=cfg.portfolio_strategy, top_n=cfg.top_n, buffer_n=cfg.buffer_n,
         pred_col="y_pred", stock_col="stock_id",
     )
-    paper_result = backtest_score(all_scores.rename(columns={"bayes_score": "_bayes"}), returns, "_bayes",
-                                   cfg.top_n, portfolio_config=pfolio)
-    return paper_result, all_scores
+    paper_result = backtest_score(
+        final_scores.rename(columns={"bayes_score": "_bayes"}), returns, "_bayes",
+        cfg.top_n, portfolio_config=pfolio,
+    )
+    return paper_result, final_scores
 
 
 # ── Main ─────────────────────────────────────────────────────
@@ -259,6 +234,8 @@ def main() -> None:
     parser.add_argument("--buffer-n", type=int, default=None)
     parser.add_argument("--portfolio-strategy", default=None,
                         choices=["top_n", "score_weighted", "bin_weighted", "top_n_buffer", "bin_weighted_buffer"])
+    parser.add_argument("--no-gate", action="store_true", default=False)
+    parser.add_argument("--half-life", type=int, default=252)
     args = parser.parse_args()
 
     cfg = EvalConfig()
@@ -272,8 +249,7 @@ def main() -> None:
     if args.portfolio_strategy is not None: cfg.portfolio_strategy = args.portfolio_strategy
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Unified evaluation — {cfg.eval_split}")
-    print(f"  smooth={cfg.smooth_window}d, bayes_w={cfg.bayes_window}, bayes_clip={cfg.bayes_clip}")
+    print(f"Unified evaluation — {cfg.eval_split} (smooth={cfg.smooth_window}d)")
     if cfg.mode == "real":
         print(f"  real capital={cfg.real_capital:,.0f} CNY")
 
@@ -328,12 +304,15 @@ def main() -> None:
         print(f"  RR: Sharpe={rr.get('sharpe_ratio',0):.4f}  NAV={rr.get('final_nav',0):.4f}")
         print(f"  weights: " + " ".join(f"{m}={rr_w[m]:.3f}" for m in MODELS))
 
-    # ── Bayes V2 ──
+    # ── Bayes V3 ──
+    use_gate = not args.no_gate
+    hl = args.half_life
     step_label = "6/6" if cfg.mode == "full" else "2/2"
-    print(f"\n[{step_label}] Bayes V2 (rolling) ...")
-    bayes_paper, bayes_scores = _run_bayes_v1(preds, returns, ind_panel, cfg)
-    _add("Bayes V2", bayes_paper)
-    print(f"  Bayes V2: Sharpe={bayes_paper.get('sharpe_ratio',0):.4f}  NAV={bayes_paper.get('final_nav',0):.4f}")
+    tag = f"Bayes+Gate hl={hl}" if use_gate else f"Bayes no-gate hl={hl}"
+    print(f"\n[{step_label}] {tag} ...")
+    bayes_paper, bayes_scores = _run_bayes_v2(preds, returns, ind_panel, cfg, use_gate=use_gate, half_life=hl)
+    _add(tag, bayes_paper)
+    print(f"  {tag}: Sharpe={bayes_paper.get('sharpe_ratio',0):.4f}  NAV={bayes_paper.get('final_nav',0):.4f}")
 
     # ── Real backtest (only in real mode) ──
     if cfg.mode == "real":
@@ -346,8 +325,10 @@ def main() -> None:
         rb_result = run_real_backtest(bayes_scores, prices, rb_config)
         rb_summary = rb_result["summary"]
 
-        _add("Bayes V2 (paper)", bayes_paper)
-        _add("Bayes V2 (real)", rb_summary)
+        paper_label = f"Bayes hl={hl} (paper)" if not use_gate else f"Bayes+Gate hl={hl} (paper)"
+        real_label = f"Bayes hl={hl} (real)" if not use_gate else f"Bayes+Gate hl={hl} (real)"
+        _add(paper_label, bayes_paper)
+        _add(real_label, rb_summary)
 
         print(f"  {'':>16s}  {'Sharpe':>8s}  {'NAV':>8s}  {'MaxDD':>8s}  {'Turnover':>9s}  {'Cap%':>7s}  {'Stocks':>7s}")
         print(f"  {'Paper (%-wt)':>16s}  {bayes_paper['sharpe_ratio']:>8.4f}  {bayes_paper['final_nav']:>8.4f}  {bayes_paper['max_drawdown']:>7.1%}  {bayes_paper.get('mean_turnover',0):>8.1%}  {'100%':>7s}  {cfg.top_n:>7d}")

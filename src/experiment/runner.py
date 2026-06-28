@@ -60,6 +60,13 @@ def _model_features(
     return tuple(config.feature_cols)
 
 
+def _save_model_features(output_dir: Path, model_name: str, cols: tuple[str, ...]) -> None:
+    """Save per-model feature list for audit reproducibility."""
+    import json as _json
+    path = output_dir / f"model_features_{model_name}.json"
+    path.write_text(_json.dumps(list(cols), ensure_ascii=False), encoding="utf-8")
+
+
 def _apply_feature_signs(
     df: pd.DataFrame, model_name: str, config: ExperimentConfig
 ) -> pd.DataFrame:
@@ -195,65 +202,99 @@ def run_experiment(config: ExperimentConfig | None = None) -> dict[str, Any]:
     }
 
 
+def _get_total_trees(model) -> int:
+    inner = model.model
+    if hasattr(inner, "booster_"):
+        return inner.booster_.num_trees()
+    try:
+        return inner.get_booster().num_boosted_rounds()
+    except Exception:
+        return 1
+
+
 def _tabular_predict_at_n(model, dataset, n, date_col, stock_col):
     """Predict using first N trees, return pred_df with meta columns."""
     inner = model.model
     X = dataset.X
+    n = min(int(n), _get_total_trees(model))
     if hasattr(inner, "best_iteration_"):
         y_pred = inner.predict(X, num_iteration=n)
     else:
         y_pred = inner.predict(X, iteration_range=(0, n))
-    return pd.DataFrame({
-        date_col: dataset.meta[date_col].values,
-        stock_col: dataset.meta[stock_col].astype(str).values,
-        "y_pred": y_pred,
-        "y_true": dataset.y,
-    })
+    pred_df = dataset.meta.copy()
+    pred_df["y_pred"] = y_pred
+    pred_df["y_true"] = dataset.y
+    return pred_df
 
 
 def _tabular_n_scan(
-    model, valid_data, data, config, portfolio_config, cost_config,
-    model_name, output_dir,
+    model, valid_data, test_data, data, config, portfolio_config,
+    cost_config, model_name, output_dir,
 ):
     """Scan candidate n_tree values, pick best by valid total return."""
-    inner = model.model
-    candidates = [200, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000]
+    total_trees = _get_total_trees(model)
+    base_candidates = [200, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000]
+    candidates = [c for c in base_candidates if c <= total_trees]
+    if not candidates:
+        candidates = [total_trees]
     best_n = candidates[0]
     best_valid_ret = -float("inf")
     scan_records = []
 
     print("  n_scan:", end="", flush=True)
     for n in candidates:
-        pred_df = _tabular_predict_at_n(
+        valid_pred = _tabular_predict_at_n(
             model, valid_data, n, config.date_col, config.stock_col,
         )
-        eval_result = evaluate_prediction_split(
-            pred_df=pred_df,
+        valid_eval = evaluate_prediction_split(
+            pred_df=valid_pred,
             returns_df=data.returns_df,
             config=config,
             portfolio_config=portfolio_config,
             cost_config=cost_config,
             split_name="valid",
         )
-        valid_ret = eval_result["backtest_result"]["summary"]["total_return"]
-        valid_sr = eval_result["backtest_result"]["summary"]["sharpe_ratio"]
+        v_ret = valid_eval["backtest_result"]["summary"]["total_return"]
+        v_sr = valid_eval["backtest_result"]["summary"]["sharpe_ratio"]
+        v_to = valid_eval["backtest_result"]["summary"]["mean_turnover"]
+
+        test_pred = _tabular_predict_at_n(
+            model, test_data, n, config.date_col, config.stock_col,
+        )
+        test_eval = evaluate_prediction_split(
+            pred_df=test_pred,
+            returns_df=data.returns_df,
+            config=config,
+            portfolio_config=portfolio_config,
+            cost_config=cost_config,
+            split_name="test",
+        )
+        t_ret = test_eval["backtest_result"]["summary"]["total_return"]
+        t_sr = test_eval["backtest_result"]["summary"]["sharpe_ratio"]
+        t_to = test_eval["backtest_result"]["summary"]["mean_turnover"]
+
         scan_records.append({
             "n_tree": n,
-            "valid_total_return": valid_ret,
-            "valid_sharpe": valid_sr,
+            "valid_total_return": v_ret,
+            "valid_sharpe": v_sr,
+            "valid_turnover": v_to,
+            "test_total_return": t_ret,
+            "test_sharpe": t_sr,
+            "test_turnover": t_to,
         })
-        marker = "*" if valid_ret > best_valid_ret else ""
-        print(f" {n}:{valid_ret:.3f}{marker}", end="", flush=True)
-        if valid_ret > best_valid_ret:
-            best_valid_ret = valid_ret
+        marker = "*" if v_ret > best_valid_ret else ""
+        print(f" {n}:{v_ret:.3f}{marker}", end="", flush=True)
+        if v_ret > best_valid_ret:
+            best_valid_ret = v_ret
             best_n = n
     print(flush=True)
 
     scan_df = pd.DataFrame(scan_records)
     scan_path = output_dir / f"n_scan_{model_name}.csv"
     scan_df.to_csv(scan_path, index=False)
-    print(f"  best_n={best_n}  valid_ret={best_valid_ret:.4f}  "
-          f"scan saved to {scan_path}")
+    print(f"  best_n={best_n}  valid_ret={best_valid_ret:.4f}"
+          f"  total_trees={total_trees}")
+    print(f"  scan saved to {scan_path}")
 
     return best_n, best_valid_ret, scan_records
 
@@ -316,10 +357,14 @@ def _run_tabular_models(
             output_dir=output_dir / "models" / model_name,
         )
 
+        # Save feature list alongside model for audit reproducibility
+        _save_model_features(output_dir, model_name, cols)
+
         # ── n_tree scan: pick best_n by valid total return ──
         best_n, best_valid_ret, scan_records = _tabular_n_scan(
             model=model,
             valid_data=valid_data,
+            test_data=test_data,
             data=data,
             config=config,
             portfolio_config=portfolio_config,
@@ -497,6 +542,9 @@ def _run_torch_models(
                     date_col=config.date_col,
                 ),
             )
+
+            # Save feature list alongside model for audit reproducibility
+            _save_model_features(output_dir, model_name, cols)
 
             valid_pred_df = generate_predictions(
                 model=model,

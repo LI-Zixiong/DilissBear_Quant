@@ -17,7 +17,7 @@ from src.data.loader import load_panel_data
 from src.data.preprocess import PreprocessConfig, preprocess_panel_data
 from src.experiment.config import ExperimentConfig
 from src.experiment.returns import build_experiment_returns
-from src.experiment.split import split_panel_by_date_ratio
+from src.experiment.split import split_panel_by_date_ratio, split_panel_by_dates
 
 
 @dataclass
@@ -91,9 +91,13 @@ def load_experiment_raw_data(data_path: str | Path) -> pd.DataFrame:
 def preprocess_experiment_data(
     raw_df: pd.DataFrame,
     config: ExperimentConfig,
+    active_feature_cols: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Apply the standard panel preprocessing pipeline for experiments.
+
+    If active_feature_cols is provided, only those factor columns are validated
+    and kept (reducing memory for models with restricted factor pools).
     """
 
     work = raw_df.copy()
@@ -101,10 +105,12 @@ def preprocess_experiment_data(
     if config.date_col not in work.columns and config.date_col in work.index.names:
         work = work.reset_index()
 
+    feature_cols = active_feature_cols if active_feature_cols is not None else list(config.feature_cols)
+
     preprocess_config = PreprocessConfig(
         date_col=config.date_col,
         stock_col=config.stock_col,
-        feature_cols=list(config.feature_cols),
+        feature_cols=feature_cols,
         target_col=config.target_col,
         meta_cols=list(config.meta_cols),
         replace_inf_with_nan=True,
@@ -123,30 +129,64 @@ def preprocess_experiment_data(
     return result.df, result.report
 
 
+def _active_column_set(config: ExperimentConfig) -> set[str]:
+    """Compute the minimal set of columns needed by active models."""
+    needed = set()
+    for model_name in config.model_names:
+        if config.model_feature_cols and model_name in config.model_feature_cols:
+            needed.update(config.model_feature_cols[model_name])
+        else:
+            needed.update(config.feature_cols)
+    needed.add(config.date_col)
+    needed.add(config.stock_col)
+    needed.add(config.target_col)
+    needed.update(config.meta_cols)
+    if config.backtest_return_mode == "column":
+        needed.add(config.return_col)
+    if config.backtest_return_source:
+        needed.add(config.backtest_return_source)
+    return needed
+
+
 def prepare_experiment_data(config: ExperimentConfig) -> ExperimentData:
     """
     Prepare all data frames needed by the experiment runner.
 
     Steps:
-        1. Load raw data.
+        1. Load raw data (only columns needed by active models).
         2. Preprocess panel data.
         3. Split by unique dates.
         4. Build backtest returns.
     """
 
     raw_df = load_experiment_raw_data(config.data_path)
+    active_cols = _active_column_set(config)
+    available = [c for c in active_cols if c in raw_df.columns]
+    active_factors = sorted(active_cols & set(config.feature_cols))
+    raw_df = raw_df[available].copy()
 
     clean_df, preprocess_report = preprocess_experiment_data(
         raw_df=raw_df,
         config=config,
+        active_feature_cols=active_factors,
     )
 
-    train_df, valid_df, test_df, train_end, valid_end = split_panel_by_date_ratio(
-        df=clean_df,
-        date_col=config.date_col,
-        stock_col=config.stock_col,
-        split_ratio=config.split_ratio,
-    )
+    if config.date_boundaries is not None:
+        train_df, valid_df, test_df, train_end, valid_end = split_panel_by_dates(
+            df=clean_df,
+            date_col=config.date_col,
+            stock_col=config.stock_col,
+            boundaries=config.date_boundaries,
+            purge=config.purge_days,
+            target_horizon=config.target_horizon_days,
+        )
+    else:
+        train_df, valid_df, test_df, train_end, valid_end = split_panel_by_date_ratio(
+            df=clean_df,
+            date_col=config.date_col,
+            stock_col=config.stock_col,
+            split_ratio=config.split_ratio,
+        )
 
     config.train_end = train_end
     config.valid_end = valid_end
