@@ -107,7 +107,7 @@ def add_model_ranks_and_H(df: pd.DataFrame) -> pd.DataFrame:
     """Add per-model daily rank_pct columns and forward-return H.
 
     H = top 5% of the tradeable 1-period forward return.
-    Prefers 1d_next_raw (open-to-open: t+1 open buy, t+2 open sell) when
+    Prefers 1d_next_raw (close-to-close: T close buy, T+1 close sell) when
     available — it is already the forward return at the signal date and
     needs no date-shift.  Falls back to ret_daily (close-to-close) with a
     1-day forward shift for backward compatibility.

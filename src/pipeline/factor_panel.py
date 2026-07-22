@@ -449,14 +449,15 @@ def append_factor_panel_rows(
         factor_names=config.factor_names,
     )
 
-    if config.mode == "research":
+    if config.mode in {"research", "live"}:
+        # Incremental updates must settle labels for older rows once the
+        # required future closes have actually arrived.  The newest rows still
+        # remain NaN naturally, so this is causal as of the update date and
+        # does not expose an unobserved future price.
         targets = build_targets(recomputed, config)
         for col in config.target_names:
             if col in targets.columns:
                 recomputed[col] = targets[col]
-    elif config.mode == "live":
-        for col in config.target_names:
-            recomputed[col] = np.nan
     else:
         raise ValueError(f"Unsupported mode: {config.mode}")
 
@@ -467,13 +468,41 @@ def append_factor_panel_rows(
         filter_model_start=False,
     )
 
+    key_cols = [config.stock_col, config.date_col]
+    target_cols = [c for c in config.target_names if c in recomputed.columns and c in existing.columns]
+
+    # Refresh only settled target values on the overlapping tail.  Factor
+    # values already stored in the production panel are intentionally left
+    # untouched by an incremental run.
+    if target_cols:
+        refresh = recomputed.loc[
+            recomputed[config.date_col] <= last_factor_date,
+            key_cols + target_cols,
+        ].set_index(key_cols)
+        existing_indexed = existing.set_index(key_cols)
+        for col in target_cols:
+            values = refresh[col].reindex(existing_indexed.index)
+            settled = values.notna()
+            existing_indexed.loc[settled, col] = values.loc[settled].to_numpy()
+        existing = existing_indexed.reset_index()
+
     new_rows = recomputed[recomputed[config.date_col] > last_factor_date].copy()
+
+    # Keep only stocks already in the existing factor panel (original universe).
+    # Without this, daily updates silently expand the universe to all stocks
+    # in the base panel, bloating the factor panel and breaking downstream code
+    # that assumes a fixed stock universe.
+    universe_stocks = set(existing[config.stock_col].unique())
+    before_filter = len(new_rows)
+    new_rows = new_rows[new_rows[config.stock_col].isin(universe_stocks)]
+    dropped = before_filter - len(new_rows)
+    if dropped > 0:
+        print(f"  Universe filter: {before_filter:,} → {len(new_rows):,} rows "
+              f"({dropped:,} non-universe stocks dropped)")
 
     if new_rows.empty:
         print("No new factor rows to append.")
         return existing
-
-    key_cols = [config.stock_col, config.date_col]
 
     if allow_overlap_replace:
         marker = new_rows[key_cols].drop_duplicates().assign(_new_key=1)
@@ -638,11 +667,7 @@ def compute_factor_columns(
         df = df.sort_values([config.stock_col, config.date_col])
         df["pre_close"] = df.groupby(config.stock_col)["close"].shift(1)
 
-    # Overwrite ret_daily with adjusted-open-to-open return.
-    if "open" in df.columns and "ret_daily" in df.columns:
-        df["ret_daily"] = df.groupby(config.stock_col)["open"].transform(
-            lambda x: x / x.shift(1) - 1.0
-        )
+    # ret_daily is close-close (Tushare default, adjusted for dividends).
 
     needs = set(factor_names)
 
@@ -825,7 +850,7 @@ def prepare_working_panel(
         keep_cols.add("adj_factor")
 
     keep_cols = [c for c in df.columns if c in keep_cols]
-    return df[keep_cols].copy()
+    return df[keep_cols]
 
 
 def build_base_output_skeleton(base_panel: pd.DataFrame, config: FactorPanelConfig) -> pd.DataFrame:
@@ -868,11 +893,7 @@ def build_base_output_skeleton(base_panel: pd.DataFrame, config: FactorPanelConf
         base = base.sort_values([config.stock_col, config.date_col])
         base["pre_close"] = base.groupby(config.stock_col)["close"].shift(1)
 
-    # Recalculate ret_daily from adjusted open-to-open
-    if "open" in base.columns:
-        base["ret_daily"] = base.groupby(config.stock_col)["open"].transform(
-            lambda x: x / x.shift(1) - 1.0
-        )
+    # ret_daily is close-close (Tushare default, adjusted for dividends).
 
     meta_cols = [
         "industry_sw", "list_date",
@@ -1119,16 +1140,16 @@ def build_beta_resvol(
 
 
 def build_momentum(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
-    """F006MOMENTUM = open[t-21] / open[t-252] - 1 (open-to-open momentum)."""
+    """F006MOMENTUM = close[t-21] / close[t-252] - 1 (close-to-close momentum)."""
 
-    group = df.groupby(config.stock_col)["open"]
+    group = df.groupby(config.stock_col)["close"]
     return group.shift(21) / group.shift(252) - 1
 
 
 def build_ltrev(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
-    """F007LTREV: long-term reversal ensemble based on 504/630/756-day windows (open-to-open)."""
+    """F007LTREV: long-term reversal ensemble based on 504/630/756-day windows (close-to-close)."""
 
-    group = df.groupby(config.stock_col)["open"]
+    group = df.groupby(config.stock_col)["close"]
 
     def log_reversal(lookback: int) -> pd.Series:
         return -(
@@ -1147,9 +1168,9 @@ def build_ltrev(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
 
 
 def build_strev(df: pd.DataFrame, config: FactorPanelConfig) -> pd.Series:
-    """F008STREV = negative short-term return (open-to-open)."""
+    """F008STREV = negative short-term return (close-to-close)."""
 
-    group = df.groupby(config.stock_col)["open"]
+    group = df.groupby(config.stock_col)["close"]
     return -(group.shift(1) / group.shift(21) - 1)
 
 
@@ -2030,17 +2051,17 @@ def build_targets(df: pd.DataFrame, config: FactorPanelConfig) -> pd.DataFrame:
     Build forward-return targets.
 
     1d_next_raw:
-        signal on t, buy at t+1 open, sell at t+2 open.
+        signal on t close, buy at close(t), sell at close(t+1).
 
     5d_next_raw:
-        signal on t, buy at t+1 open, sell around t+7 open.
+        signal on t close, buy at close(t), sell at close(t+5).
     """
 
-    group = df.groupby(config.stock_col)["open"]
+    group = df.groupby(config.stock_col)["close"]
 
     result = pd.DataFrame(index=df.index)
-    result["1d_next_raw"] = group.shift(-2) / group.shift(-1) - 1
-    result["5d_next_raw"] = group.shift(-6) / group.shift(-1) - 1
+    result["1d_next_raw"] = group.transform(lambda x: x.shift(-1) / x - 1)
+    result["5d_next_raw"] = group.transform(lambda x: x.shift(-5) / x - 1)
 
     return result
 
@@ -2136,10 +2157,9 @@ def filter_and_select_output_columns(
 ) -> pd.DataFrame:
     """Filter date range and select final output columns."""
 
-    df = panel.copy()
-
+    df = panel
     if filter_model_start:
-        df = df[df[config.date_col] >= pd.Timestamp(config.model_start_date)].copy()
+        df = df[df[config.date_col] >= pd.Timestamp(config.model_start_date)]
 
     key_cols = [config.date_col, config.stock_col]
     output_cols = key_cols + [name for name in factor_names if name in df.columns]
@@ -2285,7 +2305,7 @@ def standardize_panel_keys(
 ) -> pd.DataFrame:
     """Standardize stock_id and time columns."""
 
-    out = df.copy()
+    out = df.copy(deep=False)
     out[config.stock_col] = out[config.stock_col].astype(str).str.strip().str.zfill(6)
     out[config.date_col] = pd.to_datetime(out[config.date_col], errors="raise").dt.normalize()
     return out
@@ -2297,7 +2317,7 @@ def standardize_financial_keys(
 ) -> pd.DataFrame:
     """Standardize quarterly financial keys."""
 
-    out = df.copy()
+    out = df.copy(deep=False)
     out[config.stock_col] = out[config.stock_col].astype(str).str.strip().str.zfill(6)
     out["accper"] = pd.to_datetime(out["accper"], errors="raise").dt.normalize()
 
@@ -2427,19 +2447,25 @@ def build_gk_vol20(df: pd.DataFrame) -> pd.Series:
 
 def _onret_sum5(df: pd.DataFrame, config) -> pd.Series:
     onret1 = build_onret1(df)
-    df = df.copy()
-    df["_onret1"] = onret1
-    df = df.sort_values([config.stock_col, config.date_col])
-    return df.groupby(config.stock_col)["_onret1"].transform(
+    work = pd.DataFrame({
+        config.stock_col: df[config.stock_col],
+        config.date_col: df[config.date_col],
+        "_onret1": onret1,
+    })
+    work = work.sort_values([config.stock_col, config.date_col])
+    return work.groupby(config.stock_col)["_onret1"].transform(
         lambda x: x.rolling(5, min_periods=3).sum())
 
 
 def _intra_sum5(df: pd.DataFrame, config) -> pd.Series:
     intra1 = build_intra1(df)
-    df = df.copy()
-    df["_intra1"] = intra1
-    df = df.sort_values([config.stock_col, config.date_col])
-    return df.groupby(config.stock_col)["_intra1"].transform(
+    work = pd.DataFrame({
+        config.stock_col: df[config.stock_col],
+        config.date_col: df[config.date_col],
+        "_intra1": intra1,
+    })
+    work = work.sort_values([config.stock_col, config.date_col])
+    return work.groupby(config.stock_col)["_intra1"].transform(
         lambda x: x.rolling(5, min_periods=3).sum())
 
 
@@ -2479,17 +2505,17 @@ def build_gap_up_fail(df: pd.DataFrame) -> pd.Series:
 # ════════════════════════════════════════════════════════════════
 
 def build_ret5d_skip1(df: pd.DataFrame, config) -> pd.Series:
-    """F063RET5D_SKIP1 RET5D_SKIP1 = open.shift(1) / open.shift(6) - 1 (open-to-open)."""
+    """F063RET5D_SKIP1 RET5D_SKIP1 = close.shift(1) / close.shift(6) - 1 (close-to-close)."""
     df = df.sort_values([config.stock_col, config.date_col])
-    col = df["open"]
+    col = df["close"]
     return col.groupby(df[config.stock_col]).transform(
         lambda x: x.shift(1) / x.shift(6) - 1.0)
 
 
 def build_ret_accel20(df: pd.DataFrame, config) -> pd.Series:
-    """F064RET_ACCEL20 RET_ACCEL20 = ret_20d[t-1] - ret_20d[t-21] (open-to-open)."""
+    """F064RET_ACCEL20 RET_ACCEL20 = ret_20d[t-1] - ret_20d[t-21] (close-to-close)."""
     df = df.sort_values([config.stock_col, config.date_col])
-    col = df["open"]
+    col = df["close"]
     ret20 = col.groupby(df[config.stock_col]).transform(
         lambda x: x / x.shift(20) - 1.0)
     return ret20.groupby(df[config.stock_col]).transform(
@@ -2506,7 +2532,7 @@ def build_maxdd20(df: pd.DataFrame, config) -> pd.Series:
     df = df.sort_values([config.stock_col, config.date_col])
     result = pd.Series(np.nan, index=df.index, dtype=float)
     for _stock_id, grp in df.groupby(config.stock_col, sort=False):
-        prices = grp["open"].to_numpy(dtype=float)
+        prices = grp["close"].to_numpy(dtype=float)
         vals = np.full(len(prices), np.nan, dtype=float)
         for t in range(19, len(prices)):
             window = prices[t - 19:t + 1]
@@ -2520,9 +2546,9 @@ def build_maxdd20(df: pd.DataFrame, config) -> pd.Series:
 
 
 def build_efficiency20(df: pd.DataFrame, config) -> pd.Series:
-    """F066EFFICIENCY20 EFFICIENCY20 = abs(RET20) / sum(abs(ret_daily), 20) (open-to-open)."""
+    """F066EFFICIENCY20 EFFICIENCY20 = abs(RET20) / sum(abs(ret_daily), 20) (close-to-close)."""
     df = df.sort_values([config.stock_col, config.date_col])
-    col = df["open"]
+    col = df["close"]
     ret20 = col.groupby(df[config.stock_col]).transform(
         lambda x: x / x.shift(20) - 1.0)
     abs_ret = df["ret_daily"].abs()

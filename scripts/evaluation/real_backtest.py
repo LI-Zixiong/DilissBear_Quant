@@ -34,8 +34,8 @@ def load_scores(path: str) -> pd.DataFrame:
 
 
 def load_prices(path: str) -> pd.DataFrame:
-    # Only open+pre_close needed for open-to-open. Add optional columns if available.
-    base_cols = ["time", "stock_id", "open", "pre_close"]
+    # close+pre_close for close-close execution. Add optional columns if available.
+    base_cols = ["time", "stock_id", "close", "pre_close"]
     optional_cols = [
         "up_limit", "down_limit", "high_limit", "low_limit",
         "limit_up", "limit_down", "limit_up_price", "limit_down_price",
@@ -49,7 +49,7 @@ def load_prices(path: str) -> pd.DataFrame:
     df = normalize_keys(df)
     df["time"] = pd.to_datetime(df["time"])
     # Coerce price columns
-    for c in ["open", "pre_close"] + [x for x in optional_cols if x in df.columns and x not in ("is_st", "is_paused", "st", "suspend", "suspended", "is_suspended", "trade_status", "risk_warning")]:
+    for c in ["close", "pre_close"] + [x for x in optional_cols if x in df.columns and x not in ("is_st", "is_paused", "st", "suspend", "suspended", "is_suspended", "trade_status", "risk_warning")]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
@@ -94,7 +94,7 @@ def main() -> None:
     price_cols_loaded = [c for c in prices.columns if c not in ("time", "stock_id")]
     print(f"  prices: {len(prices):,} rows, {prices['time'].nunique()} dates")
     # Report optional columns found
-    extras = [c for c in prices.columns if c not in ("time", "stock_id", "open", "pre_close")]
+    extras = [c for c in prices.columns if c not in ("time", "stock_id", "close", "pre_close")]
     if extras:
         print(f"  extra cols: {extras}")
 
@@ -115,7 +115,7 @@ def main() -> None:
     result = run_real_backtest(scores, prices, config)
     s = result["summary"]
 
-    print(f"\n=== Real Backtest (Account-based, T+1 open -> T+2 open) ===")
+    print(f"\n=== Real Backtest (T signal → T close buy → T+1 close sell) ===")
     print(f"  Sharpe:             {s['sharpe_ratio']:.4f}")
     print(f"  NAV:                {s['final_nav']:.4f}")
     print(f"  Final equity:       {s['final_equity']:,.0f} CNY")

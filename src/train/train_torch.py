@@ -15,7 +15,16 @@ import pandas as pd
 
 warnings.filterwarnings("ignore", "An input array is constant")
 import torch
+
+# Apply CPU optimizations early (single-process training, no DataLoader workers).
+try:
+    _CPU_COUNT = max(1, (os.cpu_count() or 1) - 2)
+    torch.set_num_threads(_CPU_COUNT)
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass  # already set by another module
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.data.dataset_builder import BuiltDataset
@@ -80,6 +89,33 @@ class TorchTrainConfig:
     shuffle_train: bool = True
     seed: int = 42
     date_col: str = "time"
+    enable_compile: bool = False  # torch.compile — may fail on Windows without MSVC
+
+    # Loss selection. Default keeps the original MSE training path unchanged.
+    # Use loss_type="ranknet" to optimize same-day top-vs-rest pairwise ranking.
+    loss_type: str = "mse"  # "mse" | "ranknet"
+
+    # RankNet hyperparameters. Only used when loss_type="ranknet".
+    rank_pos_quantile: float = 0.95
+    rank_neg_quantile: float = 0.80
+    rank_tail_neg_quantile: float = 0.20
+    rank_tau: float = 0.20
+    pairs_per_pos: int = 10
+    dates_per_batch: int = 8
+    rank_min_date_obs: int = 50
+    rank_hard_neg_frac: float = 0.20
+    rank_hard_neg_score_quantile: float = 0.90
+    rank_hard_neg_y_quantile: float = 0.30    # toxic: only bottom N% by y qualify
+    rank_hard_neg_mode: str = "score"         # "score" | "toxic"
+    rank_hard_neg_warmup_epochs: int = 3
+    rank_tail_neg_frac: float = 0.10
+    rank_weight_mode: str = "return_diff_log_mad"  # "none" | "return_diff_log_mad" | "rank_gap"
+
+    # Early stop monitor. "auto" means RMSE for MSE, cumret for RankNet.
+    early_stop_metric: str = "auto"  # "auto" | "rmse" | "cumret" | "icir"
+
+    # Extra valid diagnostics for RankNet runs (pair acc, reverse cumret, decile spread).
+    rank_eval_diagnostics: bool = True
 
     def __post_init__(self) -> None:
         if self.epochs <= 0:
@@ -101,6 +137,39 @@ class TorchTrainConfig:
             raise ValueError(f"Invalid device={self.device!r}. Expected 'auto', 'cpu', or 'cuda'.")
         if not isinstance(self.date_col, str) or self.date_col == "":
             raise ValueError("date_col must be a non-empty string")
+
+        if self.loss_type not in ("mse", "ranknet"):
+            raise ValueError(
+                f"Invalid loss_type={self.loss_type!r}. Expected 'mse' or 'ranknet'."
+            )
+        if not 0.0 < self.rank_tail_neg_quantile < self.rank_neg_quantile < self.rank_pos_quantile < 1.0:
+            raise ValueError(
+                "Expected 0 < rank_tail_neg_quantile < rank_neg_quantile "
+                "< rank_pos_quantile < 1."
+            )
+        if self.rank_tau <= 0:
+            raise ValueError("rank_tau must be positive.")
+        if self.pairs_per_pos <= 0:
+            raise ValueError("pairs_per_pos must be a positive integer.")
+        if self.dates_per_batch <= 0:
+            raise ValueError("dates_per_batch must be a positive integer.")
+        if self.rank_min_date_obs <= 1:
+            raise ValueError("rank_min_date_obs must be greater than 1.")
+        if not 0.0 <= self.rank_hard_neg_frac <= 1.0:
+            raise ValueError("rank_hard_neg_frac must be in [0, 1].")
+        if not 0.0 <= self.rank_tail_neg_frac <= 1.0:
+            raise ValueError("rank_tail_neg_frac must be in [0, 1].")
+        if self.rank_hard_neg_frac + self.rank_tail_neg_frac > 1.0:
+            raise ValueError("rank_hard_neg_frac + rank_tail_neg_frac must be <= 1.")
+        if self.rank_weight_mode not in ("none", "return_diff_log_mad", "rank_gap"):
+            raise ValueError(
+                "rank_weight_mode must be one of: "
+                "'none', 'return_diff_log_mad', 'rank_gap'."
+            )
+        if self.early_stop_metric not in ("auto", "rmse", "cumret", "icir"):
+            raise ValueError(
+                "early_stop_metric must be one of: 'auto', 'rmse', 'cumret', 'icir'."
+            )
     
 def _resolve_device(device: str) -> torch.device:
     if device == 'auto':
@@ -154,32 +223,43 @@ def _compute_valid_cumret(
 ) -> dict:
     """Compute cumulative return of daily top-N equal-weight portfolio on valid set.
 
-    Uses 1d_next_raw[t] = open(t+2)/open(t+1)-1, the same open-to-open return as
-    the backtest engine. Signal at date t → buy open(t+1), sell open(t+2).
-    No date-shift needed: 1d_next_raw at signal date t IS the forward return.
+    Uses ret_daily (close-to-close). Signal at date t → buy close(t), sell close(t+1).
+    ret_daily[t] = close(t)/close(t-1)-1, so the forward return for signal[t] is ret_daily[t+1].
     """
-    fwd_col = "1d_next_raw"
-    if fwd_col not in meta.columns or "stock_id" not in meta.columns:
+    fwd_col = "ret_daily"
+    if "stock_id" not in meta.columns:
         return {"cumret": np.nan, "sharpe": np.nan, "n_dates": 0}
+    if fwd_col not in meta.columns:
+        fwd_col = None
+
+    fwd_vals = y_true if fwd_col is None else meta[fwd_col].values
+    fwd_label = "ret_daily"
 
     df = pd.DataFrame({
         "time": pd.to_datetime(meta[date_col].values),
         "stock_id": meta["stock_id"].astype(str).values,
         "y_pred": y_pred,
-        fwd_col: meta[fwd_col].values,
+        fwd_label: fwd_vals,
     })
-    df = df.dropna(subset=["y_pred", fwd_col])
+    df = df.dropna(subset=["y_pred", fwd_label])
 
-    # 1d_next_raw[t] IS the forward return — no next-date mapping needed
-    fwd_ret = df.set_index(["time", "stock_id"])[fwd_col]
+    # Build next-date mapping: signal[t] → earn ret_daily[t+1] = close(t+1)/close(t)-1
+    unique_dates = pd.DatetimeIndex(df["time"].drop_duplicates()).sort_values()
+    next_date_map = {unique_dates[i]: unique_dates[i + 1] for i in range(len(unique_dates) - 1)}
+
+    # Index by (time, stock_id) — ret_daily at each date is the return ending at that date
+    fwd_ret = df.set_index(["time", "stock_id"])[fwd_label]
 
     daily_rets = []
     for signal_date, g in df.groupby("time", sort=True):
         top = g.nlargest(top_n, "y_pred")
+        return_date = next_date_map.get(pd.Timestamp(signal_date))
+        if return_date is None:
+            continue
         day_rets = []
         for sid in top["stock_id"]:
             try:
-                r = fwd_ret.loc[(pd.Timestamp(signal_date), sid)]
+                r = fwd_ret.loc[(return_date, sid)]
                 if isinstance(r, pd.Series):
                     r = r.iloc[0] if len(r) else np.nan
                 r = float(r)
@@ -243,7 +323,12 @@ def _build_dataloader(
     X_tensor = torch.as_tensor(dataset.X, dtype=torch.float32)
     y_tensor = torch.as_tensor(dataset.y, dtype=torch.float32).reshape(-1, 1)
 
-    tensor_dataset = TensorDataset(X_tensor, y_tensor)
+    ind_id = getattr(dataset, "industry_id", None)
+    if ind_id is not None:
+        ind_tensor = torch.as_tensor(ind_id, dtype=torch.long)
+        tensor_dataset = TensorDataset(X_tensor, y_tensor, ind_tensor)
+    else:
+        tensor_dataset = TensorDataset(X_tensor, y_tensor)
 
     if shuffle:
         g = torch.Generator()
@@ -252,6 +337,320 @@ def _build_dataloader(
         return DataLoader(tensor_dataset, batch_size=batch_size, sampler=sampler)
 
     return DataLoader(tensor_dataset, batch_size=batch_size, shuffle=False)
+
+
+def _group_indices_by_date(
+    dataset: BuiltDataset,
+    date_col: str,
+    min_date_obs: int,
+) -> list[np.ndarray]:
+    """Build same-day index groups for cross-sectional ranking losses."""
+    if date_col not in dataset.meta.columns:
+        raise ValueError(
+            f"RankNet loss requires date_col={date_col!r} in dataset.meta. "
+            f"Available columns: {list(dataset.meta.columns)}"
+        )
+
+    y = np.asarray(dataset.y).reshape(-1)
+    finite_y = np.isfinite(y)
+
+    meta = dataset.meta.reset_index(drop=True).copy()
+    meta["__row_idx"] = np.arange(len(meta), dtype=np.int64)
+    meta = meta.loc[finite_y].copy()
+
+    date_groups: list[np.ndarray] = []
+    for _, g in meta.groupby(date_col, sort=True):
+        idx = g["__row_idx"].to_numpy(dtype=np.int64)
+        if idx.shape[0] >= min_date_obs:
+            date_groups.append(idx)
+
+    if not date_groups:
+        raise ValueError(
+            "RankNet loss could not find any date group with enough observations. "
+            f"min_date_obs={min_date_obs}."
+        )
+
+    return date_groups
+
+
+def _iter_date_batches(
+    date_groups: list[np.ndarray],
+    dates_per_batch: int,
+    shuffle: bool,
+    seed: int,
+    epoch: int,
+) -> list[list[np.ndarray]]:
+    """Return date-group batches; shuffled at the date level, never across stocks."""
+    order = np.arange(len(date_groups), dtype=np.int64)
+    if shuffle:
+        rng = np.random.default_rng(seed + epoch * 9973)
+        rng.shuffle(order)
+
+    batches: list[list[np.ndarray]] = []
+    for start in range(0, len(order), dates_per_batch):
+        selected = order[start:start + dates_per_batch]
+        batches.append([date_groups[int(i)] for i in selected])
+    return batches
+
+
+def _rank_pct_numpy(y: np.ndarray) -> np.ndarray:
+    """Fast rank percentile with average-free deterministic tie handling."""
+    order = np.argsort(y, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float32)
+    if len(y) <= 1:
+        ranks.fill(1.0)
+        return ranks
+    ranks[order] = (np.arange(len(y), dtype=np.float32) + 1.0) / float(len(y))
+    return ranks
+
+
+def _sample_ranknet_pairs_for_date(
+    y_np: np.ndarray,
+    config: TorchTrainConfig,
+    rng: np.random.Generator,
+    pred_np: np.ndarray | None = None,
+    epoch: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Sample same-day top-vs-rest pairs.
+
+    When pred_np is provided, hard negatives are mined from high-score
+    non-positive stocks (score-based), replacing the y-based hard_neg_pool.
+    """
+    y_np = np.asarray(y_np, dtype=np.float32).reshape(-1)
+    # Caller guarantees no NaN. Return only local indices (no remapping).
+    if not np.isfinite(y_np).all():
+        # Defensive: drop NaN rows but keep indices local.
+        finite = np.isfinite(y_np)
+        y_work = y_np[finite]
+        p_work = pred_np[finite] if pred_np is not None else None
+    else:
+        finite = None
+        y_work = y_np
+        p_work = pred_np
+
+    if len(y_work) < config.rank_min_date_obs:
+        return None
+
+    pos_cut = float(np.nanquantile(y_work, config.rank_pos_quantile))
+    neg_cut = float(np.nanquantile(y_work, config.rank_neg_quantile))
+    tail_cut = float(np.nanquantile(y_work, config.rank_tail_neg_quantile))
+
+    pos_pool = np.flatnonzero(y_work >= pos_cut)
+    main_neg_pool = np.flatnonzero(y_work <= neg_cut)
+    tail_neg_pool = np.flatnonzero(y_work <= tail_cut)
+
+    if len(pos_pool) == 0 or len(main_neg_pool) == 0:
+        return None
+
+    # Hard negatives: ramp from 0 after warmup to avoid corrupting early learning.
+    if epoch <= config.rank_hard_neg_warmup_epochs:
+        effective_hard_frac = 0.0
+    elif epoch == config.rank_hard_neg_warmup_epochs + 1:
+        effective_hard_frac = 0.5 * config.rank_hard_neg_frac
+    else:
+        effective_hard_frac = config.rank_hard_neg_frac
+
+    use_hard = (p_work is not None and effective_hard_frac > 0)
+    if use_hard:
+        non_pos_mask = np.ones(len(y_work), dtype=bool)
+        non_pos_mask[pos_pool] = False
+        if non_pos_mask.sum() > 0:
+            score_cut = float(np.quantile(p_work[non_pos_mask], config.rank_hard_neg_score_quantile))
+            if config.rank_hard_neg_mode == "toxic" and config.rank_hard_neg_y_quantile > 0:
+                y_cut = float(np.quantile(y_work[non_pos_mask], config.rank_hard_neg_y_quantile))
+                hard_neg_pool = np.flatnonzero(non_pos_mask & (p_work >= score_cut) & (y_work <= y_cut))
+            else:
+                hard_neg_pool = np.flatnonzero(non_pos_mask & (p_work >= score_cut))
+        else:
+            hard_neg_pool = np.empty(0, dtype=np.int64)
+    else:
+        hard_neg_pool = np.empty(0, dtype=np.int64)
+
+    pairs_per_pos = int(config.pairs_per_pos)
+    n_tail = int(round(pairs_per_pos * config.rank_tail_neg_frac))
+    if use_hard:
+        n_hard = int(round(pairs_per_pos * effective_hard_frac))
+    else:
+        n_hard = 0
+    n_main = max(0, pairs_per_pos - n_hard - n_tail)
+
+    pos_indices: list[int] = []
+    neg_indices: list[int] = []
+
+    def _choice(pool: np.ndarray, size: int) -> np.ndarray:
+        if size <= 0:
+            return np.empty(0, dtype=np.int64)
+        if len(pool) == 0:
+            pool = main_neg_pool
+        return rng.choice(pool, size=size, replace=(len(pool) < size))
+
+    for p in pos_pool:
+        main_negs = _choice(main_neg_pool, n_main)
+        hard_negs = _choice(hard_neg_pool, n_hard)
+        tail_negs = _choice(tail_neg_pool, n_tail)
+        negs = np.concatenate([main_negs, hard_negs, tail_negs])
+        if len(negs) == 0:
+            continue
+        pos_indices.extend([int(p)] * len(negs))
+        neg_indices.extend(int(n) for n in negs)
+
+    if not pos_indices:
+        return None
+
+    pos_idx = np.asarray(pos_indices, dtype=np.int64)
+    neg_idx = np.asarray(neg_indices, dtype=np.int64).reshape(-1)
+
+    diff = y_work[pos_idx] - y_work[neg_idx]
+    keep = np.isfinite(diff) & (diff > 0)
+    if keep.sum() == 0:
+        return None
+    pos_idx = pos_idx[keep]
+    neg_idx = neg_idx[keep]
+    diff = diff[keep]
+
+    if config.rank_weight_mode == "none":
+        weights = np.ones_like(diff, dtype=np.float32)
+    elif config.rank_weight_mode == "rank_gap":
+        rank_pct = _rank_pct_numpy(y_work)
+        gap = rank_pct[pos_idx] - rank_pct[neg_idx]
+        weights = np.clip(1.0 + 2.0 * gap, 1.0, 3.0).astype(np.float32)
+    else:
+        med = float(np.nanmedian(y_work))
+        mad = float(np.nanmedian(np.abs(y_work - med)))
+        scale = mad if mad > 1e-12 else float(np.nanstd(y_work))
+        scale = scale if scale > 1e-12 else 1.0
+        raw = np.maximum(diff / scale, 0.0)
+        weights = np.clip(np.log1p(raw), 0.1, 3.0).astype(np.float32)
+
+    if finite is not None:
+        pos_idx = np.flatnonzero(finite)[pos_idx]
+        neg_idx = np.flatnonzero(finite)[neg_idx]
+
+    return pos_idx, neg_idx, weights
+
+
+def _weighted_same_day_ranknet_loss(
+    pred: torch.Tensor,
+    y: torch.Tensor,
+    config: TorchTrainConfig,
+    rng: np.random.Generator,
+    epoch: int = 0,
+) -> tuple[torch.Tensor, float, int] | None:
+    """Weighted RankNet loss for one trading date."""
+    pred = pred.reshape(-1)
+    y = y.reshape(-1)
+
+    valid = torch.isfinite(pred) & torch.isfinite(y)
+    if int(valid.sum().item()) < config.rank_min_date_obs:
+        return None
+
+    pred_valid = pred[valid]
+    y_valid = y[valid]
+
+    y_np = y_valid.detach().cpu().numpy().astype(np.float32)
+    p_np = pred_valid.detach().cpu().numpy().astype(np.float32)
+
+    sampled = _sample_ranknet_pairs_for_date(y_np, config, rng, pred_np=p_np, epoch=epoch)
+    if sampled is None:
+        return None
+    pos_idx_np, neg_idx_np, weights_np = sampled
+
+    pos_idx = torch.as_tensor(pos_idx_np, dtype=torch.long, device=pred_valid.device)
+    neg_idx = torch.as_tensor(neg_idx_np, dtype=torch.long, device=pred_valid.device)
+    weights = torch.as_tensor(weights_np, dtype=pred_valid.dtype, device=pred_valid.device)
+
+    score_diff = (pred_valid[pos_idx] - pred_valid[neg_idx]) / float(config.rank_tau)
+    pair_loss = F.softplus(-score_diff) * weights
+    loss = pair_loss.mean()
+
+    with torch.no_grad():
+        pair_acc = float((score_diff > 0).float().mean().item())
+
+    return loss, pair_acc, int(pos_idx.numel())
+
+
+def _train_one_epoch_ranknet(
+    model: nn.Module,
+    dataset: BuiltDataset,
+    date_groups: list[np.ndarray],
+    optimizer: torch.optim.Optimizer,
+    config: TorchTrainConfig,
+    device: torch.device,
+    epoch: int,
+) -> dict[str, float | int]:
+    """Train one epoch with same-day top-vs-rest weighted RankNet loss."""
+    model.train()
+
+    batches = _iter_date_batches(
+        date_groups=date_groups,
+        dates_per_batch=config.dates_per_batch,
+        shuffle=config.shuffle_train,
+        seed=config.seed,
+        epoch=epoch,
+    )
+    rng = np.random.default_rng(config.seed + epoch * 104729)
+
+    total_loss = 0.0
+    total_dates = 0
+    total_pair_acc = 0.0
+    total_pairs = 0
+    skipped_dates = 0
+
+    for date_batch in batches:
+        optimizer.zero_grad()
+        date_losses: list[torch.Tensor] = []
+        batch_pair_acc = 0.0
+        batch_pairs = 0
+
+        for idx in date_batch:
+            batch_X = torch.as_tensor(dataset.X[idx], dtype=torch.float32, device=device)
+            batch_y = torch.as_tensor(dataset.y[idx], dtype=torch.float32, device=device)
+
+            kwargs = {}
+            ind_arr = getattr(dataset, "industry_id", None)
+            if ind_arr is not None and getattr(model, "uses_industry_id", False):
+                kwargs["industry_id"] = torch.as_tensor(ind_arr[idx], dtype=torch.long, device=device)
+            pred = model(batch_X, **kwargs)
+            if pred.ndim > 1:
+                pred = pred.reshape(-1)
+
+            result = _weighted_same_day_ranknet_loss(
+                pred=pred,
+                y=batch_y,
+                config=config,
+                rng=rng,
+                epoch=epoch,
+            )
+            if result is None:
+                skipped_dates += 1
+                continue
+
+            date_loss, pair_acc, n_pairs = result
+            date_losses.append(date_loss)
+            batch_pair_acc += pair_acc * n_pairs
+            batch_pairs += n_pairs
+
+        if not date_losses:
+            continue
+
+        loss = torch.stack(date_losses).mean()
+        loss.backward()
+        optimizer.step()
+
+        n_dates = len(date_losses)
+        total_loss += float(loss.item()) * n_dates
+        total_dates += n_dates
+        total_pair_acc += batch_pair_acc
+        total_pairs += batch_pairs
+
+    return {
+        "loss": total_loss / total_dates if total_dates > 0 else float("nan"),
+        "pair_acc": total_pair_acc / total_pairs if total_pairs > 0 else float("nan"),
+        "n_pairs": int(total_pairs),
+        "n_dates": int(total_dates),
+        "skipped_dates": int(skipped_dates),
+    }
+
 
 def _train_one_epoch(
     model: nn.Module,
@@ -265,13 +664,17 @@ def _train_one_epoch(
     total_loss = 0.0
     total_samples = 0
 
-    for batch_X, batch_y in dataloader:
-        batch_X = batch_X.to(device)
-        batch_y = batch_y.to(device)
+    for batch in dataloader:
+        batch_X = batch[0].to(device)
+        batch_y = batch[1].to(device)
+        batch_ind = batch[2].to(device) if len(batch) > 2 else None
 
         optimizer.zero_grad()
 
-        pred = model(batch_X)
+        kwargs = {}
+        if batch_ind is not None and getattr(model, "uses_industry_id", False):
+            kwargs["industry_id"] = batch_ind
+        pred = model(batch_X, **kwargs)
 
         if pred.ndim == 1:
             pred = pred.reshape(-1, 1)
@@ -302,11 +705,15 @@ def _evaluate(
     all_targets: list[np.ndarray] = []
 
     with torch.no_grad():
-        for batch_X, batch_y in data_loader:
-            batch_X = batch_X.to(device)
-            batch_y = batch_y.to(device)
+        for batch in data_loader:
+            batch_X = batch[0].to(device)
+            batch_y = batch[1].to(device)
+            batch_ind = batch[2].to(device) if len(batch) > 2 else None
 
-            pred = model(batch_X)
+            kwargs = {}
+            if batch_ind is not None and getattr(model, "uses_industry_id", False):
+                kwargs["industry_id"] = batch_ind
+            pred = model(batch_X, **kwargs)
 
             if pred.ndim == 1:
                 pred = pred.reshape(-1, 1)
@@ -327,6 +734,247 @@ def _evaluate(
     rmse = _rmse(y_true, y_pred)
 
     return loss_avg, rmse, y_true, y_pred
+
+
+def _maybe_compile(model: nn.Module) -> nn.Module:
+    """Apply torch.compile with graceful fallback (Windows may lack MSVC)."""
+    if not hasattr(torch, "compile"):
+        print("[torch.compile] not available — using eager.")
+        return model
+    try:
+        compiled = torch.compile(model, mode="reduce-overhead")
+        print("[torch.compile] enabled (reduce-overhead).")
+        return compiled
+    except Exception as e:
+        print(f"[torch.compile] failed: {e} — using eager.")
+        return model
+
+
+def _compute_ranknet_pair_diagnostics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    meta: pd.DataFrame,
+    date_col: str,
+    config: TorchTrainConfig,
+    seed: int = 12345,
+) -> dict:
+    """Evaluate same-day RankNet pair accuracy on a full split after prediction.
+
+    This reuses the same positive/negative sampling rule as training, but it runs
+    on already-computed predictions. It is a diagnostic only; it does not affect
+    gradients or checkpoint selection.
+    """
+    y_true = np.asarray(y_true, dtype=np.float32).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float32).reshape(-1)
+    dates = meta[date_col].values
+
+    df = pd.DataFrame({"date": dates, "y_true": y_true, "y_pred": y_pred})
+    df = df.dropna(subset=["y_true", "y_pred"])
+    if df.empty:
+        return {
+            "pair_acc": np.nan, "pair_acc_rev": np.nan,
+            "pair_margin": np.nan, "weighted_pair_acc": np.nan,
+            "n_pairs": 0, "n_dates": 0,
+        }
+
+    rng = np.random.default_rng(seed)
+    correct = 0; correct_rev = 0; total = 0
+    weighted_correct = 0.0; total_weight = 0.0
+    margins: list[float] = []
+    n_dates = 0
+
+    for _, g in df.groupby("date", sort=True):
+        y_np = g["y_true"].to_numpy(dtype=np.float32)
+        p_np = g["y_pred"].to_numpy(dtype=np.float32)
+        sampled = _sample_ranknet_pairs_for_date(y_np, config, rng)
+        if sampled is None:
+            continue
+        pos_idx, neg_idx, weights = sampled
+        if len(pos_idx) == 0:
+            continue
+
+        diff = p_np[pos_idx] - p_np[neg_idx]
+        ok = diff > 0; ok_rev = diff < 0
+        correct += int(ok.sum()); correct_rev += int(ok_rev.sum())
+        total += int(len(diff))
+        weighted_correct += float((ok.astype(np.float32) * weights).sum())
+        total_weight += float(weights.sum())
+        margins.append(float(np.mean(diff)))
+        n_dates += 1
+
+    if total == 0:
+        return {
+            "pair_acc": np.nan, "pair_acc_rev": np.nan,
+            "pair_margin": np.nan, "weighted_pair_acc": np.nan,
+            "n_pairs": 0, "n_dates": 0,
+        }
+
+    return {
+        "pair_acc": float(correct / total),
+        "pair_acc_rev": float(correct_rev / total),
+        "pair_margin": float(np.mean(margins)) if margins else np.nan,
+        "weighted_pair_acc": float(weighted_correct / total_weight) if total_weight > 0 else np.nan,
+        "n_pairs": int(total),
+        "n_dates": int(n_dates),
+    }
+
+
+def _compute_score_decile_diagnostics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    meta: pd.DataFrame,
+    date_col: str,
+    min_obs: int = 50,
+) -> dict:
+    """Mean realized return of top/bottom score deciles by day.
+
+    If score direction is healthy, top-score decile return should be above
+    bottom-score decile return. If the spread is negative while train pair_acc is
+    high, the learned signal is likely reversed or regime-specific.
+    """
+    y_true = np.asarray(y_true, dtype=np.float32).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float32).reshape(-1)
+    dates = meta[date_col].values
+    df = pd.DataFrame({"date": dates, "y_true": y_true, "y_pred": y_pred})
+    df = df.dropna(subset=["y_true", "y_pred"])
+
+    top_rets: list[float] = []; bottom_rets: list[float] = []; spreads: list[float] = []
+
+    for _, g in df.groupby("date", sort=True):
+        if len(g) < min_obs or g["y_pred"].nunique() <= 1:
+            continue
+        top_pct = 1.0 - g["y_pred"].rank(method="first", pct=True)
+        top = g.loc[top_pct <= 0.10, "y_true"]      # highest predicted scores
+        bottom = g.loc[top_pct >= 0.90, "y_true"]    # lowest predicted scores
+        if len(top) == 0 or len(bottom) == 0:
+            continue
+        top_ret = float(top.mean()); bottom_ret = float(bottom.mean())
+        top_rets.append(top_ret); bottom_rets.append(bottom_ret)
+        spreads.append(top_ret - bottom_ret)
+
+    if not spreads:
+        return {
+            "top_decile_ret": np.nan, "bottom_decile_ret": np.nan,
+            "decile_spread": np.nan, "n_dates": 0,
+        }
+
+    return {
+        "top_decile_ret": float(np.mean(top_rets)),
+        "bottom_decile_ret": float(np.mean(bottom_rets)),
+        "decile_spread": float(np.mean(spreads)),
+        "n_dates": int(len(spreads)),
+    }
+
+
+def _compute_pred_bucket_diagnostics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    meta: pd.DataFrame,
+    date_col: str,
+    min_obs: int = 50,
+) -> dict:
+    """Predicted score bucket table — shows where the toxic tail lives."""
+    y_true = np.asarray(y_true, dtype=np.float32).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float32).reshape(-1)
+    dates = meta[date_col].values
+    df = pd.DataFrame({"date": dates, "y_true": y_true, "y_pred": y_pred})
+    df = df.dropna(subset=["y_true", "y_pred"])
+
+    bins = [(0, 1), (1, 3), (3, 5), (5, 10), (10, 20), (20, 40), (40, 60), (60, 80), (80, 100)]
+    rows: list[dict] = []
+
+    for lo, hi in bins:
+        mean_rets = []
+        hit_rates = []
+        bad_rates = []
+        bad_mean = []
+        medians = []
+        for _, g in df.groupby("date", sort=True):
+            if len(g) < min_obs or g["y_pred"].nunique() <= 1:
+                continue
+            top_pct = (1.0 - g["y_pred"].rank(method="first", pct=True)) * 100
+            bucket = g[(top_pct >= lo) & (top_pct < hi)]
+            if len(bucket) < 5:
+                continue
+            mean_rets.append(float(bucket["y_true"].mean()))
+            top5_cut = g["y_true"].quantile(0.95)
+            bot20_cut = g["y_true"].quantile(0.20)
+            hit_rates.append(float((bucket["y_true"] >= top5_cut).mean()))
+            bad_mask = bucket["y_true"] <= bot20_cut
+            bad_rates.append(float(bad_mask.mean()))
+            bad_mean.append(float(bucket.loc[bad_mask, "y_true"].mean()) if bad_mask.any() else 0.0)
+            medians.append(float(bucket["y_true"].median()))
+        rows.append({
+            "bucket": f"{lo}-{hi}%",
+            "mean_ret": float(np.mean(mean_rets)) if mean_rets else np.nan,
+            "hit_rate": float(np.mean(hit_rates)) if hit_rates else np.nan,
+            "bad_rate": float(np.mean(bad_rates)) if bad_rates else np.nan,
+            "bad_avg": float(np.mean(bad_mean)) if bad_mean else np.nan,
+            "median": float(np.mean(medians)) if medians else np.nan,
+        })
+    return {"bucket_table": rows}
+
+
+def _compute_hard_negative_pair_acc(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    meta: pd.DataFrame,
+    date_col: str,
+    config: TorchTrainConfig,
+    seed: int = 12345,
+) -> dict:
+    """Split pair accuracy: random negatives vs hard (high-score) negatives."""
+    y_true = np.asarray(y_true, dtype=np.float32).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float32).reshape(-1)
+    dates = meta[date_col].values
+    df = pd.DataFrame({"date": dates, "y_true": y_true, "y_pred": y_pred})
+    df = df.dropna(subset=["y_true", "y_pred"])
+
+    rng = np.random.default_rng(seed)
+    random_correct = 0; random_total = 0
+    hard_correct = 0; hard_total = 0
+
+    for _, g in df.groupby("date", sort=True):
+        y_np = g["y_true"].to_numpy(dtype=np.float32)
+        p_np = g["y_pred"].to_numpy(dtype=np.float32)
+        if len(y_np) < config.rank_min_date_obs:
+            continue
+
+        pos_cut = float(np.nanquantile(y_np, config.rank_pos_quantile))
+        pos_pool = np.flatnonzero(y_np >= pos_cut)
+        neg_pool = np.flatnonzero(y_np < pos_cut)
+        if len(pos_pool) == 0 or len(neg_pool) < 2:
+            continue
+
+        # Build hard negative pool: top-50% of pred scores among non-positive
+        neg_preds = p_np[neg_pool]
+        hard_cut = float(np.quantile(neg_preds, 0.5))
+        hard_neg_pool = neg_pool[neg_preds >= hard_cut]
+
+        n_pos = min(20, len(pos_pool))
+        n_neg = min(10, len(neg_pool))
+        pos_sample = rng.choice(pos_pool, size=n_pos, replace=False)
+
+        # Random negatives
+        rand_neg = rng.choice(neg_pool, size=n_neg, replace=False)
+        for p in pos_sample:
+            diff_r = p_np[p] - p_np[rand_neg]
+            random_correct += int((diff_r > 0).sum())
+            random_total += len(rand_neg)
+
+        # Hard negatives
+        if len(hard_neg_pool) >= 5:
+            hard_neg = rng.choice(hard_neg_pool, size=min(n_neg, len(hard_neg_pool)), replace=False)
+            for p in pos_sample:
+                diff_h = p_np[p] - p_np[hard_neg]
+                hard_correct += int((diff_h > 0).sum())
+                hard_total += len(hard_neg)
+
+    return {
+        "random_pair_acc": float(random_correct / random_total) if random_total > 0 else np.nan,
+        "hard_pair_acc": float(hard_correct / hard_total) if hard_total > 0 else np.nan,
+    }
+
 
 def train_torch_model(
     model: nn.Module,
@@ -378,12 +1026,36 @@ def train_torch_model(
     device = _resolve_device(config.device)
     model = model.to(device)
 
-    train_loader = _build_dataloader(
-        dataset=train_data,
-        batch_size=config.batch_size,
-        shuffle=config.shuffle_train,
-        seed=config.seed,
-    )
+    # torch.compile: fuse small ops (depthwise conv + gelu + gate matmul) for
+    # reduced kernel launch overhead on CPU. Falls back to eager on failure.
+    if config.enable_compile:
+        model = _maybe_compile(model)
+
+    train_loader: DataLoader | None = None
+    train_date_groups: list[np.ndarray] | None = None
+
+    if config.loss_type == "mse":
+        train_loader = _build_dataloader(
+            dataset=train_data,
+            batch_size=config.batch_size,
+            shuffle=config.shuffle_train,
+            seed=config.seed,
+        )
+    else:
+        train_date_groups = _group_indices_by_date(
+            dataset=train_data,
+            date_col=config.date_col,
+            min_date_obs=config.rank_min_date_obs,
+        )
+        print(
+            f"[train_torch] loss_type=ranknet  "
+            f"dates={len(train_date_groups)}  dates_per_batch={config.dates_per_batch}  "
+            f"pos_q={config.rank_pos_quantile:.2f}  neg_q={config.rank_neg_quantile:.2f}  "
+            f"hard_frac={config.rank_hard_neg_frac:.2f}  "
+            f"hard_score_q={config.rank_hard_neg_score_quantile:.2f}  "
+            f"tail_frac={config.rank_tail_neg_frac:.2f}  "
+            f"tau={config.rank_tau:.4f}  weight_mode={config.rank_weight_mode}"
+        )
 
     valid_loader = _build_dataloader(
         dataset=valid_data,
@@ -392,6 +1064,7 @@ def train_torch_model(
         seed=config.seed,
     )
 
+    # Keep MSE as the validation loss/RMSE diagnostic even when training uses RankNet.
     criterion = nn.MSELoss()
 
     optimizer = torch.optim.AdamW(
@@ -420,7 +1093,15 @@ def train_torch_model(
     composite_checkpoint_path = output_dir / f"{model_name}_best_composite.pt"
     epochs_without_improvement = 0
 
+    early_stop_metric = config.early_stop_metric
+    if early_stop_metric == "auto":
+        early_stop_metric = "rmse" if config.loss_type == "mse" else "cumret"
+    early_stop_best = float("inf") if early_stop_metric == "rmse" else -np.inf
+
     final_train_loss = float("nan")
+    final_train_pair_acc = float("nan")
+    final_train_n_pairs = 0
+    final_train_n_dates = 0
     final_valid_loss = float("nan")
     final_valid_rmse = float("nan")
 
@@ -431,13 +1112,37 @@ def train_torch_model(
     for epoch in range(1, config.epochs + 1):
         t_epoch = time.perf_counter()
 
-        train_loss = _train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device
-        )
+        if config.loss_type == "mse":
+            if train_loader is None:
+                raise RuntimeError("train_loader is unexpectedly None for MSE training.")
+            train_loss = _train_one_epoch(
+                model=model,
+                dataloader=train_loader,
+                optimizer=optimizer,
+                criterion=criterion,
+                device=device
+            )
+            train_pair_acc = float("nan")
+            train_n_pairs = 0
+            train_n_dates = 0
+            train_skipped_dates = 0
+        else:
+            if train_date_groups is None:
+                raise RuntimeError("train_date_groups is unexpectedly None for RankNet training.")
+            rank_stats = _train_one_epoch_ranknet(
+                model=model,
+                dataset=train_data,
+                date_groups=train_date_groups,
+                optimizer=optimizer,
+                config=config,
+                device=device,
+                epoch=epoch,
+            )
+            train_loss = float(rank_stats["loss"])
+            train_pair_acc = float(rank_stats["pair_acc"])
+            train_n_pairs = int(rank_stats["n_pairs"])
+            train_n_dates = int(rank_stats["n_dates"])
+            train_skipped_dates = int(rank_stats["skipped_dates"])
 
         valid_loss, valid_rmse, y_true, y_pred = _evaluate(
             model=model,
@@ -451,59 +1156,155 @@ def train_torch_model(
         mean_ic = ic_result["mean_ic"]
         n_ic_dates = ic_result["n_dates"]
 
+        cumret_result = _compute_valid_cumret(y_true, y_pred, valid_data.meta, config.date_col)
+        cumret = cumret_result["cumret"]
+        epoch_sharpe = cumret_result["sharpe"]
+
+        # RankNet diagnostics: valid pair acc, reverse-score metrics, decile spread.
+        valid_pair_acc = float("nan")
+        valid_pair_acc_rev = float("nan")
+        reverse_cumret = float("nan")
+        decile_spread = float("nan")
+        if config.loss_type == "ranknet" and config.rank_eval_diagnostics:
+            pair_diag = _compute_ranknet_pair_diagnostics(
+                y_true=y_true, y_pred=y_pred, meta=valid_data.meta,
+                date_col=config.date_col, config=config,
+                seed=config.seed + epoch * 4099,
+            )
+            valid_pair_acc = pair_diag["pair_acc"]
+            valid_pair_acc_rev = pair_diag["pair_acc_rev"]
+
+            rev_cumret_result = _compute_valid_cumret(
+                y_true, -y_pred, valid_data.meta, config.date_col)
+            reverse_cumret = rev_cumret_result["cumret"]
+
+            decile_diag = _compute_score_decile_diagnostics(
+                y_true=y_true, y_pred=y_pred, meta=valid_data.meta,
+                date_col=config.date_col,
+            )
+            decile_spread = decile_diag["decile_spread"]
+
         final_train_loss = train_loss
+        final_train_pair_acc = train_pair_acc
+        final_train_n_pairs = train_n_pairs
+        final_train_n_dates = train_n_dates
         final_valid_loss = valid_loss
         final_valid_rmse = valid_rmse
 
-        if not np.isfinite(valid_rmse):
-            epochs_without_improvement += 1
-            continue
-
-        if valid_rmse < best_valid_rmse - MIN_DELTA:
+        if np.isfinite(valid_rmse) and valid_rmse < best_valid_rmse - MIN_DELTA:
             best_valid_rmse = valid_rmse
             best_rmse_epoch = epoch
-            epochs_without_improvement = 0
             torch.save(model.state_dict(), checkpoint_path)
-        else:
-            epochs_without_improvement += 1
 
         if np.isfinite(icir) and icir > best_icir:
             best_icir = icir
             best_icir_epoch = epoch
             torch.save(model.state_dict(), icir_checkpoint_path)
 
-        cumret_result = _compute_valid_cumret(y_true, y_pred, valid_data.meta, config.date_col)
-        cumret = cumret_result["cumret"]
-        epoch_sharpe = cumret_result["sharpe"]
         if np.isfinite(cumret) and cumret > best_cumret:
             best_cumret = cumret
             best_cumret_epoch = epoch
             torch.save(model.state_dict(), cumret_checkpoint_path)
 
+        if early_stop_metric == "rmse":
+            early_stop_value = valid_rmse
+            early_stop_improved = (
+                np.isfinite(early_stop_value)
+                and early_stop_value < early_stop_best - MIN_DELTA
+            )
+        elif early_stop_metric == "cumret":
+            early_stop_value = cumret
+            early_stop_improved = (
+                np.isfinite(early_stop_value)
+                and early_stop_value > early_stop_best + MIN_DELTA
+            )
+        else:  # early_stop_metric == "icir"
+            early_stop_value = icir
+            early_stop_improved = (
+                np.isfinite(early_stop_value)
+                and early_stop_value > early_stop_best + MIN_DELTA
+            )
+
+        if early_stop_improved:
+            early_stop_best = float(early_stop_value)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
         epoch_records.append({
             "epoch": epoch,
+            "loss_type": config.loss_type,
+            "train_loss": train_loss,
+            "train_pair_acc": train_pair_acc,
+            "train_n_pairs": train_n_pairs,
+            "train_n_dates": train_n_dates,
+            "train_skipped_dates": train_skipped_dates,
+            "valid_rmse": valid_rmse,
+            "icir": icir,
+            "mean_ic": mean_ic,
             "cumret": cumret if np.isfinite(cumret) else -np.inf,
             "sharpe": epoch_sharpe if np.isfinite(epoch_sharpe) else -np.inf,
+            "early_stop_metric": early_stop_metric,
+            "early_stop_value": early_stop_value if np.isfinite(early_stop_value) else np.nan,
             "checkpoint": output_dir / f"{model_name}_epoch{epoch}.pt",
+            "valid_pair_acc": valid_pair_acc,
+            "reverse_cumret": reverse_cumret,
+            "decile_spread": decile_spread,
         })
         torch.save(model.state_dict(), epoch_records[-1]["checkpoint"])
 
         epoch_time = time.perf_counter() - t_epoch
         elapsed = time.perf_counter() - t_start
-        print(
-            f"[{model_name}  epoch {epoch:>3}/{config.epochs}] "
-            f"train_loss={train_loss:.6f}  valid_rmse={valid_rmse:.6f}  "
-            f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  n_ic_dates={n_ic_dates}  "
-            f"cumret={cumret:.4f}  "
-            f"best_rmse={best_valid_rmse:.6f} @{best_rmse_epoch}  "
-            f"best_ICIR={best_icir:.4f} @{best_icir_epoch}  "
-            f"best_cumret={best_cumret:.4f} @{best_cumret_epoch}  "
-            f"epoch={epoch_time:.1f}s  elapsed={elapsed:.1f}s"
-        )
+
+        if config.loss_type == "ranknet":
+            print(
+                f"[{model_name}  epoch {epoch:>3}/{config.epochs}] "
+                f"train_loss={train_loss:.6f}  pair_acc={train_pair_acc:.4f}  "
+                f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  "
+                f"cumret={cumret:.4f}  sharpe={epoch_sharpe:.4f}  "
+                f"best_ICIR={best_icir:.4f} @{best_icir_epoch}  "
+                f"best_cumret={best_cumret:.4f} @{best_cumret_epoch}  "
+                f"epoch={epoch_time:.1f}s  elapsed={elapsed:.1f}s"
+            )
+            if config.rank_eval_diagnostics and not np.isnan(valid_pair_acc):
+                hard_diag = _compute_hard_negative_pair_acc(
+                    y_true=y_true, y_pred=y_pred, meta=valid_data.meta,
+                    date_col=config.date_col, config=config,
+                    seed=config.seed + epoch * 8191,
+                )
+                bucket_diag = _compute_pred_bucket_diagnostics(
+                    y_true=y_true, y_pred=y_pred, meta=valid_data.meta,
+                    date_col=config.date_col,
+                )
+                print(
+                    f"  [diag] valid_pair_acc={valid_pair_acc:.4f}"
+                    f"  rev_cumret={reverse_cumret:.4f}"
+                    f"  decile_spread={decile_spread:.6f}"
+                )
+                print(
+                    f"  [hard] random_pair_acc={hard_diag['random_pair_acc']:.4f}"
+                    f"  hard_pair_acc={hard_diag['hard_pair_acc']:.4f}"
+                )
+                print(f"  [buckets] " + " | ".join(
+                    f"{r['bucket']}: ret={r['mean_ret']:+.5f} hit={r['hit_rate']:.4f} bad={r['bad_rate']:.3f}"
+                    for r in bucket_diag["bucket_table"][:7]
+                ))
+        else:
+            print(
+                f"[{model_name}  epoch {epoch:>3}/{config.epochs}] "
+                f"train_loss={train_loss:.6f}  "
+                f"valid_rmse={valid_rmse:.6f}  "
+                f"ICIR={icir:.4f}  mean_IC={mean_ic:.4f}  n_ic_dates={n_ic_dates}  "
+                f"cumret={cumret:.4f}  "
+                f"best_rmse={best_valid_rmse:.6f} @{best_rmse_epoch}  "
+                f"best_ICIR={best_icir:.4f} @{best_icir_epoch}  "
+                f"best_cumret={best_cumret:.4f} @{best_cumret_epoch}  "
+                f"epoch={epoch_time:.1f}s  elapsed={elapsed:.1f}s"
+            )
 
         if config.patience > 0 and epochs_without_improvement >= config.patience:
             print(
-                f"[{model_name}] early stop: no improvement for "
+                f"[{model_name}] early stop: {early_stop_metric} did not improve for "
                 f"{config.patience} epochs (min_delta={MIN_DELTA})"
             )
             break
@@ -577,7 +1378,12 @@ def train_torch_model(
     model.load_state_dict(_load_state_dict_safely(use_checkpoint, device))
 
     return {
+        "loss_type": config.loss_type,
+        "early_stop_metric": early_stop_metric,
         "final_train_loss": final_train_loss,
+        "final_train_pair_acc": final_train_pair_acc,
+        "final_train_n_pairs": final_train_n_pairs,
+        "final_train_n_dates": final_train_n_dates,
         "final_valid_loss": final_valid_loss,
         "final_valid_rmse": final_valid_rmse,
         "best_valid_rmse": best_valid_rmse,
@@ -593,6 +1399,10 @@ def train_torch_model(
         "train_size": int(train_data.y.shape[0]),
         "valid_size": int(valid_data.y.shape[0]),
         "model_path": str(use_checkpoint),
+        "valid_pair_acc": valid_pair_acc,
+        "valid_pair_acc_rev": valid_pair_acc_rev,
+        "reverse_cumret": reverse_cumret,
+        "decile_spread": decile_spread,
     }
 
 if __name__ == "__main__":

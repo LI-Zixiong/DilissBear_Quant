@@ -11,7 +11,6 @@ from sklearn.linear_model import RidgeCV
 
 from src.backtest.engine import TransactionCostConfig, run_backtest
 from src.backtest.portfolio import PortfolioConfig
-from src.experiment.returns import align_predictions_to_returns
 
 
 # ── Shared helpers ──────────────────────────────────────────
@@ -26,17 +25,9 @@ def _backtest(
     pred = scores_df[["time", "stock_id", score_col]].rename(
         columns={score_col: "y_pred"}
     ).dropna()
-    aligned = align_predictions_to_returns(
-        pred_df=pred,
-        returns_df=returns_df,
-        date_col="time",
-        stock_col="stock_id",
-        pred_col="y_pred",
-        return_col="return_1d",
-    )
     pfolio = PortfolioConfig(strategy="top_n", top_n=top_n, pred_col="y_pred", stock_col="stock_id")
     return run_backtest(
-        pred_df=aligned,
+        pred_df=pred,
         returns_df=returns_df,
         portfolio_config=pfolio,
         return_col="return_1d",
@@ -58,6 +49,24 @@ def _smooth(df: pd.DataFrame, model_cols: list[str], window: int) -> pd.DataFram
     return out.sort_values(["time", "stock_id"]).reset_index(drop=True)
 
 
+def _smooth_with_history(
+    df: pd.DataFrame,
+    model_cols: list[str],
+    window: int,
+    history: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Causally smooth an evaluation split with earlier warm-up rows."""
+    if history is None or history.empty or window <= 1:
+        return _smooth(df, model_cols, window)
+    eval_keys = df[["time", "stock_id"]].drop_duplicates()
+    cols = ["time", "stock_id"] + model_cols
+    combined = pd.concat([history[cols], df[cols]], ignore_index=True)
+    combined = combined.drop_duplicates(["time", "stock_id"], keep="last")
+    return _smooth(combined, model_cols, window).merge(
+        eval_keys, on=["time", "stock_id"], how="inner",
+    )
+
+
 def _rank_pct(df: pd.DataFrame, model_cols: list[str]) -> pd.DataFrame:
     """Add {col}_r = daily cross-sectional percentile rank."""
     out = df.copy()
@@ -74,10 +83,13 @@ def single_model(
     model_cols: list[str],
     smooth_window: int = 3,
     top_n: int = 50,
+    history_predictions: pd.DataFrame | None = None,
 ) -> dict[str, dict]:
     """Backtest each model's rank individually."""
     results = {}
-    df = _rank_pct(predictions, model_cols)
+    df = _rank_pct(_smooth_with_history(
+        predictions, model_cols, smooth_window, history_predictions,
+    ), model_cols)
     for m in model_cols:
         results[m] = _backtest(df.rename(columns={f"{m}_r": f"_rank_{m}"}), returns, f"_rank_{m}", top_n)
     return results
@@ -89,9 +101,12 @@ def equal_weight(
     model_cols: list[str],
     smooth_window: int = 3,
     top_n: int = 50,
+    history_predictions: pd.DataFrame | None = None,
 ) -> dict:
     """Equal-weight average of model rank percentiles."""
-    df = _rank_pct(predictions, model_cols)
+    df = _rank_pct(_smooth_with_history(
+        predictions, model_cols, smooth_window, history_predictions,
+    ), model_cols)
     rank_cols = [f"{m}_r" for m in model_cols]
     df["_ew"] = df[rank_cols].mean(axis=1)
     return _backtest(df, returns, "_ew", top_n)
@@ -116,6 +131,7 @@ def rank_ridge(
     smooth_window: int = 3,
     top_n: int = 50,
     alphas: list[float] | None = None,
+    history_predictions: pd.DataFrame | None = None,
 ) -> tuple[dict, pd.Series]:
     """
     Rank-Ridge: fit RidgeCV on valid daily-ranked predictions,
@@ -125,7 +141,7 @@ def rank_ridge(
     if alphas is None:
         alphas = [1e-4, 1e-3, 1e-2, 5e-2, 0.1, 0.5, 1.0, 5.0, 10.0]
     # Fit on valid
-    v = _rank_pct(valid_predictions, model_cols)
+    v = _rank_pct(_smooth(valid_predictions, model_cols, smooth_window), model_cols)
     rank_cols = [f"{m}_r" for m in model_cols]
     v["yt_r"] = v.groupby("time")["y_true"].rank(pct=True)
     fit = v.dropna(subset=rank_cols + ["yt_r"])
@@ -135,7 +151,9 @@ def rank_ridge(
     weights = weights / weights.abs().sum()
 
     # Apply on eval
-    df = _rank_pct(predictions, model_cols)
+    df = _rank_pct(_smooth_with_history(
+        predictions, model_cols, smooth_window, history_predictions,
+    ), model_cols)
     df["_rr"] = sum(float(weights[m]) * df[f"{m}_r"] for m in model_cols)
     return _backtest(df, returns, "_rr", top_n), weights
 

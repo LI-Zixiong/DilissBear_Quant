@@ -165,15 +165,12 @@ def align_predictions_to_returns(
     normalize_date: bool = True,
 ) -> pd.DataFrame:
     """
-    Keep only prediction rows whose stock has a valid future return.
+    Keep prediction dates that have a later return date, without stock filtering.
 
-    The backtest engine selects stocks on signal date t, while realized returns
-    are observed on a later return date. This function checks the next available
-    return date after each signal date and keeps only stocks available on that
-    return date.
-
-    It does not merge return values into pred_df. It only filters pred_df so
-    that run_backtest(...) can safely align predictions and returns later.
+    This function intentionally does not inspect which stocks have returns on
+    that later date. Using T+1 return availability before selecting Top-N leaks
+    future data into the T-day candidate set. The engine selects first and then
+    validates the selected stocks' realized returns.
     """
 
     _require_columns(pred_df, [date_col, stock_col, pred_col])
@@ -201,28 +198,10 @@ def align_predictions_to_returns(
     if len(ret_dates) == 0:
         return pred.iloc[0:0].copy()
 
-    next_return_date = {}
-    for signal_date in pred_dates:
-        future_dates = ret_dates[ret_dates > signal_date]
-        if len(future_dates) > 0:
-            next_return_date[signal_date] = future_dates[0]
-
-    if not next_return_date:
+    valid_signal_dates = pred_dates[pred_dates < ret_dates.max()]
+    if len(valid_signal_dates) == 0:
         return pred.iloc[0:0].copy()
-
-    stocks_by_return_date = {
-        d: set(ret.loc[ret[date_col] == d, stock_col])
-        for d in set(next_return_date.values())
-    }
-
-    keep = pd.Series(False, index=pred.index)
-
-    for signal_date, return_date in next_return_date.items():
-        valid_stocks = stocks_by_return_date[return_date]
-        mask = (pred[date_col] == signal_date) & pred[stock_col].isin(valid_stocks)
-        keep.loc[mask] = True
-
-    return pred.loc[keep].copy().reset_index(drop=True)
+    return pred.loc[pred[date_col].isin(valid_signal_dates)].copy().reset_index(drop=True)
 
 
 def build_experiment_returns(

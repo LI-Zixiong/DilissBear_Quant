@@ -17,6 +17,7 @@ def split_panel_by_date_ratio(
     date_col: str,
     stock_col: str,
     split_ratio: Sequence[float] = (0.7, 0.1, 0.2),
+    purge: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str, str]:
     """
     Split a panel DataFrame into chronological train / valid / test sets.
@@ -41,6 +42,11 @@ def split_panel_by_date_ratio(
             (0.6, 0.1, 0.3) -> 60% train, 10% valid, 30% test
             (0.6, 0.2, 0.2) -> 60% train, 20% valid, 20% test
 
+    purge:
+        Number of trailing signal dates removed from train and valid.  This
+        prevents a forward-return target near a boundary from using prices in
+        the following split.
+
     Returns
     -------
     train_df, valid_df, test_df, train_end, valid_end
@@ -52,6 +58,8 @@ def split_panel_by_date_ratio(
         stock_col=stock_col,
         split_ratio=split_ratio,
     )
+    if purge < 0:
+        raise ValueError(f"purge must be >= 0, got {purge}")
 
     train_ratio, valid_ratio, _ = split_ratio
 
@@ -95,6 +103,16 @@ def split_panel_by_date_ratio(
     train_dates = unique_dates[:train_end_idx]
     valid_dates = unique_dates[train_end_idx:valid_end_idx]
     test_dates = unique_dates[valid_end_idx:]
+
+    if purge > 0:
+        if len(train_dates) <= purge or len(valid_dates) <= purge:
+            raise ValueError(
+                "purge would empty a split. "
+                f"train_dates={len(train_dates)}, valid_dates={len(valid_dates)}, "
+                f"purge={purge}"
+            )
+        train_dates = train_dates[:-purge]
+        valid_dates = valid_dates[:-purge]
 
     train_df = work[work[date_col].isin(train_dates)].copy().reset_index(drop=True)
     valid_df = work[work[date_col].isin(valid_dates)].copy().reset_index(drop=True)

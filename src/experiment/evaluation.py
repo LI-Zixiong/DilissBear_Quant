@@ -57,6 +57,10 @@ def evaluate_prediction_split(
         pred_col=pred_col,
         return_col=config.return_col,
     )
+    if "limit_status" in pred_df_bt.columns:
+        pred_df_bt = pred_df_bt[
+            pred_df_bt["limit_status"].ne(1) | pred_df_bt["limit_status"].isna()
+        ].reset_index(drop=True)
 
     metrics: dict[str, Any] = {}
 

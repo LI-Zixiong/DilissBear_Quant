@@ -125,13 +125,16 @@ def _to_nav_series(nav: NavInput) -> pd.Series:
     
     return series
 
-def max_drawdown(nav: NavInput) -> float:
+def max_drawdown(nav: NavInput, initial_nav: float = 1.0) -> float:
     """
     Calculate the maximum drawdown from a NAV series.
     """
     nav_series = _to_nav_series(nav)
 
-    running_max = nav_series.cummax()
+    if not np.isfinite(initial_nav) or initial_nav <= 0.0:
+        raise ValueError("initial_nav must be finite and positive")
+    # Include capital immediately before the first reported return.
+    running_max = nav_series.cummax().clip(lower=float(initial_nav))
     drawdowns = nav_series / running_max - 1.0
 
     return float(-drawdowns.min())

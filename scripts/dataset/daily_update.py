@@ -15,6 +15,25 @@ UNIFIED = Path("dataset/processed/unified_daily_panel.parquet")
 FACTOR = Path("dataset/processed/factor_panel_1500_54_ind.parquet")
 BACKUP_DIR = Path("dataset/processed/_backup")
 
+
+def _backup_previous(path: Path) -> None:
+    """Keep one immediately previous copy for deterministic rollback."""
+    import shutil
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        shutil.copy2(path, BACKUP_DIR / f"{path.name}.prev")
+
+
+def _atomic_to_parquet(df, path: Path) -> None:
+    """Write parquet fully before replacing the production file."""
+    tmp = path.with_name(f"{path.name}.tmp")
+    try:
+        df.to_parquet(tmp, index=False)
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
 if __name__ == "__main__":
     import numpy as np
     import pandas as pd
@@ -36,65 +55,65 @@ if __name__ == "__main__":
     new_dates = [d for d in all_dates if d not in have_dates]
     print(f"  Existing dates: {len(have_dates)}, New: {len(new_dates)}")
 
-    if not new_dates:
-        print("  Already up to date. Done.")
-        exit()
-
     parts = []
     for td in new_dates:
         df = pull_one_date(td)
         if df is not None and len(df) > 0:
             parts.append(df)
             print(f"  {td}: {len(df)} rows")
-    if not parts:
+    if new_dates and not parts:
         print("  No data pulled. Done.")
         exit()
 
-    new_daily = pd.concat(parts, ignore_index=True)
-    print(f"  Pulled {len(new_daily):,} rows\n")
+    new_daily = pd.concat(parts, ignore_index=True) if parts else None
+    if new_daily is not None:
+        print(f"  Pulled {len(new_daily):,} rows\n")
+    else:
+        print("  Base panel already current; checking factor panel catch-up.\n")
 
     if DRY_RUN:
         print("DRY_RUN=True — stopping here.")
         exit()
 
     # ── 2. Append base panel ──
-    print("Step 2: Appending to unified base panel...")
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    if not (BACKUP_DIR / UNIFIED.name).exists():
-        import shutil
-        shutil.copy2(UNIFIED, BACKUP_DIR / UNIFIED.name)
-
     financial = pd.read_parquet("dataset/processed/financial_quarterly_panel.parquet")
-    base_cfg = BasePanelConfig()
     base = pd.read_parquet(UNIFIED)
     base["time"] = pd.to_datetime(base["time"])
     base["stock_id"] = base["stock_id"].astype(str).str.strip().str.zfill(6)
-    updated_base = append_base_panel_rows(
-        base_panel=base, new_daily_rows=new_daily,
-        financial_quarterly=financial, config=base_cfg,
-    )
-
-    if DRY_RUN: exit()
-    updated_base.to_parquet(UNIFIED, index=False)
-    print(f"  Unified panel: {len(updated_base):,} rows\n")
+    if new_daily is not None:
+        print("Step 2: Appending to unified base panel...")
+        updated_base = append_base_panel_rows(
+            base_panel=base, new_daily_rows=new_daily,
+            financial_quarterly=financial, config=BasePanelConfig(),
+        )
+        if DRY_RUN: exit()
+        _backup_previous(UNIFIED)
+        _atomic_to_parquet(updated_base, UNIFIED)
+        print(f"  Unified panel: {len(updated_base):,} rows\n")
+    else:
+        updated_base = base
 
     # ── 3. Append factor rows ──
     print("Step 3: Appending new factor rows...")
-    if not (BACKUP_DIR / FACTOR.name).exists():
-        import shutil
-        shutil.copy2(FACTOR, BACKUP_DIR / FACTOR.name)
-
     factor_cfg = FactorPanelConfig(mode="live")
     existing = pd.read_parquet(FACTOR)
     existing["time"] = pd.to_datetime(existing["time"])
     existing["stock_id"] = existing["stock_id"].astype(str).str.strip().str.zfill(6)
+    factor_last = existing["time"].max()
+    base_last = updated_base["time"].max()
+    if factor_last >= base_last:
+        print(f"  Factor panel already current through {factor_last.date()}.")
+        print("\nDone. Next: run market_regime + experiment.")
+        exit()
+
     updated_factor = append_factor_panel_rows(
         existing_factor_panel=existing,
         updated_base_panel=updated_base,
         financial_quarterly=financial,
         config=factor_cfg,
     )
-    updated_factor.to_parquet(FACTOR, index=False)
+    _backup_previous(FACTOR)
+    _atomic_to_parquet(updated_factor, FACTOR)
     print(f"  Factor panel: {len(updated_factor):,} rows")
 
-    print("\nDone. Next: run select_universe + experiment.")
+    print("\nDone. Next: run market_regime + experiment.")

@@ -93,15 +93,23 @@ def _predict_with_torch_model(model: nn.Module, dataset: BuiltDataset, config: P
     model.eval()
 
     X_tensor = torch.as_tensor(dataset.X, dtype=torch.float32)
-    tensor_dataset = TensorDataset(X_tensor)
+    ind_id = getattr(dataset, "industry_id", None)
+    if ind_id is not None:
+        ind_tensor = torch.as_tensor(ind_id, dtype=torch.long)
+        tensor_dataset = TensorDataset(X_tensor, ind_tensor)
+    else:
+        tensor_dataset = TensorDataset(X_tensor)
     data_loader = DataLoader(tensor_dataset, batch_size=config.batch_size, shuffle=False)
 
     preds_list: list[np.ndarray] = []
 
     with torch.no_grad():
-        for (batch_X, ) in data_loader:
-            batch_X = batch_X.to(device)
-            batch_pred = model(batch_X)
+        for batch in data_loader:
+            batch_X = batch[0].to(device)
+            kwargs = {}
+            if len(batch) > 1 and getattr(model, "uses_industry_id", False):
+                kwargs["industry_id"] = batch[1].to(device)
+            batch_pred = model(batch_X, **kwargs)
 
             if batch_pred.ndim == 1:
                 batch_pred = batch_pred.reshape(-1, 1)

@@ -51,8 +51,7 @@ class ExperimentConfig:
     #   "column"      -> use an existing realized return column, e.g. ret_daily
     #   "next_target" -> map a next-period target, e.g. 1d_next_raw, to the next date
     #
-    # Default: 1d_next_raw is open-to-open (t+1 open buy, t+2 open sell),
-    # consistent with model training targets and Bayes H.
+    # Default target mapping: 1d_next_raw is close(t+1)/close(t)-1.
     return_col: str = "return_1d"
     backtest_return_mode: str = "next_target"
     backtest_return_source: str = "1d_next_raw"
@@ -178,6 +177,13 @@ class ExperimentConfig:
     # Example: {"dlinear": {"F001SIZE": -1, "F003LIQUIDITY": -1}}
     model_feature_signs: dict[str, dict[str, int]] | None = None
 
+    # Per-model one-hot expansion.  Column → dummies, fit on train, applied to
+    # all splits.  Columns listed here MUST be present in the raw panel (they
+    # are force-loaded via _active_column_set) but are removed from the feature
+    # list and replaced by the dummy columns.
+    # Example: {"dlinear": ["F055IND"]}
+    one_hot_features: dict[str, list[str]] = field(default_factory=dict)
+
     # ------------------------------------------------------------------
     # Model pool
     # ------------------------------------------------------------------
@@ -224,6 +230,10 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # General experiment settings
     # ------------------------------------------------------------------
+    # Lock the dataset end-date for stable benchmarking.  When set, rows
+    # after this date are dropped before splitting.  Empty string = use all data.
+    end_date: str = ""
+
     # Date split ratio: (train, valid, test). Must sum to 1.0.
     split_ratio: Sequence[float] = (0.6, 0.2, 0.2)
 
@@ -314,8 +324,8 @@ class ExperimentConfig:
     # ------------------------------------------------------------------
     # Outputs
     # ------------------------------------------------------------------
-    output_dir: str = "dataset/output/experiment_005"
-    report_path: str = "reports/experiment_005.md"
+    output_dir: str = "dataset/output/experiment_009"
+    report_path: str = "reports/experiment_007.md"
 
     # ------------------------------------------------------------------
     # Lightweight validation

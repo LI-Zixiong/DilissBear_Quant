@@ -137,6 +137,9 @@ def build_experiment_model(
                 verbose_eval=False,
                 random_state=seed,
                 n_jobs=int(params.get("n_jobs", -1)),
+                categorical_feature=params.get("categorical_feature", None),
+                cat_smooth=float(params.get("cat_smooth", 10.0)),
+                cat_l2=float(params.get("cat_l2", 10.0)),
             )
         )
 
@@ -157,12 +160,15 @@ def build_experiment_model(
         )
 
     if normalized_name == "dlinear":
+        params = get_model_params(normalized_name, config)
         return build_dlinear_model(
             DLinearConfig(
                 seq_len=seq_len,
                 n_features=n_features,
                 moving_avg_kernel=25,
                 dropout=0.1,
+                n_industries=int(params.get("n_industries", 0) or 0),
+                ind_rank=int(params.get("ind_rank", 0) or 0),
             )
         )
 

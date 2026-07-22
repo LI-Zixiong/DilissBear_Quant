@@ -32,7 +32,7 @@ from src.backtest.engine import TransactionCostConfig
 from src.backtest.portfolio import PortfolioConfig
 from src.data.dataset_builder import PanelDatasetBuilder
 from src.experiment.config import ExperimentConfig
-from src.experiment.data import ExperimentData, prepare_experiment_data
+from src.experiment.data import ExperimentData, expand_onehot_columns, prepare_experiment_data
 from src.experiment.evaluation import evaluate_prediction_split
 from src.experiment.model_factory import (
     build_experiment_model,
@@ -228,13 +228,17 @@ def _tabular_predict_at_n(model, dataset, n, date_col, stock_col):
 
 
 def _tabular_n_scan(
-    model, valid_data, test_data, data, config, portfolio_config,
+    model, valid_data, data, config, portfolio_config,
     cost_config, model_name, output_dir,
 ):
     """Scan candidate n_tree values, pick best by valid total return."""
     total_trees = _get_total_trees(model)
-    base_candidates = [200, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000]
-    candidates = [c for c in base_candidates if c <= total_trees]
+    # 5 evenly-spaced candidates from 20%→100% of total trees
+    step = max(1, total_trees // 5)
+    candidates = sorted(set(
+        [step, step * 2, step * 3, step * 4, total_trees]
+    ))
+    candidates = [c for c in candidates if c <= total_trees]
     if not candidates:
         candidates = [total_trees]
     best_n = candidates[0]
@@ -258,29 +262,11 @@ def _tabular_n_scan(
         v_sr = valid_eval["backtest_result"]["summary"]["sharpe_ratio"]
         v_to = valid_eval["backtest_result"]["summary"]["mean_turnover"]
 
-        test_pred = _tabular_predict_at_n(
-            model, test_data, n, config.date_col, config.stock_col,
-        )
-        test_eval = evaluate_prediction_split(
-            pred_df=test_pred,
-            returns_df=data.returns_df,
-            config=config,
-            portfolio_config=portfolio_config,
-            cost_config=cost_config,
-            split_name="test",
-        )
-        t_ret = test_eval["backtest_result"]["summary"]["total_return"]
-        t_sr = test_eval["backtest_result"]["summary"]["sharpe_ratio"]
-        t_to = test_eval["backtest_result"]["summary"]["mean_turnover"]
-
         scan_records.append({
             "n_tree": n,
             "valid_total_return": v_ret,
             "valid_sharpe": v_sr,
             "valid_turnover": v_to,
-            "test_total_return": t_ret,
-            "test_sharpe": t_sr,
-            "test_turnover": t_to,
         })
         marker = "*" if v_ret > best_valid_ret else ""
         print(f" {n}:{v_ret:.3f}{marker}", end="", flush=True)
@@ -297,6 +283,29 @@ def _tabular_n_scan(
     print(f"  scan saved to {scan_path}")
 
     return best_n, best_valid_ret, scan_records
+
+
+def _filter_train_limit_up_entry(
+    train_df: pd.DataFrame,
+    date_col: str,
+    stock_col: str,
+) -> pd.DataFrame:
+    """Remove training samples whose signal-day close is limit-up.
+
+    With T-close/post-close entry, a limit-up on T is generally not executable.
+    A limit-up on T+1 is an outcome after entry and must remain in the target.
+    """
+    if "limit_status" not in train_df.columns:
+        return train_df
+
+    df = train_df.sort_values([stock_col, date_col])
+    before = len(df)
+    keep = df["limit_status"].ne(1) | df["limit_status"].isna()
+    df = df[keep].copy()
+    after = len(df)
+    pct = (1 - after / before) * 100 if before else 0
+    print(f"  [limit-up filter] train: {before:,} → {after:,} rows ({pct:.1f}% removed)")
+    return df
 
 
 def _run_tabular_models(
@@ -317,25 +326,71 @@ def _run_tabular_models(
         print(f"\nRunning model: {model_name}")
 
         cols = _model_features(model_name, config)
-        train_df = data.train_df.copy()
+        train_df = _filter_train_limit_up_entry(
+            data.train_df.copy(), config.date_col, config.stock_col,
+        )
         valid_df = data.valid_df.copy()
         test_df = data.test_df.copy()
         _apply_feature_signs(train_df, model_name, config)
         _apply_feature_signs(valid_df, model_name, config)
         _apply_feature_signs(test_df, model_name, config)
 
+        # Append industry_id as native categorical for LightGBM
+        _cat_indices: list[int] = []
+        _expanded_cols = list(cols)
+        if model_name == "lightgbm" and "industry_sw" in train_df.columns:
+            all_ind = pd.concat([
+                train_df["industry_sw"], valid_df["industry_sw"], test_df["industry_sw"]
+            ]).dropna().astype(int)
+            if not all_ind.empty:
+                unique_ind = sorted(all_ind.unique())
+                ind_to_id = {v: i + 1 for i, v in enumerate(unique_ind)}
+                for df in (train_df, valid_df, test_df):
+                    df["industry_id"] = (
+                        df["industry_sw"].fillna(-1).astype(int).map(ind_to_id).fillna(0).astype("int64")
+                    )
+                _expanded_cols.append("industry_id")
+                _cat_indices = [len(_expanded_cols) - 1]
+                print(f"  [{model_name}] industry_id categorical: idx={_cat_indices[0]}, {len(unique_ind)} categories")
+
+        builder_meta = list(config.meta_cols)
+        if _cat_indices:
+            builder_meta.append("industry_id")
+
         builder = PanelDatasetBuilder(
-            feature_cols=list(cols),
+            feature_cols=_expanded_cols,
             target_col=config.target_col,
             date_col=config.date_col,
             stock_col=config.stock_col,
             seq_len=1,
-            meta_cols=list(config.meta_cols),
+            meta_cols=builder_meta,
         )
 
         train_data = builder.build_tabular_dataset(train_df)
         valid_data = builder.build_tabular_dataset(valid_df)
         test_data = builder.build_tabular_dataset(test_df)
+
+        live_date = pd.Timestamp(data.inference_df[config.date_col].max())
+        live_df = data.inference_df.loc[
+            data.inference_df[config.date_col].eq(live_date)
+        ].copy()
+        _apply_feature_signs(live_df, model_name, config)
+
+        if _cat_indices and "industry_sw" in live_df.columns:
+            all_ind = pd.concat([
+                train_df["industry_sw"], valid_df["industry_sw"], test_df["industry_sw"]
+            ]).dropna().astype(int)
+            unique_ind = sorted(all_ind.unique())
+            ind_to_id = {v: i + 1 for i, v in enumerate(unique_ind)}
+            live_df["industry_id"] = (
+                live_df["industry_sw"].fillna(-1).astype(int).map(ind_to_id).fillna(0).astype("int64")
+            )
+
+        live_data = builder.build_tabular_dataset(live_df, require_target=False)
+
+        # Inject categorical_feature indices into model params
+        if _cat_indices and model_name in config.model_params:
+            config.model_params[model_name]["categorical_feature"] = _cat_indices
 
         # Isolate each model from RNG consumed by any previous model.
         set_seed(config.seed)
@@ -364,7 +419,6 @@ def _run_tabular_models(
         best_n, best_valid_ret, scan_records = _tabular_n_scan(
             model=model,
             valid_data=valid_data,
-            test_data=test_data,
             data=data,
             config=config,
             portfolio_config=portfolio_config,
@@ -382,6 +436,9 @@ def _run_tabular_models(
         test_pred_df = _tabular_predict_at_n(
             model, test_data, best_n, config.date_col, config.stock_col,
         )
+        live_pred_df = _tabular_predict_at_n(
+            model, live_data, best_n, config.date_col, config.stock_col,
+        )
 
         prediction_paths = _save_prediction_outputs(
             valid_pred_df=valid_pred_df,
@@ -389,6 +446,11 @@ def _run_tabular_models(
             model_name=model_name,
             output_dir=output_dir,
         )
+        live_path = save_predictions(
+            pred_df=live_pred_df,
+            output_path=output_dir / f"predictions_live_{model_name}.parquet",
+        )
+        prediction_paths["prediction_live_path"] = str(live_path)
 
         valid_eval = _evaluate_and_save_split(
             pred_df=valid_pred_df,
@@ -475,20 +537,71 @@ def _run_torch_models(
 
         # Apply signs once per compatible group, on copies only.
         sign_model = names[0]
-        train_df = data.train_df.copy()
+        train_df = _filter_train_limit_up_entry(
+            data.train_df.copy(), config.date_col, config.stock_col,
+        )
         valid_df = data.valid_df.copy()
         test_df = data.test_df.copy()
         _apply_feature_signs(train_df, sign_model, config)
         _apply_feature_signs(valid_df, sign_model, config)
         _apply_feature_signs(test_df, sign_model, config)
 
+        # One-hot expansion: per-model categorical → dummy columns.
+        # Expands feature_cols in-place so the builder sees the dummies.
+        expanded_cols = list(cols)
+        _onehot_meta: dict[str, tuple[list[str], list]] = {}  # col → (names, cat_values)
+        for model_name in names:
+            if config.one_hot_features and model_name in config.one_hot_features:
+                for oh_col in config.one_hot_features[model_name]:
+                    if oh_col in train_df.columns:
+                        cats = sorted(train_df[oh_col].dropna().unique())
+                        train_df, valid_df, test_df, new_cols = expand_onehot_columns(
+                            train_df, valid_df, test_df, oh_col,
+                        )
+                        expanded_cols = [c for c in expanded_cols if c != oh_col] + new_cols
+                        _onehot_meta[oh_col] = (new_cols, cats)
+                        print(f"  [{model_name}] one-hot {oh_col} → {len(new_cols)} columns "
+                              f"({len(expanded_cols)} total features)")
+
+        # Create sequential industry_id from industry_sw for DLinear embedding.
+        # industry_sw is already in meta_cols. Map to 0..N-1 for nn.Embedding.
+        _n_industries = 0
+        _ind_to_id: dict = {}
+        if "industry_sw" in train_df.columns and not train_df["industry_sw"].dropna().empty:
+            all_ind = pd.concat([
+                train_df["industry_sw"], valid_df["industry_sw"], test_df["industry_sw"]
+            ]).dropna().astype(int)
+            unique_ind = sorted(all_ind.unique())
+            # UNKNOWN → 0, real industries → 1..N
+            _ind_to_id = {v: i + 1 for i, v in enumerate(unique_ind)}
+            for df in (train_df, valid_df, test_df):
+                df["industry_id"] = (
+                    df["industry_sw"].fillna(-1).astype(int).map(_ind_to_id).fillna(0).astype("int64")
+                )
+            _n_industries = len(unique_ind) + 1  # +1 for UNKNOWN=0
+            print(f"  industry_id: {_n_industries} categories (0=UNKNOWN, 1..{len(unique_ind)}={unique_ind[:5]}...)")
+
+            # Persist mapping alongside model for future inference
+            import json as _json
+            map_path = output_dir / "models" / "dlinear" / "industry_mapping.json"
+            map_path.parent.mkdir(parents=True, exist_ok=True)
+            map_path.write_text(_json.dumps(
+                {"n_industries": _n_industries, "ind_rank": 4,
+                 "id_to_code": {str(v): int(k) for k, v in _ind_to_id.items()}},
+                ensure_ascii=False, indent=2,
+            ), encoding="utf-8")
+
+        builder_meta = list(config.meta_cols)
+        if _n_industries > 0:
+            builder_meta.append("industry_id")
+
         builder = PanelDatasetBuilder(
-            feature_cols=list(cols),
+            feature_cols=expanded_cols,
             target_col=config.target_col,
             date_col=config.date_col,
             stock_col=config.stock_col,
             seq_len=seq_len,
-            meta_cols=list(config.meta_cols),
+            meta_cols=builder_meta,
         )
 
         # Build sequence windows on the concatenated chronological panel, then
@@ -506,10 +619,43 @@ def _run_torch_models(
                 f"seq_len={seq_len}, models={names}"
             )
 
+        live_date = pd.Timestamp(data.inference_df[config.date_col].max())
+        live_frame = data.inference_df.copy()
+        _apply_feature_signs(live_frame, sign_model, config)
+        live_frame = (
+            live_frame.sort_values([config.stock_col, config.date_col])
+            .groupby(config.stock_col, sort=False)
+            .tail(seq_len)
+            .copy()
+        )
+        live_frame["_live_endpoint"] = live_frame[config.date_col].eq(live_date)
+
+        if _ind_to_id and "industry_sw" in live_frame.columns:
+            live_frame["industry_id"] = (
+                live_frame["industry_sw"].fillna(-1).astype(int).map(_ind_to_id).fillna(0).astype("int64")
+            )
+
+        for oh_col, (oh_names, cats) in _onehot_meta.items():
+            if oh_col in live_frame.columns:
+                for name, cat in zip(oh_names, cats):
+                    live_frame[name] = (live_frame[oh_col] == cat).astype("uint8")
+                live_frame.drop(columns=[oh_col], inplace=True)
+
+        live_data = builder.build_sequence_dataset(
+            live_frame,
+            end_filter_col="_live_endpoint",
+            end_filter_value=True,
+            require_target=False,
+        )
+
         for model_name in names:
             print(f"\nRunning model: {model_name}")
 
             params = get_model_params(model_name, config)
+
+            # Inject n_industries discovered from data into model params
+            if _n_industries > 0 and model_name in config.model_params:
+                config.model_params[model_name]["n_industries"] = _n_industries
 
             # IMPORTANT: reset BEFORE model construction.
             # Otherwise the initial weights depend on RNG consumed by earlier
@@ -519,28 +665,45 @@ def _run_torch_models(
                 model_name=model_name,
                 seed=config.seed,
                 seq_len=int(params["seq_len"]),
-                n_features=len(cols),
+                n_features=len(expanded_cols),
                 config=config,
             )
 
             # Reset again so training-time randomness (dropout, CUDA kernels,
             # DataLoader shuffling if enabled) is also independent of model order.
             set_seed(config.seed)
+            ttc = TorchTrainConfig(
+                epochs=int(params["epochs"]),
+                patience=int(params.get("patience", config.torch_patience)),
+                batch_size=config.torch_batch_size,
+                learning_rate=float(params["lr"]),
+                weight_decay=float(params["wd"]),
+                device=config.torch_device,
+                seed=config.seed,
+                date_col=config.date_col,
+                enable_compile=bool(params.get("enable_compile", False)),
+                loss_type=str(params.get("loss_type", "mse")),
+                # Forward RankNet-specific params (use defaults when absent)
+                rank_pos_quantile=float(params.get("rank_pos_quantile", 0.95)),
+                rank_neg_quantile=float(params.get("rank_neg_quantile", 0.80)),
+                rank_tau=float(params.get("rank_tau", 0.20)),
+                rank_weight_mode=str(params.get("rank_weight_mode", "return_diff_log_mad")),
+                rank_hard_neg_frac=float(params.get("rank_hard_neg_frac", 0.20)),
+                rank_hard_neg_score_quantile=float(params.get("rank_hard_neg_score_quantile", 0.90)),
+                rank_hard_neg_y_quantile=float(params.get("rank_hard_neg_y_quantile", 0.30)),
+                rank_hard_neg_mode=str(params.get("rank_hard_neg_mode", "score")),
+                rank_hard_neg_warmup_epochs=int(params.get("rank_hard_neg_warmup_epochs", 3)),
+                rank_tail_neg_frac=float(params.get("rank_tail_neg_frac", 0.10)),
+                early_stop_metric=str(params.get("early_stop_metric", "auto")),
+                pairs_per_pos=int(params.get("pairs_per_pos", 10)),
+                dates_per_batch=int(params.get("dates_per_batch", 8)),
+            )
             train_summary = train_torch_model(
                 model=model,
                 train_data=train_data,
                 valid_data=valid_data,
                 output_dir=output_dir / "models" / model_name,
-                config=TorchTrainConfig(
-                    epochs=int(params["epochs"]),
-                    patience=int(params.get("patience", config.torch_patience)),
-                    batch_size=config.torch_batch_size,
-                    learning_rate=float(params["lr"]),
-                    weight_decay=float(params["wd"]),
-                    device=config.torch_device,
-                    seed=config.seed,
-                    date_col=config.date_col,
-                ),
+                config=ttc,
             )
 
             # Save feature list alongside model for audit reproducibility
@@ -562,12 +725,25 @@ def _run_torch_models(
                 required_meta_cols=(config.date_col, config.stock_col),
             )
 
+            live_pred_df = generate_predictions(
+                model=model,
+                dataset=live_data,
+                model_name=model_name,
+                config=prediction_config,
+                required_meta_cols=(config.date_col, config.stock_col),
+            )
+
             prediction_paths = _save_prediction_outputs(
                 valid_pred_df=valid_pred_df,
                 test_pred_df=test_pred_df,
                 model_name=model_name,
                 output_dir=output_dir,
             )
+            live_path = save_predictions(
+                pred_df=live_pred_df,
+                output_path=output_dir / f"predictions_live_{model_name}.parquet",
+            )
+            prediction_paths["prediction_live_path"] = str(live_path)
 
             valid_eval = _evaluate_and_save_split(
                 pred_df=valid_pred_df,

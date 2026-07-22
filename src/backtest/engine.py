@@ -9,7 +9,6 @@ import pandas as pd
 import numpy as np
 
 from src.backtest.metrics import (
-    calculate_turnover,
     cumulative_nav,
     summarize_backtest,
 )
@@ -155,6 +154,50 @@ def _compute_period_return(
 
     return float((weights * aligned_returns).sum())
 
+
+def _rebalance_amounts(
+    target_weights: pd.Series,
+    pretrade_weights: pd.Series | None,
+) -> tuple[float, float, float]:
+    """Return buy, sell and reported one-way turnover fractions."""
+    target = target_weights.astype(float)
+    if pretrade_weights is None:
+        buy = float(target.clip(lower=0.0).sum())
+        return buy, 0.0, buy
+    previous = pretrade_weights.astype(float)
+    all_assets = target.index.union(previous.index)
+    delta = (
+        target.reindex(all_assets).fillna(0.0)
+        - previous.reindex(all_assets).fillna(0.0)
+    )
+    buy = float(delta.clip(lower=0.0).sum())
+    sell = float((-delta.clip(upper=0.0)).sum())
+    return buy, sell, 0.5 * (buy + sell)
+
+
+def _drift_weights(
+    target_weights: pd.Series,
+    next_returns: pd.Series,
+    signal_date: pd.Timestamp,
+    return_date: pd.Timestamp,
+) -> pd.Series:
+    """Mark target weights through the holding-period return."""
+    aligned = next_returns.reindex(target_weights.index).astype(float)
+    finite = np.isfinite(aligned.to_numpy())
+    if not finite.all():
+        stocks = list(aligned.index[~finite][:10])
+        raise ValueError(
+            "Missing/invalid next-period returns for selected stocks. "
+            f"signal_date={signal_date}, return_date={return_date}, stocks={stocks}"
+        )
+    marked = target_weights * (1.0 + aligned)
+    value = float(marked.sum())
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"Invalid portfolio value on {return_date}: {value}")
+    drifted = (marked / value).astype(float)
+    drifted.name = return_date
+    return drifted
+
 def run_backtest(
     pred_df: pd.DataFrame,
     returns_df: pd.DataFrame,
@@ -206,7 +249,9 @@ def run_backtest(
     weights_records: list[pd.Series] = []
     weight_dates: list[pd.Timestamp] = []
     turnover_values: dict[pd.Timestamp, float] = {}
+    cost_values: dict[pd.Timestamp, float] = {}
     signal_to_return: dict[pd.Timestamp, pd.Timestamp] = {}
+    end_weights_records: list[pd.Series] = []
 
     previous_weights: pd.Series | None = None
 
@@ -242,23 +287,28 @@ def run_backtest(
             return_date=return_date,
         )
 
-        if previous_weights is None:
-            turnover = 0.0
-        else:
-            turnover = calculate_turnover(
-                current_weights=weights,
-                previous_weights=previous_weights,
-            )
+        buy_amount, sell_amount, turnover = _rebalance_amounts(
+            target_weights=weights, pretrade_weights=previous_weights,
+        )
+        period_cost = (
+            buy_amount * cost_config.buy_cost + sell_amount * cost_config.sell_cost
+            if cost_config is not None else 0.0
+        )
+        end_weights = _drift_weights(
+            weights, next_returns, signal_date, return_date,
+        )
 
         period_returns[return_date] = period_return
         turnover_values[signal_date] = turnover
+        cost_values[return_date] = period_cost
         signal_to_return[signal_date] = return_date
 
         weights.name = signal_date
         weights_records.append(weights)
         weight_dates.append(signal_date)
+        end_weights_records.append(end_weights)
 
-        previous_weights = weights.copy()
+        previous_weights = end_weights
 
     if not period_returns:
         raise ValueError("No valid backtest periods were generated")
@@ -270,16 +320,13 @@ def run_backtest(
     daily_turnover.name = "turnover"
 
     if cost_config is not None:
-        avg_cost = 0.5 * (cost_config.buy_cost + cost_config.sell_cost)
-        turnover_by_return = pd.Series({
-            signal_to_return[sd]: tv
-            for sd, tv in turnover_values.items()
-        }).sort_index()
-        daily_returns = daily_returns_raw - turnover_by_return * avg_cost
+        cost_by_return = pd.Series(cost_values, dtype=float).sort_index()
+        daily_returns = daily_returns_raw - cost_by_return
         daily_returns.name = "strategy_return_net"
         result = {
             "daily_returns": daily_returns,
             "daily_returns_raw": daily_returns_raw,
+            "daily_costs": cost_by_return.rename("transaction_cost"),
         }
     else:
         daily_returns = daily_returns_raw
@@ -292,6 +339,11 @@ def run_backtest(
 
     daily_weights = pd.DataFrame(weights_records, index=weight_dates).sort_index()
     daily_weights.index.name = date_col
+    daily_end_weights = pd.DataFrame(
+        end_weights_records,
+        index=[signal_to_return[d] for d in weight_dates],
+    ).sort_index()
+    daily_end_weights.index.name = date_col
 
     summary = summarize_backtest(
         returns=daily_returns,
@@ -304,6 +356,7 @@ def run_backtest(
     result["summary"] = summary
     result["daily_nav"] = daily_nav
     result["daily_weights"] = daily_weights
+    result["daily_end_weights"] = daily_end_weights
     result["daily_turnover"] = daily_turnover
 
     return result

@@ -32,6 +32,7 @@ class BuiltDataset:
     X: np.ndarray
     y: np.ndarray
     meta: pd.DataFrame
+    industry_id: np.ndarray | None = None
 
 class PanelDatasetBuilder:
     """
@@ -211,6 +212,7 @@ class PanelDatasetBuilder:
         self,
         df: pd.DataFrame,
         output_meta_cols: Optional[Sequence[str]] = None,
+        require_target: bool = True,
     ) -> BuiltDataset:
         """
         Build a tabular dataset for models such as XGBoost and LightGBM.
@@ -233,7 +235,9 @@ class PanelDatasetBuilder:
         X_all = prepared[self.feature_cols].to_numpy(dtype=np.float32, copy = True)
         y_all = prepared[self.target_col].to_numpy(dtype=np.float32, copy = True).reshape(-1)
 
-        valid_mask = np.isfinite(X_all).all(axis=1) & np.isfinite(y_all)
+        valid_mask = np.isfinite(X_all).all(axis=1)
+        if require_target:
+            valid_mask &= np.isfinite(y_all)
 
         X = X_all[valid_mask]
         y = y_all[valid_mask]
@@ -253,6 +257,7 @@ class PanelDatasetBuilder:
         output_meta_cols: Optional[Sequence[str]] = None,
         end_filter_col: Optional[str] = None,
         end_filter_value: Optional[object] = None,
+        require_target: bool = True,
     ) -> BuiltDataset:
         """
         Build a sequence dataset for models such as DLinear, TSMixer, PatchTST,
@@ -313,10 +318,9 @@ class PanelDatasetBuilder:
             windows = windows.transpose(0, 2, 1)
             window_targets = targets[self.seq_len - 1:]
 
-            valid = (
-                np.isfinite(windows).all(axis=(1, 2))
-                & np.isfinite(window_targets)
-            )
+            valid = np.isfinite(windows).all(axis=(1, 2))
+            if require_target:
+                valid &= np.isfinite(window_targets)
 
             if end_filter_col is not None:
                 end_values = group[end_filter_col].to_numpy()[self.seq_len - 1:]
@@ -352,10 +356,9 @@ class PanelDatasetBuilder:
             windows = windows.transpose(0, 2, 1)
             window_targets = targets[self.seq_len - 1:]
 
-            valid = (
-                np.isfinite(windows).all(axis=(1, 2))
-                & np.isfinite(window_targets)
-            )
+            valid = np.isfinite(windows).all(axis=(1, 2))
+            if require_target:
+                valid &= np.isfinite(window_targets)
 
             if end_filter_col is not None:
                 end_values = group[end_filter_col].to_numpy()[self.seq_len - 1:]
@@ -376,7 +379,11 @@ class PanelDatasetBuilder:
 
         meta = pd.concat(meta_parts, ignore_index=True)
 
-        return BuiltDataset(X=X, y=y, meta=meta)
+        ind_id = None
+        if "industry_id" in meta.columns:
+            ind_id = np.array(meta.pop("industry_id").values, dtype=np.int64, copy=True)
+
+        return BuiltDataset(X=X, y=y, meta=meta, industry_id=ind_id)
         
     @staticmethod
     def _subset_built_dataset(dataset: BuiltDataset, mask: np.ndarray) -> BuiltDataset:

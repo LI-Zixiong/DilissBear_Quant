@@ -40,7 +40,6 @@ from sklearn.linear_model import RidgeCV
 from src.backtest.engine import TransactionCostConfig, run_backtest
 from src.backtest.metrics import prediction_ic_summary
 from src.backtest.portfolio import PortfolioConfig
-from src.experiment.returns import align_predictions_to_returns
 
 
 DEFAULT_MODELS = ("lightgbm", "dlinear")
@@ -217,6 +216,23 @@ def smooth_predictions(df: pd.DataFrame, model_cols: Iterable[str], window: int)
     return out.sort_values(["time", "stock_id"]).reset_index(drop=True)
 
 
+def smooth_predictions_with_history(
+    eval_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    model_cols: Iterable[str],
+    window: int,
+) -> pd.DataFrame:
+    """Smooth Test with earlier Valid rows, then retain Test rows only."""
+    if history_df is None or history_df.empty or window <= 1:
+        return smooth_predictions(eval_df, model_cols, window)
+    eval_keys = eval_df[["time", "stock_id"]].drop_duplicates()
+    combined = pd.concat([history_df, eval_df], ignore_index=True, sort=False)
+    combined = combined.drop_duplicates(["time", "stock_id"], keep="last")
+    return smooth_predictions(combined, model_cols, window).merge(
+        eval_keys, on=["time", "stock_id"], how="inner",
+    )
+
+
 def add_daily_model_ranks(df: pd.DataFrame, model_cols: Iterable[str]) -> pd.DataFrame:
     """Add daily cross-sectional percentile ranks for model prediction columns."""
     out = df.copy()
@@ -356,18 +372,10 @@ def backtest_score(
 ) -> dict:
     """Backtest score column using realized next-day return_1d."""
     pred = df[["time", "stock_id", score_col]].rename(columns={score_col: "y_pred"}).dropna()
-    aligned = align_predictions_to_returns(
-        pred_df=pred,
-        returns_df=returns,
-        date_col="time",
-        stock_col="stock_id",
-        pred_col="y_pred",
-        return_col="return_1d",
-    )
     if portfolio_config is None:
         portfolio_config = PortfolioConfig(strategy="top_n", top_n=top_n, pred_col="y_pred", stock_col="stock_id")
     return run_backtest(
-        pred_df=aligned,
+        pred_df=pred,
         returns_df=returns,
         portfolio_config=portfolio_config,
         return_col="return_1d",
@@ -499,7 +507,7 @@ def evaluate_single_models(
     rows: list[dict] = []
     for window in config.smooth_windows:
         valid_s = smooth_predictions(valid, config.models, window)
-        test_s = smooth_predictions(test, config.models, window)
+        test_s = smooth_predictions_with_history(test, valid, config.models, window)
         for model in config.models:
             score_col = f"_{model}_w{window}"
             valid_scored = valid_s.assign(**{score_col: valid_s[model]})
@@ -534,7 +542,7 @@ def evaluate_equal_weight(
     ew_weights = weights_to_str(tuple(1.0 / len(config.models) for _ in config.models), config.models)
     for window in config.smooth_windows:
         valid_s = smooth_predictions(valid, config.models, window)
-        test_s = smooth_predictions(test, config.models, window)
+        test_s = smooth_predictions_with_history(test, valid, config.models, window)
         valid_scored = add_equal_weight_score(valid_s, config.models, score_col, rank_space=rank_space)
         test_scored = add_equal_weight_score(test_s, config.models, score_col, rank_space=rank_space)
         rows.extend(
@@ -564,7 +572,7 @@ def evaluate_rank_ridge(
     for window in config.smooth_windows:
         print(f"      window={window}d: fitting RidgeCV on valid ranked predictions...")
         valid_s = smooth_predictions(valid, config.models, window)
-        test_s = smooth_predictions(test, config.models, window)
+        test_s = smooth_predictions_with_history(test, valid, config.models, window)
         weights, alpha, n_fit = fit_rank_ridge(valid_s, config.models, config.ridge_alphas)
         print(
             f"        alpha={alpha}, n_fit={n_fit:,}, "
@@ -607,7 +615,7 @@ def evaluate_ridge_raw(
     for window in config.smooth_windows:
         print(f"      window={window}d: fitting RidgeCV on valid raw predictions...")
         valid_s = smooth_predictions(valid, config.models, window)
-        test_s = smooth_predictions(test, config.models, window)
+        test_s = smooth_predictions_with_history(test, valid, config.models, window)
         weights, alpha, n_fit = fit_raw_ridge(valid_s, config.models, config.ridge_alphas)
         print(
             f"        alpha={alpha}, n_fit={n_fit:,}, "
@@ -650,7 +658,7 @@ def evaluate_fixed_weight_grid(
     counter = 0
     for window in config.smooth_windows:
         valid_s = smooth_predictions(valid, config.models, window)
-        test_s = smooth_predictions(test, config.models, window)
+        test_s = smooth_predictions_with_history(test, valid, config.models, window)
         for weights in config.grid_weights:
             counter += 1
             if len(weights) != len(config.models):
@@ -913,7 +921,9 @@ def main() -> None:
             print(f"\nBest Ridge variant: section={best_section}, window={best_window}d")
             print(f"  Weights: {best_weights_str}")
 
-            test_s = smooth_predictions(test, config.models, best_window)
+            test_s = smooth_predictions_with_history(
+                test, valid, config.models, best_window,
+            )
             if best_section == "rank_ridge":
                 weights, _, _ = fit_rank_ridge(
                     smooth_predictions(valid, config.models, best_window),

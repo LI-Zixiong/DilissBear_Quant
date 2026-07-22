@@ -29,6 +29,8 @@ class DLinearConfig:
     n_features: int = 12
     moving_avg_kernel: int = 25
     dropout: float = 0.1
+    n_industries: int = 0
+    ind_rank: int = 0
 
     def __post_init__(self) -> None:
         if self.moving_avg_kernel < 1:
@@ -118,6 +120,8 @@ class DLinearPanelRegressor(nn.Module):
         n_features: int,
         moving_avg_kernel: int = 25,
         dropout: float = 0.1,
+        n_industries: int = 0,
+        ind_rank: int = 0,
     ) -> None:
         super().__init__()
 
@@ -131,6 +135,16 @@ class DLinearPanelRegressor(nn.Module):
         self.trend_linear = nn.Linear(seq_len, 1)
 
         self.dropout = nn.Dropout(dropout)
+
+        # Low-rank industry-factor interaction.  industry_id is static per stock
+        # (not in the time series).  rank-4 embedding → per-factor modulation.
+        self.uses_industry_id = n_industries > 0 and ind_rank > 0
+        self.ind_embedding: nn.Embedding | None = None
+        self.ind_to_factor: nn.Linear | None = None
+        if self.uses_industry_id:
+            self.ind_embedding = nn.Embedding(n_industries, ind_rank)
+            self.ind_to_factor = nn.Linear(ind_rank, n_features, bias=False)
+            nn.init.zeros_(self.ind_to_factor.weight)  # start with no modulation
 
         # Then combine all factor-level predictions into one return prediction.
         self.feature_head = nn.Sequential(
@@ -161,12 +175,16 @@ class DLinearPanelRegressor(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, industry_id: torch.Tensor | None = None) -> torch.Tensor:
         """
         Parameters
         ----------
         x:
             Tensor with shape [B, L, C]
+        industry_id:
+            Optional long tensor [B] with per-sample industry index (0..n_ind-1).
+            When provided and ind_embedding is configured, applies low-rank
+            industry-factor modulation to per_feature_pred before the head.
 
         Returns
         -------
@@ -206,6 +224,13 @@ class DLinearPanelRegressor(nn.Module):
 
         per_feature_pred = self.dropout(per_feature_pred)
 
+        # Low-rank industry-factor interaction: each industry learns a rank-4
+        # embedding that modulates per-factor predictions before the head.
+        if self.ind_embedding is not None and industry_id is not None:
+            ind_emb = self.ind_embedding(industry_id)        # [B, rank]
+            factor_mod = self.ind_to_factor(ind_emb)          # [B, C]
+            per_feature_pred = per_feature_pred * (1.0 + factor_mod)
+
         # [B, C] -> [B, 1]
         pred = self.feature_head(per_feature_pred)
 
@@ -222,6 +247,8 @@ def build_dlinear_model(config: DLinearConfig) -> DLinearPanelRegressor:
         n_features=config.n_features,
         moving_avg_kernel=config.moving_avg_kernel,
         dropout=config.dropout,
+        n_industries=config.n_industries,
+        ind_rank=config.ind_rank,
     )
 
 

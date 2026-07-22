@@ -64,7 +64,7 @@ def _validate_prediction_frame(pred_df: pd.DataFrame, config: PortfolioConfig) -
     if pred_df[config.stock_col].duplicated().any():
         raise ValueError(f"{config.stock_col} contains duplicated stocks")
 
-    if config.strategy == "top_n":
+    if config.strategy != "equal_all":
         if config.pred_col not in pred_df.columns:
             raise ValueError(f"pred_df missing prediction column: {config.pred_col}")
 
@@ -203,7 +203,10 @@ def _build_bin_weighted_weights(pred_df: pd.DataFrame, config: PortfolioConfig) 
         else:
             weights[i] = config.bin_weights[2]
 
-    weights = weights / weights.sum()
+    total = weights.sum()
+    if total <= 0:
+        raise ValueError("bin_weighted produced zero investable weight")
+    weights = weights / total
     return pd.Series(weights, index=selected[config.stock_col],
                      name="weight", dtype=float)
 
@@ -246,7 +249,10 @@ def _build_bin_weighted_buffer_weights(
             weights[i] = config.bin_weights[1]
         else:
             weights[i] = config.bin_weights[2]
-    weights = weights / weights.sum()
+    total = weights.sum()
+    if total <= 0:
+        raise ValueError("bin_weighted_buffer produced zero investable weight")
+    weights = weights / total
     return pd.Series(weights, index=selected[config.stock_col].reset_index(drop=True),
                      name="weight", dtype=float)
 

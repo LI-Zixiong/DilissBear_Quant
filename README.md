@@ -1,35 +1,36 @@
 # JulongQuant · 巨龙量化
 
-A-share quantitative stock-selection research framework. Pipeline: factor data → model training → Bayes blending → account-level real backtest.
+A-share quantitative stock-selection research framework. Pipeline: factor data → 3-model training → EW rank 5d ensemble → account-level real backtest.
 
-> **V1** — 6/2026. Open-to-open execution, smart-hold, FF5 attribution. Sharpe 1.42 real, alpha 13.3%/yr after factor controls.
+> **V3 — 7/2026.** Three-model ensemble (LightGBM + DLinear + GatedDW-TCN), 5d causal smoothing, close-to-close execution. Real Sharpe 1.63, FF5 alpha 64.8%/yr.
 
-## Results (real backtest, 2024-03 ~ 2026-06)
+## Results (2024-04 ~ 2026-07, corrected engine)
 
-| | Sharpe | NAV | MaxDD | Notes |
-|---|---|---|---|---|
-| **Strategy (real)** | **1.42** | **2.03** | 14.8% | open-to-open, smart-hold, budget lots |
-| Strategy (paper) | 2.00 | 3.26 | 15.0% | close-to-close, continuous weights |
-| ZZ500 | — | 1.46 | — | benchmark |
-| ZZ1000 | — | 1.45 | — | benchmark |
+| | Sharpe | NAV | MaxDD | Turnover | Notes |
+|---|---|---|---|---|---|
+| **EW rank 5d (real)** | **1.63** | **2.43** | 16.4% | 10.7% | lots, limits, costs |
+| EW rank 5d (paper) | 1.76 | 3.05 | 18.4% | 15.1% | close-to-close, continuous |
+| Rank-Ridge 5d (paper) | 1.76 | 3.05 | 18.3% | 15.4% | RidgeCV weights |
+| Bayes LLR w=63 (real) | 1.50 | 2.05 | 15.1% | 13.8% | industry-conditional LLR |
+| ZZ500 | — | 1.62 | — | — | benchmark |
+| ZZ1000 | — | 1.60 | — | — | benchmark |
 
-**FF5 Alpha**: 13.3%/yr (t=2.69, Newey-West). Selection residual Sharpe **1.91**, market-neutral (corr -0.13).  
-See `reports/strategy_v1/V1_REPORT.md` for full attribution.
+**FF5 Alpha**: 64.8%/yr (t=3.62, Newey-West HAC). R² < 0.10 — pure stock-selection alpha, no factor loading.
 
 ## Stack
 
-Python 3.11, PyTorch, LightGBM, XGBoost. 6 models (LGBM, XGBoost, DLinear, iTransformer, PatchTST, GatedDW-TCN). Bayes V2 rolling-window ensemble. Account-based real backtest with integer lots, limit filters, and smart-hold.
+Python 3.11, PyTorch, LightGBM. 6 models in zoo (LGBM, XGBoost, DLinear, iTransformer, PatchTST, GatedDW-TCN). Production ensemble uses 3 models (LGBM, DLinear, GatedDW-TCN). Account-based real backtest with integer lots, limit filters, and smart-hold.
 
 ## Quick Start
 
 ```bash
 source .venv/Scripts/activate
 
-# Run real backtest (budget mode)
-python -m scripts.evaluation.real_backtest --position-sizing budget
+# Full evaluation (EW + Rank-Ridge + Bayes)
+python -m scripts.evaluation.run_full_eval --mode llr --run-kind full
 
-# Full evaluation sweep
-python -m scripts.evaluation.run_full_eval --mode full
+# Real backtest (Bayes + EW 5d comparison)
+python -m scripts.evaluation.run_full_eval --mode llr --run-kind real
 
 # FF5 attribution
 python temp/build_ff5_factors.py
@@ -40,8 +41,9 @@ python temp/ff5_attribution.py
 
 ```
 src/
-  backtest/     real_backtest (account engine), bayes_blender, ensemble, portfolio, metrics
+  backtest/     engine, portfolio, metrics, real_backtest, bayes_blender, ensemble
   models/       6 models (stable)
+  experiment/   config, data, returns, runner, evaluation
   pipeline/     base_panel, factor_panel
   utils/        seed, logger, stats (Newey-West)
 scripts/
@@ -52,7 +54,7 @@ dataset/
   input/        CSMAR, Tushare, indices (gitignored)
   processed/    unified_daily_panel, factor_panel, ff5_factors (gitignored)
 reports/
-  strategy_v1/  V1_REPORT.md, evidence/
+  strategy_v1/  evidence/, diagnostic reports
 ```
 
 ## License

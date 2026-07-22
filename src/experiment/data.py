@@ -28,6 +28,7 @@ class ExperimentData:
 
     raw_df: pd.DataFrame
     clean_df: pd.DataFrame
+    inference_df: pd.DataFrame
 
     train_df: pd.DataFrame
     valid_df: pd.DataFrame
@@ -92,6 +93,7 @@ def preprocess_experiment_data(
     raw_df: pd.DataFrame,
     config: ExperimentConfig,
     active_feature_cols: list[str] | None = None,
+    drop_missing_target: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Apply the standard panel preprocessing pipeline for experiments.
@@ -116,7 +118,7 @@ def preprocess_experiment_data(
         replace_inf_with_nan=True,
         drop_rows_with_missing_keys=True,
         drop_rows_with_missing_features=False,
-        drop_rows_with_missing_target=True,
+        drop_rows_with_missing_target=drop_missing_target,
         duplicate_policy="raise",
         sort_values=True,
     )
@@ -145,7 +147,35 @@ def _active_column_set(config: ExperimentConfig) -> set[str]:
         needed.add(config.return_col)
     if config.backtest_return_source:
         needed.add(config.backtest_return_source)
+    # Force-load columns destined for one-hot expansion so they survive
+    # column filtering even when excluded from per-model feature lists.
+    for model_name in config.model_names:
+        if config.one_hot_features and model_name in config.one_hot_features:
+            needed.update(config.one_hot_features[model_name])
     return needed
+
+
+def expand_onehot_columns(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    col: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    """One-hot encode a categorical column fit on train, applied to all splits.
+
+    Categories are inferred from *train* only (no leakage).  Missing /
+    unseen values safely produce an all-zero row.  uint8 keeps memory low.
+    """
+    cats = sorted(train_df[col].dropna().unique())
+    prefix = f"{col}_"
+    new_cols = [f"{prefix}{int(c)}" for c in cats]
+
+    for df in (train_df, valid_df, test_df):
+        for i, c in enumerate(cats):
+            df[new_cols[i]] = (df[col] == c).astype("uint8")
+        df.drop(columns=[col], inplace=True)
+
+    return train_df, valid_df, test_df, new_cols
 
 
 def prepare_experiment_data(config: ExperimentConfig) -> ExperimentData:
@@ -163,13 +193,29 @@ def prepare_experiment_data(config: ExperimentConfig) -> ExperimentData:
     active_cols = _active_column_set(config)
     available = [c for c in active_cols if c in raw_df.columns]
     active_factors = sorted(active_cols & set(config.feature_cols))
-    raw_df = raw_df[available].copy()
+    # Halve memory before any deep copy: float64 → float32 in-place
+    for col in raw_df.columns:
+        if raw_df[col].dtype == "float64":
+            raw_df[col] = raw_df[col].astype("float32")
 
-    clean_df, preprocess_report = preprocess_experiment_data(
+    raw_df = raw_df[available]
+
+    inference_df, preprocess_report = preprocess_experiment_data(
         raw_df=raw_df,
         config=config,
         active_feature_cols=active_factors,
+        drop_missing_target=False,
     )
+    missing_target = inference_df[config.target_col].isna()
+    clean_df = inference_df.loc[~missing_target].copy().reset_index(drop=True)
+    preprocess_report["dropped_missing_target_rows"] = int(missing_target.sum())
+    preprocess_report["output_rows"] = int(len(clean_df))
+
+    if config.end_date:
+        clean_df = clean_df[
+            clean_df[config.date_col] <= pd.Timestamp(config.end_date)
+        ].reset_index(drop=True)
+        preprocess_report["end_date_filtered_rows"] = int(len(clean_df))
 
     if config.date_boundaries is not None:
         train_df, valid_df, test_df, train_end, valid_end = split_panel_by_dates(
@@ -186,13 +232,18 @@ def prepare_experiment_data(config: ExperimentConfig) -> ExperimentData:
             date_col=config.date_col,
             stock_col=config.stock_col,
             split_ratio=config.split_ratio,
+            purge=config.purge_days,
         )
 
     config.train_end = train_end
     config.valid_end = valid_end
 
+    # Use inference_df (all dates, ret_daily intact) rather than clean_df
+    # (which loses the last ~5 dates when 5d label is still NaN).  The engine
+    # maps each signal T → return_date T+1, so even the latest signal dates
+    # need a valid return_1d that is already realized.
     returns_df = build_experiment_returns(
-        df=clean_df,
+        df=inference_df,
         date_col=config.date_col,
         stock_col=config.stock_col,
         return_col=config.return_col,
@@ -209,6 +260,7 @@ def prepare_experiment_data(config: ExperimentConfig) -> ExperimentData:
     return ExperimentData(
         raw_df=raw_df,
         clean_df=clean_df,
+        inference_df=inference_df,
         train_df=train_df,
         valid_df=valid_df,
         test_df=test_df,

@@ -1,18 +1,17 @@
 """
-Account-based real backtest engine for A-share open-to-open execution.
+Account-based real backtest engine for A-share close-close execution.
 
 Trading convention
 ------------------
 Signal date T close      : model / Bayes score is known after close.
-Entry date  T+1 open     : buy at open if the stock is tradable and not open limit-up.
-Target exit T+2 open     : attempt to sell at open. If the stock is not tradable or
-                           opens limit-down, carry the position and try again on the
-                           next trading day's open.
+Entry date  T close      : buy at close through post-market close-price trading.
+Target exit T+1 close    : attempt to sell at close. If the stock closes limit-down,
+                           carry the position and try again on the next trading day.
 
 Main differences from the quick daily-independent engine
 --------------------------------------------------------
 - True account simulation: cash, holdings, equity and delayed exits are tracked.
-- No stock-level future filter: a stock is not removed just because T+2 price is missing.
+- No stock-level future filter: a stock is not removed just because its exit price is missing.
 - Buy cash check includes buy commission.
 - Sell proceeds deduct sell commission + stamp tax.
 - Integer lots only.
@@ -20,7 +19,7 @@ Main differences from the quick daily-independent engine
 
 Required price_df columns
 -------------------------
-[time, stock_id, open, pre_close]
+[time, stock_id, close, pre_close]
 
 Optional price_df columns, used automatically if present
 --------------------------------------------------------
@@ -81,8 +80,8 @@ class RealBacktestConfig:
     position_sizing: str = "fixed"
     cash_ratio: float = 0.80  # fraction of post-sell cash to deploy (budget mode)
 
-    # Price column names. Keep open-to-open by default.
-    open_col: str = "open"
+    # Price column names. close-close execution via post-market close-price trading.
+    open_col: str = "close"
     pre_close_col: str = "pre_close"
 
     def __post_init__(self) -> None:
@@ -168,8 +167,8 @@ def _exact_limit_price(row: dict[str, Any], candidates: list[str]) -> float | No
     return None
 
 
-def _is_open_limit_up(row: dict[str, Any], stock_id: str, available_cols: set[str]) -> bool:
-    """Opened at limit-up, so buy is not assumed executable."""
+def _is_close_limit_up(row: dict[str, Any], stock_id: str, available_cols: set[str]) -> bool:
+    """Closed at limit-up, so buy at close is not executable."""
     open_px = row.get("open")
     pre_close = row.get("pre_close")
     if not _is_finite_positive(open_px) or not _is_finite_positive(pre_close):
@@ -185,8 +184,8 @@ def _is_open_limit_up(row: dict[str, Any], stock_id: str, available_cols: set[st
     return float(open_px) >= limit_price - 1e-3
 
 
-def _is_open_limit_down(row: dict[str, Any], stock_id: str, available_cols: set[str]) -> bool:
-    """Opened at limit-down, so sell is not assumed executable."""
+def _is_close_limit_down(row: dict[str, Any], stock_id: str, available_cols: set[str]) -> bool:
+    """Closed at limit-down, so sell at close is not executable."""
     open_px = row.get("open")
     pre_close = row.get("pre_close")
     if not _is_finite_positive(open_px) or not _is_finite_positive(pre_close):
@@ -427,7 +426,7 @@ def _build_buy_targets(
             row_["pre_close"] = r["pre_close"]
             if config.skip_suspended and _row_is_suspended(row_, price_cols):
                 return True
-            if config.block_limit_up_buy and _is_open_limit_up(row_, r["stock_id"], price_cols):
+            if config.block_limit_up_buy and _is_close_limit_up(row_, r["stock_id"], price_cols):
                 return True
             return False
 
@@ -484,7 +483,7 @@ def run_real_backtest(
     periods_per_year: int = 252,
 ) -> dict[str, Any]:
     """
-    Account-based real backtest: T close signal -> T+1 open buy -> T+2 open target sell.
+    Account-based real backtest: T signal → T close buy → T+1 close sell.
 
     Returns
     -------
@@ -510,21 +509,21 @@ def run_real_backtest(
         dd = pd.Timestamp(d)
         price_lookup[dd] = grp.set_index(stock_col).to_dict("index")
 
-    # Map each signal date T to entry date T+1 and target exit date T+2.
+    # Map each signal date T to entry date T (post-market close) and target exit T+1.
     entry_signals: dict[pd.Timestamp, list[tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame]]] = {}
     skipped_signal_dates = 0
     for signal_date, day_pred in pred.groupby(date_col, sort=True):
         signal_date = pd.Timestamp(signal_date)
         idx = date_to_idx.get(signal_date)
-        if idx is None or idx + 2 >= len(price_dates):
+        if idx is None or idx + 1 >= len(price_dates):
             skipped_signal_dates += 1
             continue
-        entry_date = price_dates[idx + 1]
-        target_exit_date = price_dates[idx + 2]
+        entry_date = price_dates[idx]       # T: post-market close-price execution
+        target_exit_date = price_dates[idx + 1]  # T+1 close
         entry_signals.setdefault(entry_date, []).append((signal_date, target_exit_date, day_pred.copy()))
 
     if not entry_signals:
-        raise ValueError("No valid signal dates can be mapped to T+1/T+2 trading dates")
+        raise ValueError("No valid signal dates can be mapped to T/T+1 trading dates")
 
     first_entry_date = min(entry_signals)
     first_entry_idx = date_to_idx[first_entry_date]
@@ -596,7 +595,7 @@ def run_real_backtest(
 
                 if delta_lots > 0:
                     # Need more: buy delta lots (buy slip applied)
-                    buy_slip = config.buy_slippage_bps.get(pos.get("bin", 2), 10) / 10000.0
+                    buy_slip = config.buy_slippage_bps.get(target.get("bin", 2), 10) / 10000.0
                     px = raw_px * (1.0 + buy_slip)
                     # Need more: buy delta lots at buy commission (万3)
                     delta_shares = delta_lots * config.lot_size
@@ -624,29 +623,47 @@ def run_real_backtest(
                         })
                 elif delta_lots < 0:
                     # Need fewer: sell excess (sell slip applied)
-                    sell_slip = config.sell_slippage_bps / 10000.0
-                    px = raw_px * (1.0 - sell_slip)
-                    excess_lots = -delta_lots
-                    excess_shares = excess_lots * config.lot_size
-                    gross_sell = excess_shares * px
-                    sell_fee = _commission(gross_sell, config) + gross_sell * config.stamp_tax_rate
-                    cash += gross_sell - sell_fee
-                    pos["shares"] -= excess_shares
-                    pos["lots"] -= excess_lots
-                    pos["entry_gross"] -= (excess_lots * config.lot_size * pos["entry_open"])
-                    n_sells += 1
-                    trade_log.append({
-                        "date": current_date, "action": "SELL",
-                        "position_id": pos["position_id"], "stock_id": sid,
-                        "shares": excess_shares, "lots": excess_lots,
-                        "price": px, "gross": gross_sell, "fee": sell_fee,
-                        "cash_after": cash,
-                        "signal_date": pos["signal_date"], "entry_date": pos["entry_date"],
-                        "target_exit_date": pos["target_exit_date"],
-                        "delayed_exit_days": pos.get("delayed_exit_days", 0),
-                        "realized_pnl": gross_sell - excess_lots * config.lot_size * pos["entry_open"] - pos["buy_fee"] * excess_lots / max(pos["lots"] + excess_lots, 1) - sell_fee,
-                        "return_on_gross": np.nan,
-                    })
+                    can_reduce = row is not None and _is_finite_positive(row.get("open"))
+                    if can_reduce and config.skip_suspended and _row_is_suspended(row, price_cols):
+                        can_reduce = False
+                    if can_reduce and config.block_limit_down_sell and _is_close_limit_down(row, sid, price_cols):
+                        can_reduce = False
+
+                    if not can_reduce:
+                        pos["delayed_exit_days"] = int(pos.get("delayed_exit_days", 0)) + 1
+                        n_blocked_sells += 1
+                    else:
+                        sell_slip = config.sell_slippage_bps / 10000.0
+                        px = raw_px * (1.0 - sell_slip)
+                        excess_lots = -delta_lots
+                        excess_shares = excess_lots * config.lot_size
+                        gross_sell = excess_shares * px
+                        sell_fee = _commission(gross_sell, config) + gross_sell * config.stamp_tax_rate
+                        old_shares = pos["shares"]
+                        fraction = excess_shares / old_shares
+                        allocated_entry = pos["entry_gross"] * fraction
+                        allocated_buy_fee = pos["buy_fee"] * fraction
+                        cash += gross_sell - sell_fee
+                        pos["shares"] -= excess_shares
+                        pos["lots"] -= excess_lots
+                        pos["entry_gross"] -= allocated_entry
+                        pos["buy_fee"] -= allocated_buy_fee
+                        n_sells += 1
+                        trade_log.append({
+                            "date": current_date, "action": "SELL",
+                            "position_id": pos["position_id"], "stock_id": sid,
+                            "shares": excess_shares, "lots": excess_lots,
+                            "price": px, "gross": gross_sell, "fee": sell_fee,
+                            "cash_after": cash,
+                            "signal_date": pos["signal_date"], "entry_date": pos["entry_date"],
+                            "target_exit_date": pos["target_exit_date"],
+                            "delayed_exit_days": pos.get("delayed_exit_days", 0),
+                            "realized_pnl": gross_sell - allocated_entry - allocated_buy_fee - sell_fee,
+                            "return_on_gross": (
+                                (gross_sell - allocated_entry - allocated_buy_fee - sell_fee) / allocated_entry
+                                if allocated_entry > 0 else np.nan
+                            ),
+                        })
 
                 # Extend exit date
                 pos["target_exit_date"] = target["target_exit_date"]
@@ -654,7 +671,8 @@ def run_real_backtest(
                 pos["score"] = target["score"]
                 pos["rank_pct"] = target["rank_pct"]
                 pos["bin"] = target["bin"]
-                pos["delayed_exit_days"] = 0
+                if delta_lots >= 0 or can_reduce:
+                    pos["delayed_exit_days"] = 0
                 still_holding.append(pos)
                 del buy_targets[sid]
                 continue
@@ -663,7 +681,7 @@ def run_real_backtest(
             can_sell = row is not None and _is_finite_positive(row.get("open"))
             if can_sell and config.skip_suspended and _row_is_suspended(row, price_cols):
                 can_sell = False
-            if can_sell and config.block_limit_down_sell and _is_open_limit_down(row, sid, price_cols):
+            if can_sell and config.block_limit_down_sell and _is_close_limit_down(row, sid, price_cols):
                 can_sell = False
 
             if not can_sell:
@@ -754,7 +772,7 @@ def run_real_backtest(
             next_position_id += 1
 
         # ------------------------------------------------------------------
-        # 3) Mark account equity at current open after sell/buy processing.
+        # 3) Mark account equity at current close after sell/buy processing.
         # ------------------------------------------------------------------
         market_value = 0.0
         for pos in positions:
@@ -894,8 +912,8 @@ if __name__ == "__main__":
     scores = normalize_keys(scores)
     print(f"  scores: {len(scores):,} rows, {scores['time'].nunique()} dates")
 
-    # Minimal columns. Add optional exact limit/suspension columns here if your panel has them.
-    price_cols = ["time", "stock_id", "open", "pre_close"]
+    # Minimal columns for close-close execution.
+    price_cols = ["time", "stock_id", "close", "pre_close"]
     panel_path = Path("dataset/processed/unified_daily_panel.parquet")
     prices = pd.read_parquet(panel_path, columns=price_cols)
     prices = normalize_keys(prices)
@@ -915,7 +933,7 @@ if __name__ == "__main__":
     result = run_real_backtest(scores, prices, config)
     s = result["summary"]
 
-    print("\n=== Account Real Backtest (T+1 open -> T+2 open target) ===")
+    print("\n=== Account Real Backtest (T signal → T close buy → T+1 close sell) ===")
     print(f"  Sharpe:             {s['sharpe_ratio']:.4f}")
     print(f"  NAV:                {s['final_nav']:.4f}")
     print(f"  Final equity:       {s['final_equity']:,.0f} CNY")

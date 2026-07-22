@@ -116,7 +116,9 @@ ALPHA_OTHER = 20.0
 
 @dataclass
 class BayesBlenderConfig:
-    models: Tuple[str, ...] = ("lightgbm", "xgboost", "dlinear", "gated_dwtcn")
+    # Frozen production model set.  XGBoost was removed after the ensemble
+    # marginal-contribution diagnosis.
+    models: Tuple[str, ...] = ("lightgbm", "dlinear", "gated_dwtcn")
 
     rolling_window: int = 63
 
@@ -163,12 +165,6 @@ class BayesBlenderConfig:
 
     # Manual per-model hierarchy weights used when auto_weights=False.
     model_weights: dict = field(default_factory=lambda: {
-        "xgboost": {
-            "strong":      (0.25, 0.20, 0.55),
-            "weak":        (0.40, 0.30, 0.30),
-            "small":       (0.55, 0.45, 0.00),
-            "global_only": (1.00, 0.00, 0.00),
-        },
         "dlinear": {
             "strong":      (0.25, 0.20, 0.55),
             "weak":        (0.40, 0.30, 0.30),
@@ -966,7 +962,10 @@ def apply_online_gate(
     ----------
     scores_detail:
         Output of build_bayes_scores(..., detailed=True).
-        Must have columns: time, stock_id, bayes_score, {m}_rank, {m}_llr_blended.
+        Must have columns: time, stock_id, bayes_score and
+        {m}_llr_blended.  Gate skill is measured from the same calibrated
+        per-model contribution that the gate later reweights; raw model ranks
+        are intentionally not used.
 
     returns_df:
         Backtest returns with columns time, stock_id, return_col.
@@ -995,6 +994,10 @@ def apply_online_gate(
         gate_history: per-date gate weights, excess returns, eta.
     """
     scores = scores_detail.copy()
+    if gate_burnin < 0:
+        raise ValueError(f"gate_burnin must be >= 0, got {gate_burnin}")
+    if reward_window <= 0:
+        raise ValueError(f"reward_window must be > 0, got {reward_window}")
     scores["time"] = pd.to_datetime(scores["time"])
     ret = returns_df.copy()
     ret["time"] = pd.to_datetime(ret["time"])
@@ -1006,56 +1009,102 @@ def apply_online_gate(
         if not models:
             raise ValueError("No {m}_llr_blended columns found in scores_detail.")
 
+    required_score_cols = {
+        "time", "stock_id", "bayes_score",
+        *(f"{m}_llr_blended" for m in models),
+    }
+    missing_score_cols = required_score_cols.difference(scores.columns)
+    if missing_score_cols:
+        raise ValueError(
+            f"scores_detail is missing columns: {sorted(missing_score_cols)}"
+        )
+    required_return_cols = {"time", "stock_id", return_col}
+    missing_return_cols = required_return_cols.difference(ret.columns)
+    if missing_return_cols:
+        raise ValueError(
+            f"returns_df is missing columns: {sorted(missing_return_cols)}"
+        )
+
     gate = OnlineExpertGate(models)
     all_dates = sorted(scores["time"].drop_duplicates())
     return_dates = sorted(ret["time"].drop_duplicates())
 
-    # Map signal date → next return date (same logic as engine)
+    # Map signal date -> first later realised-return date (same convention as
+    # the backtest engine).  The map is built once and never consults returns
+    # beyond the current signal date during the update loop.
+    return_date_array = np.asarray(return_dates, dtype="datetime64[ns]")
     next_ret: dict[pd.Timestamp, pd.Timestamp] = {}
     for d in all_dates:
-        future = [r for r in return_dates if r > d]
-        if future:
-            next_ret[d] = future[0]
+        j = int(np.searchsorted(return_date_array, np.datetime64(d), side="right"))
+        if j < len(return_date_array):
+            next_ret[d] = pd.Timestamp(return_date_array[j])
 
     gated_list: list[pd.DataFrame] = []
     gate_rows: list[dict] = []
     from collections import deque
     _daily_ret_buf: dict[str, deque[float]] = {m: deque(maxlen=reward_window) for m in models}
+    n_realized_days = 0
 
     for di, signal_date in enumerate(all_dates):
         day = scores[scores["time"] == signal_date].copy()
-        ret_date = next_ret.get(signal_date)
-        ret_day = ret[ret["time"] == ret_date] if ret_date is not None else None
 
-        # Compute per-model daily return from previous signal date.
-        # Use RAW rank (not Bayes contribution) to avoid feedback loop with
-        # auto_weights.  Gate judges model quality independently; Bayes
-        # contribution handles industry/bin calibration.
-        if di > 0 and ret_day is not None:
+        # Compute per-model daily return from the previous signal date.  Use
+        # each model's actual Layer-1 llr_blended contribution: this is the
+        # expert signal that enters the outer gate, so Gate and LLR modes differ
+        # only by the outer reweighting step.
+        if di > 0:
             prev_date = all_dates[di - 1]
+            realized_date = next_ret.get(prev_date)
+            # At signal_date close, only returns ending on or before
+            # signal_date are observable.  Never use next_ret[signal_date]
+            # here; that would feed T+1 performance into T's gate weights.
+            ret_day = (
+                ret[ret["time"] == realized_date]
+                if realized_date is not None and realized_date <= signal_date
+                else None
+            )
+        else:
+            ret_day = None
+
+        gate_excess = {m: 0.0 for m in models}
+        gate_eta = 0.0
+        if di > 0 and ret_day is not None:
             prev_day = scores[scores["time"] == prev_date]
             for m in models:
-                rank_col = f"{m}_rank"
-                if rank_col not in prev_day.columns:
-                    _daily_ret_buf[m].append(0.0)
-                    continue
-                top_ids = prev_day.nlargest(top_n, rank_col)["stock_id"].tolist()
+                contrib_col = f"{m}_llr_blended"
+                top_ids = prev_day.nlargest(top_n, contrib_col)["stock_id"].tolist()
                 top_rets = ret_day[ret_day["stock_id"].isin(top_ids)]
                 _daily_ret_buf[m].append(float(top_rets[return_col].mean()) if not top_rets.empty else 0.0)
 
-            # Feed rolling-mean return to gate once buffer is full.
-            if len(_daily_ret_buf[models[0]]) >= reward_window:
+            n_realized_days += 1
+            # Keep uniform weights during burn-in, then feed the rolling-mean
+            # realized return to the gate.
+            if (
+                n_realized_days >= gate_burnin
+                and len(_daily_ret_buf[models[0]]) >= reward_window
+            ):
                 smoothed_rets = {m: np.mean(buf) for m, buf in _daily_ret_buf.items()}
                 gate.update(smoothed_rets)
+                last_excess = gate._history[-1]["excess"]
+                gate_eta = float(gate._history[-1]["eta"])
+                gate_excess = {
+                    m: float(last_excess[mi]) for mi, m in enumerate(models)
+                }
 
-        # Build gated score = Σ w_m * S_m
+        # Build gated score.  Multiplying the probability weights by M makes
+        # uniform Gate exactly equal to the raw LLR sum (not merely rank-
+        # equivalent), which keeps burn-in and downstream score-weighted
+        # portfolio behaviour identical across the two modes.
         w = gate.weights()
         raw = day["bayes_score"].values if "bayes_score" in day.columns else np.zeros(len(day))
         gated = np.zeros(len(day), dtype=float)
         for m in models:
             contrib_col = f"{m}_llr_blended"
             if contrib_col in day.columns:
-                gated += float(w.get(m, 0.0)) * day[contrib_col].fillna(0.0).values
+                gated += (
+                    len(models) * float(w.get(m, 0.0))
+                    * day[contrib_col].fillna(0.0).values
+                )
 
         out = day[["time", "stock_id"]].copy()
         out["bayes_score"] = gated
@@ -1072,20 +1121,89 @@ def apply_online_gate(
         gate_rows.append({
             "time": signal_date,
             **{f"{m}_weight": float(w.get(m, 0.0)) for m in models},
-            **{f"{m}_contrib_ret": float(0.0) for m in models},  # filled below
+            **{f"{m}_contrib_ret": gate_excess[m] for m in models},
+            "eta": gate_eta,
         })
 
     gated_scores = pd.concat(gated_list, ignore_index=True) if gated_list else pd.DataFrame()
     gate_history = pd.DataFrame(gate_rows) if gate_rows else pd.DataFrame()
 
-    # Fill contrib_ret from gate history
-    if not gate_history.empty and gate._history:
-        for gi, h in enumerate(gate._history):
-            if gi + 1 < len(gate_history):
-                for mi, m in enumerate(models):
-                    gate_history.loc[gi + 1, f"{m}_contrib_ret"] = float(h["excess"][mi])
-
     return gated_scores, gate_history
+
+
+def build_fusion_scores(
+    merged_ranked: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    models: list[str],
+    mode: str = "llr",
+    config: BayesBlenderConfig | None = None,
+    eval_dates: set[pd.Timestamp] | set[np.datetime64] | None = None,
+    eval_burnin: int | None = None,
+    top_n: int = 50,
+    gate_burnin: int = 63,
+    reward_window: int = 1,
+    return_col: str = "return_1d",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the two diagnosis-controlled fusion paths from one Layer 1.
+
+    ``mode='llr'`` returns the direct sum of the three detailed
+    ``llr_blended`` contributions.  ``mode='gate'`` builds that exact same
+    Layer-1 result first and then applies :func:`apply_online_gate`.
+
+    Returns ``(scores, gate_history)``.  ``gate_history`` is empty in LLR mode.
+    Keeping the branch here, rather than in an evaluation-only runner, prevents
+    the two routes from silently drifting to different Bayes configurations.
+    """
+    if mode not in {"llr", "gate"}:
+        raise ValueError(f"mode must be 'llr' or 'gate', got {mode!r}")
+
+    cfg = config or BayesBlenderConfig(models=tuple(models))
+    if tuple(cfg.models) != tuple(models):
+        raise ValueError(
+            "config.models and models must match exactly: "
+            f"{tuple(cfg.models)!r} != {tuple(models)!r}"
+        )
+
+    detail = build_bayes_scores(
+        merged_ranked=merged_ranked,
+        models=models,
+        config=cfg,
+        eval_dates=eval_dates,
+        eval_burnin=eval_burnin,
+        detailed=True,
+    )
+
+    contrib_cols = [f"{m}_llr_blended" for m in models]
+    missing = [c for c in contrib_cols if c not in detail.columns]
+    if missing:
+        raise RuntimeError(f"Layer-1 output is missing contribution columns: {missing}")
+
+    raw_sum = detail[contrib_cols].fillna(0.0).sum(axis=1)
+    if "bayes_score" in detail.columns and not np.allclose(
+        detail["bayes_score"].to_numpy(dtype=float),
+        raw_sum.to_numpy(dtype=float),
+        rtol=1e-10,
+        atol=1e-12,
+        equal_nan=True,
+    ):
+        raise RuntimeError(
+            "Layer-1 bayes_score is not the sum of the per-model "
+            "llr_blended contributions"
+        )
+    detail["bayes_score"] = raw_sum
+
+    if mode == "llr":
+        return detail, pd.DataFrame()
+
+    return apply_online_gate(
+        scores_detail=detail,
+        returns_df=returns_df,
+        models=models,
+        top_n=top_n,
+        gate_burnin=gate_burnin,
+        reward_window=reward_window,
+        return_col=return_col,
+    )
 
 
 # ------------------------------------------------------------------

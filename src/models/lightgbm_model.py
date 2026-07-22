@@ -33,6 +33,9 @@ class LightGBMConfig:
     metric: str = 'rmse'
     early_stopping_rounds: Optional[int] = 50
     verbose_eval: bool = False
+    categorical_feature: list[int] | None = None
+    cat_smooth: float = 10.0
+    cat_l2: float = 10.0
 
     def __post_init__(self) -> None:
         if self.n_estimators < 1:
@@ -206,18 +209,28 @@ class LightGBMReturnRegressor:
                     )
                 )
 
+            fit_kwargs = {}
+            if self.config.categorical_feature is not None:
+                fit_kwargs["categorical_feature"] = self.config.categorical_feature
+
             self.model.fit(
                 X_train,
                 y_train,
                 eval_set=[(X_valid, y_valid)],
                 eval_metric=self.config.metric,
                 callbacks=callbacks,
+                **fit_kwargs,
             )
         else:
+            fit_kwargs = {}
+            if self.config.categorical_feature is not None:
+                fit_kwargs["categorical_feature"] = self.config.categorical_feature
+
             self.model.fit(
                 X_train,
                 y_train,
                 callbacks=callbacks,
+                **fit_kwargs,
             )
 
         self._is_fitted = True
