@@ -107,10 +107,9 @@ def _load_prediction_split(cfg: EvalConfig, split: str) -> pd.DataFrame:
         else:
             merged = merged.merge(df, on=["time", "stock_id"], how="inner")
     # Signal-day limit-up is known at T and blocks the post-close buy.
-    if "limit_status" in merged.columns:
-        merged = merged[
-            merged["limit_status"].ne(1) | merged["limit_status"].isna()
-        ]
+    # Do not remove limit-up names here. Selection must happen first; the
+    # account executor then records a blocked buy instead of backfilling with a
+    # lower-ranked stock.
     return merged.sort_values(["time", "stock_id"]).reset_index(drop=True)
 
 
@@ -128,10 +127,6 @@ def _load_valid_predictions(cfg: EvalConfig) -> pd.DataFrame:
             merged = df
         else:
             merged = merged.merge(df[["time", "stock_id", m]], on=["time", "stock_id"], how="inner")
-    if "limit_status" in merged.columns:
-        merged = merged[
-            merged["limit_status"].ne(1) | merged["limit_status"].isna()
-        ]
     return merged.sort_values(["time", "stock_id"]).reset_index(drop=True)
 
 
@@ -162,7 +157,11 @@ def _load_returns_and_prices(cfg: EvalConfig) -> tuple[pd.DataFrame, pd.DataFram
     panel = normalize_keys(panel)
 
     # Prices from unified daily panel
-    prices = panel[["time", "stock_id", "close", "pre_close"]].copy()
+    optional = ["up_limit", "high_limit", "limit_up_price", "down_limit", "low_limit",
+                "limit_down_price", "is_paused", "paused", "suspend", "suspended",
+                "is_suspended", "trade_status", "is_st", "st", "risk_warning"]
+    prices = panel[["time", "stock_id", "close", "pre_close"]
+                   + [c for c in optional if c in panel.columns]].copy()
     prices[["close", "pre_close"]] = prices[["close", "pre_close"]].astype(float)
 
     # Returns from factor panel (close-to-close)
@@ -179,7 +178,12 @@ def _load_industry(cfg: EvalConfig) -> pd.DataFrame:
 
 def _load_prices(cfg: EvalConfig) -> pd.DataFrame:
     """Load close/pre_close for real backtest (close-close execution)."""
-    prices = pd.read_parquet(cfg.returns_path, columns=["time", "stock_id", "close", "pre_close"])
+    prices = pd.read_parquet(cfg.returns_path)
+    optional = ["up_limit", "high_limit", "limit_up_price", "down_limit", "low_limit",
+                "limit_down_price", "is_paused", "paused", "suspend", "suspended",
+                "is_suspended", "trade_status", "is_st", "st", "risk_warning"]
+    prices = prices[["time", "stock_id", "close", "pre_close"]
+                    + [c for c in optional if c in prices.columns]]
     prices = normalize_keys(prices)
     prices[["close", "pre_close"]] = prices[["close", "pre_close"]].astype(float)
     return prices
@@ -446,8 +450,10 @@ def main() -> None:
         print(f"\n[3/3] Real backtest (T close to T+1 close, lots, limits) ...")
         rb_config = RealBacktestConfig(
             capital=cfg.real_capital,
-            bin_lots=(0, 1, 2),
+            position_sizing="budget",
+            cash_ratio=0.80,
             max_stocks=cfg.top_n,
+            min_commission=5.0,
         )
 
         # ── Bayes LLR real ──

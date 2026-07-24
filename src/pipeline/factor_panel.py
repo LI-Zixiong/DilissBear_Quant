@@ -629,6 +629,7 @@ def compute_factor_columns(
     config: FactorPanelConfig,
     factor_names: Sequence[str],
     shared_cache: dict[str, Any] | None = None,
+    target_dates: pd.DatetimeIndex | None = None,
 ) -> pd.DataFrame:
     """
     Compute selected factor columns.
@@ -636,8 +637,11 @@ def compute_factor_columns(
     The public signature is preserved; shared_cache is an internal optional
     cache used by full historical computation to avoid recomputing large shared
     tables across adjacent batches.
-    """
 
+    *target_dates*, when provided (live/incremental mode), restrict
+    cross-sectional winsorize/z-score to only those dates, significantly
+    reducing the cost of daily updates.
+    """
     if shared_cache is None:
         shared_cache = {}
 
@@ -766,7 +770,7 @@ def compute_factor_columns(
 
     for start in range(0, len(factor_names), 10):
         batch = list(factor_names[start:start + 10])
-        df = winsorize_zscore(df=df, factor_names=batch, config=config)
+        df = winsorize_zscore(df=df, factor_names=batch, config=config, target_dates=target_dates)
         drop_cols = [
             c for c in df.columns
             if any(c == f"{f}_w" or (c == f"{f}_raw" and not config.save_raw_factors) for f in batch)
@@ -2075,16 +2079,25 @@ def winsorize_zscore(
     df: pd.DataFrame,
     factor_names: list[str],
     config: FactorPanelConfig,
+    target_dates: pd.DatetimeIndex | None = None,
 ) -> pd.DataFrame:
     """
     Cross-sectional winsorize and z-score.
 
     Optional industry neutralization is supported but off by default.
+
+    When *target_dates* is provided (live/incremental mode), only those dates
+    receive cross-sectional quantile winsorizing and z-score; tail rows
+    outside *target_dates* are left as-is, saving significant time.
     """
 
     neutralize_set = set(config.neutralize_factors)
-
     categorical_factors = {"F055IND"}
+    dates_col = config.date_col
+
+    if target_dates is not None and len(target_dates) == 0:
+        return df
+    live_mode = target_dates is not None
 
     for name in factor_names:
         raw_col = f"{name}_raw"
@@ -2097,39 +2110,49 @@ def winsorize_zscore(
             df[name] = df[raw_col]
             continue
 
-        lower = df.groupby(config.date_col)[raw_col].transform(
+        work = df[[dates_col, raw_col]].copy()
+        work["_idx"] = np.arange(len(work))
+        if live_mode:
+            live_mask = work[dates_col].isin(target_dates)
+            if not live_mask.any():
+                continue
+
+        lower = work.groupby(dates_col)[raw_col].transform(
             lambda x: x.quantile(config.winsorize_lower)
         )
-        upper = df.groupby(config.date_col)[raw_col].transform(
+        upper = work.groupby(dates_col)[raw_col].transform(
             lambda x: x.quantile(config.winsorize_upper)
         )
-
         w_col = f"{name}_w"
-        df[w_col] = df[raw_col].clip(lower, upper)
+        work["_w"] = work[raw_col].clip(lower, upper)
 
         if (
             config.industry_col
             and config.industry_col in df.columns
             and name in neutralize_set
         ):
-            has_industry = df[config.industry_col].notna()
+            has_industry = df[config.industry_col].notna().values
             if has_industry.any():
-                neutralized = df[w_col].copy()
-
-                group_keys = [config.date_col, config.industry_col]
-                mu_ind = df.loc[has_industry].groupby(group_keys)[w_col].transform("mean")
-                sd_ind = df.loc[has_industry].groupby(group_keys)[w_col].transform("std")
-
-                neutralized.loc[has_industry] = (
-                    df.loc[has_industry, w_col] - mu_ind
+                group_keys = [dates_col, config.industry_col]
+                work["_ind"] = df.loc[has_industry, config.industry_col]
+                mu_ind = work.loc[has_industry].groupby(group_keys)["_w"].transform("mean")
+                sd_ind = work.loc[has_industry].groupby(group_keys)["_w"].transform("std")
+                work.loc[has_industry, "_w"] = (
+                    work.loc[has_industry, "_w"] - mu_ind
                 ) / sd_ind.where(sd_ind > 1e-10, 1.0)
 
-                df[w_col] = neutralized
+        mu = work.groupby(dates_col)["_w"].transform("mean")
+        sd = work.groupby(dates_col)["_w"].transform("std")
+        z = (work["_w"] - mu) / sd.where(sd > 1e-10, 1.0)
+        z = z.fillna(0.0)
 
-        mu = df.groupby(config.date_col)[w_col].transform("mean")
-        sd = df.groupby(config.date_col)[w_col].transform("std")
-        df[name] = (df[w_col] - mu) / sd.where(sd > 1e-10, 1.0)
-        df[name] = df[name].fillna(0.0)
+        if live_mode:
+            df.loc[live_mask, raw_col] = work.loc[live_mask, raw_col]  # winsorized raw
+            df.loc[live_mask, w_col] = work.loc[live_mask, "_w"]
+            df.loc[live_mask, name] = z.loc[live_mask]
+        else:
+            df[w_col] = work["_w"]
+            df[name] = z
 
     return df
 

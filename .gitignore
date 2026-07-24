@@ -281,6 +281,12 @@ backup/
 # Markdown documents (design docs)
 mds/
 
+# Website assets (local only)
+website/
+
+# Live store cache (generated data)
+dataset/cache/
+
 # Misc
 ind.txt
 *.pt

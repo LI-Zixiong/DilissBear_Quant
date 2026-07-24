@@ -65,8 +65,8 @@ class RealBacktestConfig:
     pred_col: str = "bayes_score"
 
     # Rank-aware slippage (bps). Bin3 signals are most crowded → highest buy slip.
-    buy_slippage_bps: dict[int, float] | None = None  # {bin: bps}, e.g. {1:5,2:10,3:15}
-    sell_slippage_bps: float = 3.0  # uniform sell slip in basis points
+    buy_slippage_bps: dict[int, float] | None = None  # {bin: bps}, default 0 (post-close trading at close price)
+    sell_slippage_bps: float = 0.0  # uniform sell slip, default 0 (post-close trading at close price)
 
     # Trading realism switches
     block_limit_up_buy: bool = True
@@ -75,10 +75,12 @@ class RealBacktestConfig:
     allow_duplicate_position: bool = False
 
     # Position sizing mode
-    # "fixed": bin_lots slots per stock (price-distorted, simple)
-    # "budget": bin-weighted cash budget → per-stock target → round lots (price-fair)
-    position_sizing: str = "fixed"
-    cash_ratio: float = 0.80  # fraction of post-sell cash to deploy (budget mode)
+    # Production logic: deploy 80% of pre-trade total assets across Top50,
+    # with elite stocks receiving 2x the per-stock budget of strong stocks.
+    # "fixed" is retained only for reproducing the earlier fixed-lot experiment.
+    position_sizing: str = "budget"
+    cash_ratio: float = 0.80
+    start_date: str | pd.Timestamp | None = None
 
     # Price column names. close-close execution via post-market close-price trading.
     open_col: str = "close"
@@ -104,7 +106,7 @@ class RealBacktestConfig:
         if not (0.0 < self.cash_ratio <= 1.0):
             raise ValueError(f"cash_ratio must be in (0, 1], got {self.cash_ratio}")
         if self.buy_slippage_bps is None:
-            self.buy_slippage_bps = {1: 3, 2: 5, 3: 8}
+            self.buy_slippage_bps = {1: 0, 2: 0, 3: 0}
 
 
 def _is_finite_positive(x: Any) -> bool:
@@ -280,11 +282,11 @@ def _allocate_by_budget(
     Budget-based lot allocation across bin2 + bin3.
 
     Algorithm:
-      1. budget = available_cash * cash_ratio
-      2. bin_budget = budget * (n_stocks_in_bin * bin_weight) / sum(all bins)
-      3. per_stock_budget = bin_budget / n_stocks_in_bin
+      1. budget = pre-trade total assets * cash_ratio
+      2. one budget unit = budget / (2 * elite_count + strong_count)
+      3. elite gets 2 units per stock; strong gets 1 unit per stock
       4. lots = round(per_stock_budget / (price * lot_size))
-      5. If total cost > bin_budget, skip lowest-ranked stocks.
+      5. If rounded total cost exceeds budget, remove lowest ranks first.
 
     Returns (position_dicts, total_spent).
     """
@@ -302,27 +304,19 @@ def _allocate_by_budget(
     if not bin_groups:
         return [], 0.0
 
-    # Compute bin-level budgets
+    # One common budget unit: strong=1 unit per stock, elite=2 units per stock.
     bin_total_weight = sum(
         len(grp) * _BUDGET_BIN_WEIGHTS[bi] for bi, grp in bin_groups.items()
     )
-    bin_budgets: dict[int, float] = {}
-    for bi, grp in bin_groups.items():
-        bin_budgets[bi] = budget * (len(grp) * _BUDGET_BIN_WEIGHTS[bi]) / bin_total_weight
-
-    positions_out: list[dict[str, Any]] = []
-    total_spent = 0.0
+    budget_per_unit = budget / bin_total_weight
     lot_size = config.lot_size
 
-    for bi in [3, 2]:  # bin3 first (higher priority)
-        if bi not in bin_groups:
+    stock_plans = []
+    for bi in [3, 2]:
+        grp = bin_groups.get(bi)
+        if grp is None:
             continue
-        grp = bin_groups[bi]
-        n_stocks = len(grp)
-        per_stock = bin_budgets[bi] / n_stocks
-
-        # Compute target lots for each stock (round to nearest integer)
-        stock_plans = []
+        per_stock = budget_per_unit * _BUDGET_BIN_WEIGHTS[bi]
         slip_bps = config.buy_slippage_bps.get(bi, 0)
         slip_rate = slip_bps / 10000.0
         for _, row in grp.iterrows():
@@ -345,20 +339,15 @@ def _allocate_by_budget(
                 "buy_fee": _commission(entry_gross, config),
             })
 
-        # Sort by score desc; skip lowest-ranked if overspent
-        stock_plans.sort(key=lambda x: x["score"], reverse=True)
-        bin_spent = 0.0
-        bin_positions = []
-        for plan in stock_plans:
-            if bin_spent + plan["entry_gross"] > bin_budgets[bi] + 1e-9:
-                continue  # skip lowest-ranked
-            bin_spent += plan["entry_gross"]
-            bin_positions.append(plan)
+    # Rounding can push the plan above 80%.  Preserve the highest-ranked prefix
+    # and remove the lowest-ranked name until the gross plan fits the budget.
+    stock_plans.sort(key=lambda x: x["score"], reverse=True)
+    total_spent = sum(plan["entry_gross"] for plan in stock_plans)
+    while stock_plans and total_spent > budget + 1e-9:
+        removed = stock_plans.pop()
+        total_spent -= removed["entry_gross"]
 
-        positions_out.extend(bin_positions)
-        total_spent += bin_spent
-
-    return positions_out, total_spent
+    return stock_plans, total_spent
 
 
 def _build_buy_targets(
@@ -391,19 +380,25 @@ def _build_buy_targets(
     n_filtered = 0
 
     for signal_date, target_exit_date, day_pred in entry_signals.get(current_date, []):
+        ranked = day_pred[[stock_col, config.pred_col]].copy()
+        ranked["rank_pct"] = ranked[config.pred_col].rank(pct=True)
+        ranked = ranked.sort_values(config.pred_col, ascending=False).head(config.max_stocks)
         rows = []
-        for _, pred_row in day_pred.iterrows():
+        for _, pred_row in ranked.iterrows():
             sid = pred_row[stock_col]
             row = today_px.get(sid)
             if row is None:
+                n_filtered += 1
                 continue
             open_px = row.get("open")
             pre_close = row.get("pre_close")
             if not _is_finite_positive(open_px) or not _is_finite_positive(pre_close):
+                n_filtered += 1
                 continue
             rows.append({
                 "stock_id": sid,
                 "score": float(pred_row[config.pred_col]),
+                "rank_pct": float(pred_row["rank_pct"]),
                 "open": float(open_px),
                 "pre_close": float(pre_close),
                 "raw_price_row": row,
@@ -417,8 +412,6 @@ def _build_buy_targets(
             subset=["stock_id", "score", "open", "pre_close"])
         if stocks_df.empty:
             continue
-
-        stocks_df["rank_pct"] = stocks_df["score"].rank(pct=True)
 
         def _buy_blocked(r: pd.Series) -> bool:
             row_ = dict(r["raw_price_row"])
@@ -499,8 +492,12 @@ def run_real_backtest(
     prices, price_cols = _clean_price_frame(price_df, date_col, stock_col, config)
 
     price_dates = [pd.Timestamp(d) for d in np.sort(prices[date_col].dropna().unique())]
-    if len(price_dates) < 3:
-        raise ValueError("price_df must contain at least 3 trading dates")
+    if config.start_date is not None:
+        start = pd.Timestamp(config.start_date).normalize()
+        price_dates = [d for d in price_dates if d >= start]
+        pred = pred[pred[date_col] >= start].copy()
+    if not price_dates:
+        raise ValueError("price_df contains no trading dates on or after start_date")
     date_to_idx = {d: i for i, d in enumerate(price_dates)}
 
     # Price lookup: {date: {stock_id: row_dict}}
@@ -515,11 +512,15 @@ def run_real_backtest(
     for signal_date, day_pred in pred.groupby(date_col, sort=True):
         signal_date = pd.Timestamp(signal_date)
         idx = date_to_idx.get(signal_date)
-        if idx is None or idx + 1 >= len(price_dates):
+        if idx is None:
             skipped_signal_dates += 1
             continue
         entry_date = price_dates[idx]       # T: post-market close-price execution
-        target_exit_date = price_dates[idx + 1]  # T+1 close
+        # The latest signal must still create today's actual holding.  Its T+1
+        # date is unknown until the next market update, so keep it open with
+        # NaT; the deterministic replay will map it to the real next trading
+        # date as soon as that date exists.
+        target_exit_date = price_dates[idx + 1] if idx + 1 < len(price_dates) else pd.NaT
         entry_signals.setdefault(entry_date, []).append((signal_date, target_exit_date, day_pred.copy()))
 
     if not entry_signals:
@@ -576,7 +577,8 @@ def run_real_backtest(
 
         for pos in positions:
             sid = pos["stock_id"]
-            due_to_sell = current_date >= pos["target_exit_date"]
+            target_exit = pos["target_exit_date"]
+            due_to_sell = pd.notna(target_exit) and current_date >= target_exit
             row = today_px.get(sid)
 
             if row is not None and _is_finite_positive(row.get("open")):
@@ -608,6 +610,7 @@ def run_real_backtest(
                         pos["entry_gross"] += delta_gross
                         pos["buy_fee"] += delta_fee
                         pos["entry_open"] = (pos["entry_open"] * (pos["lots"] - delta_lots) + px * delta_lots) / pos["lots"] if pos["lots"] > 0 else px
+                        pos["last_buy_date"] = current_date
                         n_buys += 1
                         capital_used_today += delta_gross
                         trade_log.append({
@@ -744,6 +747,7 @@ def run_real_backtest(
                 "buy_fee": buy_fee,
                 "signal_date": target["signal_date"],
                 "entry_date": current_date,
+                "last_buy_date": current_date,
                 "target_exit_date": target["target_exit_date"],
                 "score": target["score"],
                 "rank_pct": target["rank_pct"],
@@ -793,9 +797,17 @@ def run_real_backtest(
                 "shares": pos["shares"],
                 "lots": pos["lots"],
                 "entry_date": pos["entry_date"],
+                "last_buy_date": pos.get("last_buy_date", pos["entry_date"]),
                 "target_exit_date": pos["target_exit_date"],
                 "last_price": mark_price,
                 "market_value": pos["shares"] * mark_price,
+                "avg_cost": ((pos["entry_gross"] + pos["buy_fee"]) / pos["shares"]
+                             if pos["shares"] > 0 else np.nan),
+                "unrealized_pnl": (pos["shares"] * mark_price
+                                   - pos["entry_gross"] - pos["buy_fee"]),
+                "score": pos.get("score"),
+                "rank_pct": pos.get("rank_pct"),
+                "selected_today": pos.get("signal_date") == current_date,
                 "delayed_exit_days": pos.get("delayed_exit_days", 0),
             })
 
@@ -868,6 +880,10 @@ def run_real_backtest(
     position_snapshots_df = pd.DataFrame(position_snapshots)
     if not position_snapshots_df.empty:
         position_snapshots_df = position_snapshots_df.sort_values(["date", "position_id"]).reset_index(drop=True)
+        totals = position_snapshots_df.groupby("date")["market_value"].transform("sum")
+        position_snapshots_df["weight"] = np.where(
+            totals > 0, position_snapshots_df["market_value"] / totals, 0.0
+        )
 
     return {
         "daily_returns": daily_returns,
@@ -922,7 +938,8 @@ if __name__ == "__main__":
 
     config = RealBacktestConfig(
         capital=200_000,
-        bin_lots=(0, 1, 2),
+        position_sizing="budget",
+        cash_ratio=0.80,
         max_stocks=50,
         commission_rate=0.0003,
         stamp_tax_rate=0.0005,
