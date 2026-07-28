@@ -35,8 +35,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import RidgeCV
-
 from src.backtest.engine import TransactionCostConfig, run_backtest
 from src.backtest.metrics import prediction_ic_summary
 from src.backtest.portfolio import PortfolioConfig
@@ -281,6 +279,8 @@ def fit_rank_ridge(valid_df: pd.DataFrame, model_cols: Iterable[str], alphas: It
     if fit_df.empty:
         raise ValueError("No valid rows to fit Rank-Ridge after rank/dropna.")
 
+    from sklearn.linear_model import RidgeCV
+
     ridge = RidgeCV(alphas=list(alphas), fit_intercept=False)
     ridge.fit(fit_df[rank_cols].to_numpy(), fit_df["y_true_r"].to_numpy())
 
@@ -316,6 +316,8 @@ def fit_raw_ridge(valid_df: pd.DataFrame, model_cols: Iterable[str], alphas: Ite
     fit_df = valid_df.dropna(subset=fit_cols)
     if fit_df.empty:
         raise ValueError("No valid rows to fit Raw-Ridge after dropna.")
+
+    from sklearn.linear_model import RidgeCV
 
     ridge = RidgeCV(alphas=list(alphas), fit_intercept=True)
     ridge.fit(fit_df[cols].to_numpy(), fit_df["y_true"].to_numpy())

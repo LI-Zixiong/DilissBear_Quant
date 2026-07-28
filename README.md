@@ -1,60 +1,73 @@
 # JulongQuant · 巨龙量化
 
-A-share quantitative stock-selection research framework. Pipeline: factor data → 3-model training → EW rank 5d ensemble → account-level real backtest.
+A-share quantitative stock-selection research framework. Pipeline: factor data → 3-model training → EW rank 10d ensemble → account-level real backtest → live daily trading.
 
-> **V3 — 7/2026.** Three-model ensemble (LightGBM + DLinear + GatedDW-TCN), 5d causal smoothing, close-to-close execution. Real Sharpe 1.63, FF5 alpha 64.8%/yr.
+> **V3.1 — 7/2026.** 10d causal smoothing, close-to-close execution, fixed buffer + regime defense, budget position sizing (98% deployment). Official ZZ1500 benchmark (ZZ500+ZZ1000 6:5 market-cap weighted).
 
-## Results (2024-04 ~ 2026-07, corrected engine)
+## Results (2022-01 ~ 2026-07, corrected engine)
 
-| | Sharpe | NAV | MaxDD | Turnover | Notes |
-|---|---|---|---|---|---|
-| **EW rank 5d (real)** | **1.63** | **2.43** | 16.4% | 10.7% | lots, limits, costs |
-| EW rank 5d (paper) | 1.76 | 3.05 | 18.4% | 15.1% | close-to-close, continuous |
-| Rank-Ridge 5d (paper) | 1.76 | 3.05 | 18.3% | 15.4% | RidgeCV weights |
-| Bayes LLR w=63 (real) | 1.50 | 2.05 | 15.1% | 13.8% | industry-conditional LLR |
-| ZZ500 | — | 1.62 | — | — | benchmark |
-| ZZ1000 | — | 1.60 | — | — | benchmark |
+| Strategy | Sharpe | NAV | MaxDD | Turnover | Notes |
+|---|---:|---:|---:|---:|---|
+| **s1 (buf50 baseline)** | **1.16** | **3.90** | 42.1% | 8.8% | fixed buffer, no defense |
+| **s2 (buf120 + Bear20%)** | **1.36** | **4.34** | 20.7% | 8.6% | buffer + regime defense |
+| ZZ1500 (official) | 0.26 | 1.16 | 40.4% | — | ZZ500+ZZ1000 6:5 cap-weighted |
 
-**FF5 Alpha**: 64.8%/yr (t=3.62, Newey-West HAC). R² < 0.10 — pure stock-selection alpha, no factor loading.
-
-## Stack
-
-Python 3.11, PyTorch, LightGBM. 6 models in zoo (LGBM, XGBoost, DLinear, iTransformer, PatchTST, GatedDW-TCN). Production ensemble uses 3 models (LGBM, DLinear, GatedDW-TCN). Account-based real backtest with integer lots, limit filters, and smart-hold.
-
-## Quick Start
+## Live Trading
 
 ```bash
 source .venv/Scripts/activate
 
-# Full evaluation (EW + Rank-Ridge + Bayes)
-python -m scripts.evaluation.run_full_eval --mode llr --run-kind full
+# Daily pipeline
+python -m scripts.dataset.live_pipeline --project-root D:\JulongQuant
 
-# Real backtest (Bayes + EW 5d comparison)
+# Strategy evaluation (test period only)
 python -m scripts.evaluation.run_full_eval --mode llr --run-kind real
 
-# FF5 attribution
-python temp/build_ff5_factors.py
-python temp/ff5_attribution.py
+# Strategy grid search
+python -m scripts.evaluation.run_strategy_grid --smooth 10
+
+# Buffer diagnostic
+python -m scripts.evaluation.buffer_diagnostic
+
+# Index data update
+python -m scripts.dataset.daily_update --update-indices
 ```
+
+## Strategy Parameters (s2)
+
+| Parameter | Value | Notes |
+|---|---|---|
+| Smooth window | 10d | EW rank smoothing |
+| Position sizing | Budget | Bin-weighted equal-notional |
+| Cash ratio | 98% | High deployment |
+| Buffer | Fixed-120 | Exit threshold keeps top-120 held stocks |
+| Bear defense | Score < -0.35 + falling + not bull | Reduces to 20% cash |
+| Recovery | 3-day linear | 20% → 46% → 72% → 98% |
+
+## Stack
+
+Python 3.11, PyTorch, LightGBM. 6 models in zoo (LGBM, XGBoost, DLinear, iTransformer, PatchTST, GatedDW-TCN). Production ensemble uses 3 models (LGBM, DLinear, GatedDW-TCN). Account-based real backtest with integer lots, limit filters, T+1, min ¥5 commission, stamp tax.
 
 ## Structure
 
 ```
 src/
-  backtest/     engine, portfolio, metrics, real_backtest, bayes_blender, ensemble
+  backtest/     engine, portfolio, metrics, real_backtest, live_account, ensemble
   models/       6 models (stable)
-  experiment/   config, data, returns, runner, evaluation
-  pipeline/     base_panel, factor_panel
-  utils/        seed, logger, stats (Newey-West)
+  experiment/   config, data, returns, runner
+  pipeline/     live_store, tushare_client, factor_panel, live_factor_*
+  predict/      live_predictor, live_predictor_incremental
 scripts/
-  evaluation/   run_full_eval, real_backtest
-  dataset/      build pipelines, daily_update
-  experiment/   run_experiment, tune_experiment
+  evaluation/   run_full_eval, run_strategy_grid, live_portfolio, buffer_diagnostic
+  dataset/      live_pipeline, daily_update, live_postprocess
+website/        SPA dashboard (index.html, convert_data.py)
 dataset/
   input/        CSMAR, Tushare, indices (gitignored)
-  processed/    unified_daily_panel, factor_panel, ff5_factors (gitignored)
+  processed/    unified_daily_panel, factor_panel (gitignored)
+  cache/        live store, grid cache (gitignored)
 reports/
-  strategy_v1/  evidence/, diagnostic reports
+  strategy_v1/  evidence/, diagnostic reports, NAV curves
+pics/           Generated comparison plots (gitignored)
 ```
 
 ## License

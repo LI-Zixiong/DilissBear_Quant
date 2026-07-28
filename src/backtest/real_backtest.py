@@ -74,16 +74,36 @@ class RealBacktestConfig:
     skip_suspended: bool = True
     allow_duplicate_position: bool = False
 
+    # Strategy: buffer — stocks outside Top buffer_exit_n are force-sold.
+    # 50 = no buffer (same as entry); 80 = hold until rank > 80.
+    buffer_exit_n: int = 50
+    # Strategy: buffer mode.
+    #   "expand"  — retain old stocks within exit_n, allow > max_stocks total (current).
+    #   "fixed"   — retain old stocks first, fill remaining slots from new entries, cap at max_stocks.
+    buffer_mode: str = "expand"
+    # Strategy: gross daily turnover cap, (buys + sells) / pre-trade equity. None = unlimited.
+    max_daily_turnover: float | None = None
+    # Strategy: partial adjustment speed. 1.0 = full rebalance; 0.5 = half.
+    lambda_weight: float = 1.0
+    # Strategy: elite budget weight relative to strong (default 2.0 = 2x).
+    elite_budget_weight: float = 2.0
+    # Strategy: use continuous softmax weights instead of bin weights.
+    use_softmax_weights: bool = False
+    # Strategy: regime-based position defence.
+    regime_csv_path: str = ""
+    regime_defense_score: float | None = None  # Bear + score < this triggers defence
+    regime_danger_ratio: float = 0.80           # cash_ratio when defence is active
+    regime_recovery_steps: int = 3              # days to linearly recover to normal
+
     # Position sizing mode
     # Production logic: deploy 80% of pre-trade total assets across Top50,
     # with elite stocks receiving 2x the per-stock budget of strong stocks.
     # "fixed" is retained only for reproducing the earlier fixed-lot experiment.
     position_sizing: str = "budget"
-    cash_ratio: float = 0.80
+    cash_ratio: float = 0.98
     start_date: str | pd.Timestamp | None = None
 
-    # Price column names. close-close execution via post-market close-price trading.
-    open_col: str = "close"
+    # Price column names.
     pre_close_col: str = "pre_close"
 
     def __post_init__(self) -> None:
@@ -105,6 +125,33 @@ class RealBacktestConfig:
             raise ValueError(f"position_sizing must be 'fixed' or 'budget', got {self.position_sizing}")
         if not (0.0 < self.cash_ratio <= 1.0):
             raise ValueError(f"cash_ratio must be in (0, 1], got {self.cash_ratio}")
+        if self.buffer_exit_n < self.max_stocks:
+            raise ValueError(f"buffer_exit_n ({self.buffer_exit_n}) must be >= max_stocks ({self.max_stocks})")
+        if self.buffer_mode not in ("expand", "fixed"):
+            raise ValueError(f"buffer_mode must be 'expand' or 'fixed', got {self.buffer_mode}")
+        if self.max_daily_turnover is not None and not (0.0 < self.max_daily_turnover <= 1.0):
+            raise ValueError(
+                f"max_daily_turnover must be in (0, 1] or None, got {self.max_daily_turnover}"
+            )
+        if self.lambda_weight <= 0 or self.lambda_weight > 1:
+            raise ValueError(f"lambda_weight must be in (0, 1], got {self.lambda_weight}")
+        if self.elite_budget_weight <= 0:
+            raise ValueError(f"elite_budget_weight must be positive, got {self.elite_budget_weight}")
+        if not (0.0 < self.regime_danger_ratio <= 1.0):
+            raise ValueError(
+                f"regime_danger_ratio must be in (0, 1], got {self.regime_danger_ratio}"
+            )
+        if (
+            (self.regime_csv_path or self.regime_defense_score is not None)
+            and self.regime_danger_ratio > self.cash_ratio
+        ):
+            raise ValueError(
+                "regime_danger_ratio cannot exceed normal cash_ratio when regime defence is enabled"
+            )
+        if self.regime_recovery_steps < 0:
+            raise ValueError(
+                f"regime_recovery_steps must be non-negative, got {self.regime_recovery_steps}"
+            )
         if self.buy_slippage_bps is None:
             self.buy_slippage_bps = {1: 0, 2: 0, 3: 0}
 
@@ -171,36 +218,36 @@ def _exact_limit_price(row: dict[str, Any], candidates: list[str]) -> float | No
 
 def _is_close_limit_up(row: dict[str, Any], stock_id: str, available_cols: set[str]) -> bool:
     """Closed at limit-up, so buy at close is not executable."""
-    open_px = row.get("open")
+    close_px = row.get("close")
     pre_close = row.get("pre_close")
-    if not _is_finite_positive(open_px) or not _is_finite_positive(pre_close):
+    if not _is_finite_positive(close_px) or not _is_finite_positive(pre_close):
         return True
 
     exact = _exact_limit_price(row, ["up_limit", "high_limit", "limit_up", "limit_up_price"])
     if exact is not None:
-        return float(open_px) >= exact - 1e-3
+        return float(close_px) >= exact - 1e-3
 
     is_st = _row_is_st(row, available_cols)
     limit_pct = _limit_pct_from_code(stock_id, is_st=is_st)
     limit_price = round(float(pre_close) * (1.0 + limit_pct), 2)
-    return float(open_px) >= limit_price - 1e-3
+    return float(close_px) >= limit_price - 1e-3
 
 
 def _is_close_limit_down(row: dict[str, Any], stock_id: str, available_cols: set[str]) -> bool:
     """Closed at limit-down, so sell at close is not executable."""
-    open_px = row.get("open")
+    close_px = row.get("close")
     pre_close = row.get("pre_close")
-    if not _is_finite_positive(open_px) or not _is_finite_positive(pre_close):
+    if not _is_finite_positive(close_px) or not _is_finite_positive(pre_close):
         return True
 
     exact = _exact_limit_price(row, ["down_limit", "low_limit", "limit_down", "limit_down_price"])
     if exact is not None:
-        return float(open_px) <= exact + 1e-3
+        return float(close_px) <= exact + 1e-3
 
     is_st = _row_is_st(row, available_cols)
     limit_pct = _limit_pct_from_code(stock_id, is_st=is_st)
     limit_price = round(float(pre_close) * (1.0 - limit_pct), 2)
-    return float(open_px) <= limit_price + 1e-3
+    return float(close_px) <= limit_price + 1e-3
 
 
 def _assign_bin(rank_pct: float, edges: tuple[float, float, float]) -> int:
@@ -219,6 +266,29 @@ def _commission(amount: float, config: RealBacktestConfig) -> float:
     return max(amount * config.commission_rate, config.min_commission)
 
 
+def _lambda_adjusted_lots(delta_lots: int, lambda_weight: float) -> int:
+    """Apply partial rebalancing while preserving the sign and whole-lot execution."""
+    if delta_lots == 0 or lambda_weight >= 1.0:
+        return delta_lots
+    adjusted = int(np.floor(abs(delta_lots) * lambda_weight + 0.5))
+    if adjusted == 0:
+        return 0
+    return adjusted if delta_lots > 0 else -adjusted
+
+
+def _lots_within_turnover(
+    desired_lots: int,
+    gross_per_lot: float,
+    remaining_gross: float,
+) -> int:
+    """Clip a whole-lot adjustment to the remaining gross turnover budget."""
+    if desired_lots <= 0 or gross_per_lot <= 0 or remaining_gross <= 0:
+        return 0
+    if np.isinf(remaining_gross):
+        return desired_lots
+    return min(desired_lots, int(np.floor((remaining_gross + 1e-9) / gross_per_lot)))
+
+
 def _clean_price_frame(
     price_df: pd.DataFrame,
     date_col: str,
@@ -229,15 +299,10 @@ def _clean_price_frame(
     prices[date_col] = pd.to_datetime(prices[date_col])
     prices[stock_col] = prices[stock_col].astype(str).str.strip().str.zfill(6)
 
-    rename_map = {}
-    if config.open_col != "open":
-        rename_map[config.open_col] = "open"
     if config.pre_close_col != "pre_close":
-        rename_map[config.pre_close_col] = "pre_close"
-    if rename_map:
-        prices = prices.rename(columns=rename_map)
+        prices = prices.rename(columns={config.pre_close_col: "pre_close"})
 
-    required = {date_col, stock_col, "open", "pre_close"}
+    required = {date_col, stock_col, "close", "pre_close"}
     missing = required - set(prices.columns)
     if missing:
         raise ValueError(f"price_df missing columns: {missing}")
@@ -269,14 +334,11 @@ def _clean_pred_frame(
     return pred
 
 
-# Budget allocation weights: bin2 = 1.0x, bin3 = 2.0x  (bin1 skipped)
-_BUDGET_BIN_WEIGHTS = {2: 1.0, 3: 2.0}
-
-
 def _allocate_by_budget(
     eligible: pd.DataFrame,
     available_cash: float,
     config: RealBacktestConfig,
+    cash_ratio_override: float | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     """
     Budget-based lot allocation across bin2 + bin3.
@@ -290,13 +352,18 @@ def _allocate_by_budget(
 
     Returns (position_dicts, total_spent).
     """
-    budget = available_cash * config.cash_ratio
+    cr = cash_ratio_override if cash_ratio_override is not None else config.cash_ratio
+    budget = available_cash * cr
     if budget <= 0:
         return [], 0.0
 
-    # Separate by bin, already sorted by score desc
+    # Separate by bin.  When buffer is active, bin 0-1 survivors also participate
+    # (at standard 1x weight); they should not be dropped just because their rank
+    # fell below the elite/strong threshold.
+    active_buffer = config.buffer_exit_n > config.max_stocks
+    bin_range = (0, 1, 2, 3) if active_buffer else (2, 3)
     bin_groups: dict[int, pd.DataFrame] = {}
-    for bi in [2, 3]:
+    for bi in bin_range:
         grp = eligible[eligible["bin"] == bi]
         if not grp.empty:
             bin_groups[bi] = grp
@@ -304,40 +371,47 @@ def _allocate_by_budget(
     if not bin_groups:
         return [], 0.0
 
-    # One common budget unit: strong=1 unit per stock, elite=2 units per stock.
-    bin_total_weight = sum(
-        len(grp) * _BUDGET_BIN_WEIGHTS[bi] for bi, grp in bin_groups.items()
-    )
-    budget_per_unit = budget / bin_total_weight
+    # Standard mode keeps the original strong/elite ratio.  Softmax mode uses
+    # each selected stock's score directly and therefore removes the bin step.
+    selected = pd.concat([bin_groups[bi] for bi in sorted(bin_groups)]).copy()
+    if config.use_softmax_weights:
+        score_values = selected["score"].to_numpy(dtype=float)
+        exp_scores = np.exp(score_values - np.max(score_values))
+        selected["_budget_weight"] = exp_scores / exp_scores.sum()
+    else:
+        selected["_budget_weight"] = np.where(
+            selected["bin"].to_numpy(dtype=int) == 3,
+            config.elite_budget_weight,
+            1.0,
+        )
+        selected["_budget_weight"] /= selected["_budget_weight"].sum()
+
     lot_size = config.lot_size
 
     stock_plans = []
-    for bi in [3, 2]:
-        grp = bin_groups.get(bi)
-        if grp is None:
-            continue
-        per_stock = budget_per_unit * _BUDGET_BIN_WEIGHTS[bi]
+    for _, row in selected.sort_values("score", ascending=False).iterrows():
+        bi = int(row["bin"])
+        per_stock = budget * float(row["_budget_weight"])
         slip_bps = config.buy_slippage_bps.get(bi, 0)
         slip_rate = slip_bps / 10000.0
-        for _, row in grp.iterrows():
-            fill_price = float(row["open"]) * (1.0 + slip_rate)
-            price_per_lot = fill_price * lot_size
-            if price_per_lot <= 0:
-                continue
-            raw_lots = per_stock / price_per_lot
-            n_lots = max(1, int(round(raw_lots)))
-            entry_gross = n_lots * price_per_lot
-            stock_plans.append({
-                "stock_id": str(row["stock_id"]),
-                "open": fill_price,
-                "score": float(row["score"]),
-                "rank_pct": float(row["rank_pct"]),
-                "bin": bi,
-                "n_lots": n_lots,
-                "shares": n_lots * lot_size,
-                "entry_gross": entry_gross,
-                "buy_fee": _commission(entry_gross, config),
-            })
+        fill_price = float(row["close"]) * (1.0 + slip_rate)
+        price_per_lot = fill_price * lot_size
+        if price_per_lot <= 0:
+            continue
+        raw_lots = per_stock / price_per_lot
+        n_lots = max(1, int(round(raw_lots)))
+        entry_gross = n_lots * price_per_lot
+        stock_plans.append({
+            "stock_id": str(row["stock_id"]),
+            "close": fill_price,
+            "score": float(row["score"]),
+            "rank_pct": float(row["rank_pct"]),
+            "bin": bi,
+            "n_lots": n_lots,
+            "shares": n_lots * lot_size,
+            "entry_gross": entry_gross,
+            "buy_fee": _commission(entry_gross, config),
+        })
 
     # Rounding can push the plan above 80%.  Preserve the highest-ranked prefix
     # and remove the lowest-ranked name until the gross plan fits the budget.
@@ -359,49 +433,120 @@ def _build_buy_targets(
     config: RealBacktestConfig,
     stock_col: str,
     price_cols: set[str],
+    cash_ratio_override: float | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int]:
     """
     Build today's buy targets from signal predictions (before selling).
 
-    Returns (buy_targets, n_filtered) where buy_targets maps stock_id → {lots, shares, open,
-    score, rank_pct, bin, entry_gross (budget only), buy_fee (budget only), signal_date, target_exit_date}.
+    Buffer logic (when buffer_exit_n > max_stocks):
+      1. Full stock ranking.
+      2. Held stocks within buffer_exit_n survive (capped at max_stocks by rank).
+      3. Remaining slots filled from today's Top entry (excluding survivors).
+      4. All target stocks are assigned equal-target budget weights.
+
+    Returns (buy_targets, n_filtered).  buy_targets maps stock_id → {lots,
+    shares, open, score, rank_pct, bin, entry_gross, buy_fee, signal_date,
+    target_exit_date}.
     """
-    # Budget base = cash + current market value (smart-hold locks value in positions).
     pre_sell_mv = 0.0
     for pos in positions:
         row_ = today_px.get(pos["stock_id"])
-        if row_ is not None and _is_finite_positive(row_.get("open")):
-            pre_sell_mv += pos["shares"] * float(row_["open"])
+        if row_ is not None and _is_finite_positive(row_.get("close")):
+            pre_sell_mv += pos["shares"] * float(row_["close"])
         else:
             pre_sell_mv += pos["shares"] * float(pos.get("last_price", pos["entry_open"]))
     deployable = cash + pre_sell_mv
 
     buy_targets: dict[str, dict[str, Any]] = {}
     n_filtered = 0
+    held_ids = {str(pos["stock_id"]) for pos in positions}
 
     for signal_date, target_exit_date, day_pred in entry_signals.get(current_date, []):
         ranked = day_pred[[stock_col, config.pred_col]].copy()
         ranked["rank_pct"] = ranked[config.pred_col].rank(pct=True)
-        ranked = ranked.sort_values(config.pred_col, ascending=False).head(config.max_stocks)
+        ranked = ranked.sort_values(config.pred_col, ascending=False)
+        ranked["ordinal_rank"] = np.arange(1, len(ranked) + 1)
+        held_set = held_ids.copy()
+
+        # ── Step 1: determine target membership (who stays, who enters) ──
+        target_ids: list[str] = []
+        is_held: dict[str, bool] = {}
+        n_survivors = 0
+
+        if config.buffer_exit_n > config.max_stocks:
+            survivor_df = ranked[
+                ranked[stock_col].isin(held_set)
+                & (ranked["ordinal_rank"] <= config.buffer_exit_n)
+            ].sort_values(config.pred_col, ascending=False)
+
+            if config.buffer_mode == "fixed":
+                survivor_df = survivor_df.head(config.max_stocks)
+            elif config.buffer_mode == "expand":
+                survivor_df = survivor_df.head(config.max_stocks * 3)
+
+            for _, s in survivor_df.iterrows():
+                sid = str(s[stock_col])
+                target_ids.append(sid)
+                is_held[sid] = True
+                n_survivors += 1
+
+        # Fill remaining slots from Top entries (not already held survivors)
+        active_buffer = config.buffer_exit_n > config.max_stocks
+        max_tg = (config.max_stocks
+                  if not active_buffer or config.buffer_mode == "fixed"
+                  else config.max_stocks * 3)
+        slots = max_tg - len(target_ids)
+        if slots > 0:
+            for _, pred_row in ranked.iterrows():
+                sid = str(pred_row[stock_col])
+                if sid in set(target_ids):
+                    continue
+                if slots <= 0:
+                    break
+                target_ids.append(sid)
+                is_held[sid] = sid in held_set
+                slots -= 1
+
+        # ── Step 2: build price rows; buy_blocked only applies to NEW entries ──
         rows = []
-        for _, pred_row in ranked.iterrows():
-            sid = pred_row[stock_col]
+        for sid in target_ids:
             row = today_px.get(sid)
             if row is None:
                 n_filtered += 1
                 continue
-            open_px = row.get("open")
+            close_px = row.get("close")
             pre_close = row.get("pre_close")
-            if not _is_finite_positive(open_px) or not _is_finite_positive(pre_close):
+            if not _is_finite_positive(close_px) or not _is_finite_positive(pre_close):
+                n_filtered += 1
+                continue
+            pred_match = ranked[ranked[stock_col] == sid]
+            if pred_match.empty:
+                continue
+            # Already-held stocks: block_buy only if suspended.  Limit-up on a
+            # held stock does NOT change its membership; it just means "can't
+            # increase position today", handled by the executor.
+            blk = False
+            if not is_held.get(sid, False):
+                row_dict = dict(row)
+                if config.skip_suspended and _row_is_suspended(row_dict, price_cols):
+                    blk = True
+                elif config.block_limit_up_buy and _is_close_limit_up(
+                    row_dict, sid, price_cols
+                ):
+                    blk = True
+            elif config.skip_suspended and _row_is_suspended(dict(row), price_cols):
+                blk = True  # suspension affects everyone
+            if blk and not is_held.get(sid, False):
                 n_filtered += 1
                 continue
             rows.append({
                 "stock_id": sid,
-                "score": float(pred_row[config.pred_col]),
-                "rank_pct": float(pred_row["rank_pct"]),
-                "open": float(open_px),
+                "score": float(pred_match.iloc[0][config.pred_col]),
+                "rank_pct": float(pred_match.iloc[0]["rank_pct"]),
+                "close": float(close_px),
                 "pre_close": float(pre_close),
                 "raw_price_row": row,
+                "_is_held": is_held.get(sid, False),
             })
 
         if not rows:
@@ -409,35 +554,36 @@ def _build_buy_targets(
 
         stocks_df = pd.DataFrame(rows)
         stocks_df = stocks_df.replace([np.inf, -np.inf], np.nan).dropna(
-            subset=["stock_id", "score", "open", "pre_close"])
+            subset=["stock_id", "score", "close", "pre_close"])
         if stocks_df.empty:
             continue
 
-        def _buy_blocked(r: pd.Series) -> bool:
-            row_ = dict(r["raw_price_row"])
-            row_["open"] = r["open"]
-            row_["pre_close"] = r["pre_close"]
-            if config.skip_suspended and _row_is_suspended(row_, price_cols):
-                return True
-            if config.block_limit_up_buy and _is_close_limit_up(row_, r["stock_id"], price_cols):
-                return True
-            return False
+        # Bin assignment for ALL target stocks (buffer survivors included)
+        stocks_df["bin"] = stocks_df["rank_pct"].apply(
+            lambda x: _assign_bin(float(x), config.bin_edges)
+        )
+        stocks_df = stocks_df.sort_values("score", ascending=False)
 
-        stocks_df["buy_blocked"] = stocks_df.apply(_buy_blocked, axis=1)
-        n_filtered += int(stocks_df["buy_blocked"].sum())
-        eligible = stocks_df[~stocks_df["buy_blocked"]].copy()
-        if eligible.empty:
-            continue
-
-        eligible["bin"] = eligible["rank_pct"].apply(lambda x: _assign_bin(float(x), config.bin_edges))
-        eligible = eligible.sort_values("score", ascending=False)
+        # buy_blocked flag: only true for NEW entries that can't be purchased.
+        # Held stocks that are limit-up stay in the target set; executor handles
+        # delta (can't buy more, won't sell).
+        stocks_df["_can_buy"] = ~(stocks_df["_is_held"] & (
+            stocks_df.apply(lambda r: (
+                config.block_limit_up_buy and _is_close_limit_up(
+                    dict(r["raw_price_row"]), r["stock_id"], price_cols
+                )
+            ), axis=1)
+        ))
+        eligible = stocks_df.copy()
 
         if config.position_sizing == "budget":
-            budget_plans, _ = _allocate_by_budget(eligible, deployable, config)
+            budget_plans, _ = _allocate_by_budget(eligible, deployable, config,
+                cash_ratio_override=(cash_ratio_override if cash_ratio_override is not None else config.cash_ratio))
             for plan in budget_plans:
                 buy_targets[plan["stock_id"]] = {
                     "lots": plan["n_lots"], "shares": plan["shares"],
-                    "open": plan["open"], "score": plan["score"],
+                    "close": plan["close"],
+                    "score": plan["score"],
                     "rank_pct": plan["rank_pct"], "bin": plan["bin"],
                     "entry_gross": plan["entry_gross"], "buy_fee": plan["buy_fee"],
                     "signal_date": signal_date, "target_exit_date": target_exit_date,
@@ -455,10 +601,10 @@ def _build_buy_targets(
                     continue
                 slip_bps_fixed = config.buy_slippage_bps.get(bi, 0)
                 slip_rate_fixed = slip_bps_fixed / 10000.0
-                fill_fixed = float(stock["open"]) * (1.0 + slip_rate_fixed)
+                fill_fixed = float(stock["close"]) * (1.0 + slip_rate_fixed)
                 buy_targets[sid] = {
                     "lots": n_lots, "shares": n_lots * config.lot_size,
-                    "open": fill_fixed,
+                    "close": fill_fixed,
                     "score": float(stock["score"]),
                     "rank_pct": float(stock["rank_pct"]), "bin": bi,
                     "signal_date": signal_date, "target_exit_date": target_exit_date,
@@ -474,6 +620,8 @@ def run_real_backtest(
     date_col: str = "time",
     stock_col: str = "stock_id",
     periods_per_year: int = 252,
+    _price_lookup: dict | None = None,
+    _price_cols: set[str] | None = None,
 ) -> dict[str, Any]:
     """
     Account-based real backtest: T signal → T close buy → T+1 close sell.
@@ -488,23 +636,91 @@ def run_real_backtest(
     if config is None:
         config = RealBacktestConfig()
 
-    pred = _clean_pred_frame(pred_df, date_col, stock_col, config.pred_col)
-    prices, price_cols = _clean_price_frame(price_df, date_col, stock_col, config)
+    # ── Regime defence ──
+    regime_active: dict[pd.Timestamp, dict[str, float]] = {}
+    if config.regime_csv_path and config.regime_defense_score is not None:
+        reg = pd.read_csv(config.regime_csv_path, parse_dates=["date"])
+        required_regime_cols = {"date", "bull", "regime_score"}
+        missing_regime_cols = required_regime_cols - set(reg.columns)
+        if missing_regime_cols:
+            raise ValueError(f"regime CSV missing columns: {missing_regime_cols}")
+        reg = reg.sort_values("date").drop_duplicates("date", keep="last")
+        reg["score_diff"] = reg["regime_score"].diff()
+        for _, row in reg.iterrows():
+            ts = pd.Timestamp(row["date"])
+            regime_active[ts] = {
+                "bull": float(row["bull"]),
+                "score": float(row["regime_score"]),
+                "falling": bool(float(row["score_diff"]) < -0.01) if pd.notna(row.get("score_diff")) else False,
+            }
 
-    price_dates = [pd.Timestamp(d) for d in np.sort(prices[date_col].dropna().unique())]
-    if config.start_date is not None:
-        start = pd.Timestamp(config.start_date).normalize()
-        price_dates = [d for d in price_dates if d >= start]
-        pred = pred[pred[date_col] >= start].copy()
+    defence_active = False
+    recovery_left = 0
+    cash_ratio_current = config.cash_ratio
+
+    # Inherit regime state from before start_date so a defence triggered on
+    # 7/17 is still active (or recovering) when the backtest begins on 7/20.
+    if regime_active and config.regime_defense_score is not None:
+        warmup_dates = sorted(regime_active)
+        if config.start_date is not None:
+            start_ts = pd.Timestamp(config.start_date)
+            warmup_dates = [d for d in warmup_dates if d <= start_ts]
+        for d in warmup_dates:
+            reg = regime_active.get(d)
+            if reg is None:
+                continue
+            danger = (
+                reg["bull"] == 0.0
+                and reg["score"] < config.regime_defense_score
+                and reg["falling"]
+            )
+            if danger:
+                defence_active = True
+                recovery_left = 0
+                cash_ratio_current = config.regime_danger_ratio
+            else:
+                if defence_active:
+                    defence_active = False
+                    recovery_left = config.regime_recovery_steps
+                if recovery_left > 0:
+                    completed = config.regime_recovery_steps - recovery_left + 1
+                    cash_ratio_current = (
+                        config.regime_danger_ratio
+                        + (completed / config.regime_recovery_steps)
+                        * (config.cash_ratio - config.regime_danger_ratio)
+                    )
+                    recovery_left -= 1
+                else:
+                    cash_ratio_current = config.cash_ratio
+
+    # ── Core engine ──
+    pred = _clean_pred_frame(pred_df, date_col, stock_col, config.pred_col)
+
+    if _price_lookup is not None and _price_cols is not None:
+        price_lookup = {
+            k: v for k, v in _price_lookup.items()
+            if config.start_date is None or k >= pd.Timestamp(config.start_date)
+        }
+        price_cols = _price_cols
+        price_dates = sorted(price_lookup.keys())
+        if config.start_date is not None:
+            price_dates = [d for d in price_dates if d >= pd.Timestamp(config.start_date)]
+    else:
+        prices, price_cols = _clean_price_frame(price_df, date_col, stock_col, config)
+        price_dates = [pd.Timestamp(d) for d in np.sort(prices[date_col].dropna().unique())]
+        if config.start_date is not None:
+            start = pd.Timestamp(config.start_date).normalize()
+            price_dates = [d for d in price_dates if d >= start]
+            pred = pred[pred[date_col] >= start].copy()
+        # Price lookup: {date: {stock_id: row_dict}}
+        price_lookup = {}
+        for d, grp in prices.groupby(date_col, sort=True):
+            dd = pd.Timestamp(d)
+            grp = grp.loc[:, ~grp.columns.duplicated()].copy()
+            price_lookup[dd] = grp.set_index(stock_col).to_dict("index")
     if not price_dates:
         raise ValueError("price_df contains no trading dates on or after start_date")
     date_to_idx = {d: i for i, d in enumerate(price_dates)}
-
-    # Price lookup: {date: {stock_id: row_dict}}
-    price_lookup: dict[pd.Timestamp, dict[str, dict[str, Any]]] = {}
-    for d, grp in prices.groupby(date_col, sort=True):
-        dd = pd.Timestamp(d)
-        price_lookup[dd] = grp.set_index(stock_col).to_dict("index")
 
     # Map each signal date T to entry date T (post-market close) and target exit T+1.
     entry_signals: dict[pd.Timestamp, list[tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame]]] = {}
@@ -542,6 +758,9 @@ def run_real_backtest(
     capital_used_by_date: dict[pd.Timestamp, float] = {}
     filtered_by_date: dict[pd.Timestamp, int] = {}
     blocked_sell_by_date: dict[pd.Timestamp, int] = {}
+    turnover_by_date: dict[pd.Timestamp, float] = {}
+    cash_ratio_by_date: dict[pd.Timestamp, float] = {}
+    turnover_deferred_by_date: dict[pd.Timestamp, int] = {}
 
     trade_log: list[dict[str, Any]] = []
     position_snapshots: list[dict[str, Any]] = []
@@ -553,11 +772,58 @@ def run_real_backtest(
         if last_entry_date is not None and current_date > last_entry_date and len(positions) == 0:
             break
 
+        # ── Regime defence per-day ──
+        if regime_active and config.regime_defense_score is not None:
+            reg = regime_active.get(current_date)
+            danger_today = (
+                reg is not None
+                and reg["bull"] == 0.0
+                and reg["score"] < config.regime_defense_score
+                and reg["falling"]
+            )
+            if danger_today:
+                if not defence_active:
+                    defence_active = True
+                recovery_left = 0
+                cash_ratio_current = config.regime_danger_ratio
+            else:
+                if defence_active:
+                    defence_active = False
+                    recovery_left = config.regime_recovery_steps
+                if recovery_left > 0:
+                    completed = config.regime_recovery_steps - recovery_left + 1
+                    t = completed / config.regime_recovery_steps
+                    cash_ratio_current = (
+                        config.regime_danger_ratio
+                        + t * (config.cash_ratio - config.regime_danger_ratio)
+                    )
+                    recovery_left -= 1
+                else:
+                    cash_ratio_current = config.cash_ratio
+
         today_px = price_lookup.get(current_date, {})
+        pre_trade_mv = 0.0
+        for pos in positions:
+            row = today_px.get(pos["stock_id"])
+            if row is not None and _is_finite_positive(row.get("close")):
+                mark = float(row["close"])
+            else:
+                mark = float(pos.get("last_price", pos["entry_open"]))
+            pre_trade_mv += pos["shares"] * mark
+        pre_trade_equity = cash + pre_trade_mv
+        turnover_limit = (
+            np.inf
+            if config.max_daily_turnover is None
+            else config.max_daily_turnover * pre_trade_equity
+        )
+        gross_buy_today = 0.0
+        gross_sell_today = 0.0
+
         n_buys = 0
         n_sells = 0
         n_filtered = 0
         n_blocked_sells = 0
+        n_turnover_deferred = 0
         capital_used_today = 0.0
 
         # ------------------------------------------------------------------
@@ -565,7 +831,7 @@ def run_real_backtest(
         # ------------------------------------------------------------------
         buy_targets, n_filtered_today = _build_buy_targets(
             current_date, entry_signals, today_px, positions, cash,
-            config, stock_col, price_cols,
+            config, stock_col, price_cols, cash_ratio_override=cash_ratio_current,
         )
         n_filtered += n_filtered_today
 
@@ -575,14 +841,28 @@ def run_real_backtest(
         held_stock_ids = {p["stock_id"] for p in positions}
         still_holding: list[dict[str, Any]] = []
 
-        for pos in positions:
+        # Forced exits with the weakest scores are processed first.  Surviving
+        # names and new buys are then handled from higher to lower target score.
+        def _holding_priority(pos: dict[str, Any]) -> tuple[int, float]:
+            sid_ = pos["stock_id"]
+            target_ = buy_targets.get(sid_)
+            if target_ is None:
+                return (0, float(pos.get("score", -np.inf)))
+            delta_ = target_["lots"] - pos["lots"]
+            if delta_ < 0:
+                return (1, float(target_["score"]))
+            if delta_ > 0:
+                return (2, -float(target_["score"]))
+            return (3, 0.0)
+
+        for pos in sorted(positions, key=_holding_priority):
             sid = pos["stock_id"]
             target_exit = pos["target_exit_date"]
             due_to_sell = pd.notna(target_exit) and current_date >= target_exit
             row = today_px.get(sid)
 
-            if row is not None and _is_finite_positive(row.get("open")):
-                pos["last_price"] = float(row["open"])
+            if row is not None and _is_finite_positive(row.get("close")):
+                pos["last_price"] = float(row["close"])
                 pos["last_price_date"] = current_date
 
             if not due_to_sell:
@@ -592,18 +872,29 @@ def run_real_backtest(
             target = buy_targets.get(sid)
             if target is not None:
                 # ── Smart hold: stock still in buy list, only trade delta ──
-                delta_lots = target["lots"] - pos["lots"]
-                raw_px = float(row["open"]) if row is not None and _is_finite_positive(row.get("open")) else pos.get("last_price", pos["entry_open"])
+                delta_lots = _lambda_adjusted_lots(
+                    target["lots"] - pos["lots"],
+                    config.lambda_weight,
+                )
+                raw_px = float(row["close"]) if row is not None and _is_finite_positive(row.get("close")) else pos.get("last_price", pos["entry_open"])
 
                 if delta_lots > 0:
                     # Need more: buy delta lots (buy slip applied)
                     buy_slip = config.buy_slippage_bps.get(target.get("bin", 2), 10) / 10000.0
                     px = raw_px * (1.0 + buy_slip)
                     # Need more: buy delta lots at buy commission (万3)
+                    remaining_turnover = turnover_limit - gross_buy_today - gross_sell_today
+                    delta_lots = _lots_within_turnover(
+                        delta_lots,
+                        px * config.lot_size,
+                        remaining_turnover,
+                    )
+                    if delta_lots == 0:
+                        n_turnover_deferred += 1
                     delta_shares = delta_lots * config.lot_size
                     delta_gross = delta_shares * px
                     delta_fee = _commission(delta_gross, config)
-                    if delta_gross + delta_fee <= cash + 1e-9:
+                    if delta_lots > 0 and delta_gross + delta_fee <= cash + 1e-9:
                         cash -= (delta_gross + delta_fee)
                         pos["shares"] += delta_shares
                         pos["lots"] += delta_lots
@@ -613,6 +904,7 @@ def run_real_backtest(
                         pos["last_buy_date"] = current_date
                         n_buys += 1
                         capital_used_today += delta_gross
+                        gross_buy_today += delta_gross
                         trade_log.append({
                             "date": current_date, "action": "BUY",
                             "position_id": pos["position_id"], "stock_id": sid,
@@ -626,7 +918,7 @@ def run_real_backtest(
                         })
                 elif delta_lots < 0:
                     # Need fewer: sell excess (sell slip applied)
-                    can_reduce = row is not None and _is_finite_positive(row.get("open"))
+                    can_reduce = row is not None and _is_finite_positive(row.get("close"))
                     if can_reduce and config.skip_suspended and _row_is_suspended(row, price_cols):
                         can_reduce = False
                     if can_reduce and config.block_limit_down_sell and _is_close_limit_down(row, sid, price_cols):
@@ -638,7 +930,18 @@ def run_real_backtest(
                     else:
                         sell_slip = config.sell_slippage_bps / 10000.0
                         px = raw_px * (1.0 - sell_slip)
-                        excess_lots = -delta_lots
+                        remaining_turnover = turnover_limit - gross_buy_today - gross_sell_today
+                        excess_lots = _lots_within_turnover(
+                            -delta_lots,
+                            px * config.lot_size,
+                            remaining_turnover,
+                        )
+                        if excess_lots == 0:
+                            n_turnover_deferred += 1
+                            can_reduce = False
+                            still_holding.append(pos)
+                            del buy_targets[sid]
+                            continue
                         excess_shares = excess_lots * config.lot_size
                         gross_sell = excess_shares * px
                         sell_fee = _commission(gross_sell, config) + gross_sell * config.stamp_tax_rate
@@ -652,6 +955,7 @@ def run_real_backtest(
                         pos["entry_gross"] -= allocated_entry
                         pos["buy_fee"] -= allocated_buy_fee
                         n_sells += 1
+                        gross_sell_today += gross_sell
                         trade_log.append({
                             "date": current_date, "action": "SELL",
                             "position_id": pos["position_id"], "stock_id": sid,
@@ -681,7 +985,7 @@ def run_real_backtest(
                 continue
 
             # ── Stock NOT in buy list: full sell ──
-            can_sell = row is not None and _is_finite_positive(row.get("open"))
+            can_sell = row is not None and _is_finite_positive(row.get("close"))
             if can_sell and config.skip_suspended and _row_is_suspended(row, price_cols):
                 can_sell = False
             if can_sell and config.block_limit_down_sell and _is_close_limit_down(row, sid, price_cols):
@@ -693,8 +997,15 @@ def run_real_backtest(
                 n_blocked_sells += 1
                 continue
 
-            sell_open = float(row["open"]) * (1.0 - config.sell_slippage_bps / 10000.0)
+            sell_open = float(row["close"]) * (1.0 - config.sell_slippage_bps / 10000.0)
             gross_sell = pos["shares"] * sell_open
+            remaining_turnover = turnover_limit - gross_buy_today - gross_sell_today
+            if gross_sell > remaining_turnover + 1e-9:
+                # Turnover is a voluntary execution constraint, not a market
+                # blockage.  Keep the position and retry on the next day.
+                still_holding.append(pos)
+                n_turnover_deferred += 1
+                continue
             sell_commission = _commission(gross_sell, config)
             stamp_tax = gross_sell * config.stamp_tax_rate
             sell_fee = sell_commission + stamp_tax
@@ -702,6 +1013,7 @@ def run_real_backtest(
 
             realized_pnl = gross_sell - pos["entry_gross"] - pos["buy_fee"] - sell_fee
             n_sells += 1
+            gross_sell_today += gross_sell
             trade_log.append({
                 "date": current_date, "action": "SELL",
                 "position_id": pos["position_id"], "stock_id": sid,
@@ -721,17 +1033,29 @@ def run_real_backtest(
         # ------------------------------------------------------------------
         # 3) Buy new stocks (in buy_targets but not currently held).
         # ------------------------------------------------------------------
+        max_slots = max(0, config.max_stocks - len(still_holding))
         new_plans = sorted(
             [(sid, t) for sid, t in buy_targets.items() if sid not in held_stock_ids],
             key=lambda x: x[1]["score"], reverse=True,
         )
         n_new = 0
         for sid, target in new_plans:
-            if n_new >= config.max_stocks:
+            if n_new >= max_slots:
                 break
 
-            entry_gross = target.get("entry_gross", target["shares"] * target["open"])
-            buy_fee = target.get("buy_fee", _commission(entry_gross, config))
+            entry_close = target["close"]
+            entry_gross = target.get("entry_gross", target["shares"] * entry_close)
+            remaining_turnover = turnover_limit - gross_buy_today - gross_sell_today
+            actual_lots = _lots_within_turnover(
+                int(target["lots"]),
+                float(entry_close) * config.lot_size,
+                remaining_turnover,
+            )
+            if actual_lots == 0:
+                n_turnover_deferred += 1
+                continue
+            entry_gross = actual_lots * config.lot_size * float(entry_close)
+            buy_fee = _commission(entry_gross, config)
             cash_needed = entry_gross + buy_fee
             if cash_needed > cash + 1e-9:
                 continue
@@ -740,9 +1064,9 @@ def run_real_backtest(
             position = {
                 "position_id": next_position_id,
                 "stock_id": sid,
-                "shares": target["shares"],
-                "lots": target["lots"],
-                "entry_open": target["open"],
+                "shares": actual_lots * config.lot_size,
+                "lots": actual_lots,
+                "entry_open": target["close"],
                 "entry_gross": entry_gross,
                 "buy_fee": buy_fee,
                 "signal_date": target["signal_date"],
@@ -752,7 +1076,7 @@ def run_real_backtest(
                 "score": target["score"],
                 "rank_pct": target["rank_pct"],
                 "bin": target["bin"],
-                "last_price": target["open"],
+                "last_price": target["close"],
                 "last_price_date": current_date,
                 "delayed_exit_days": 0,
             }
@@ -761,12 +1085,13 @@ def run_real_backtest(
             n_buys += 1
             n_new += 1
             capital_used_today += entry_gross
+            gross_buy_today += entry_gross
 
             trade_log.append({
                 "date": current_date, "action": "BUY",
                 "position_id": next_position_id, "stock_id": sid,
-                "shares": target["shares"], "lots": target["lots"],
-                "price": target["open"], "gross": entry_gross, "fee": buy_fee,
+                "shares": actual_lots * config.lot_size, "lots": actual_lots,
+                "price": entry_close, "gross": entry_gross, "fee": buy_fee,
                 "cash_after": cash,
                 "signal_date": target["signal_date"], "entry_date": current_date,
                 "target_exit_date": target["target_exit_date"],
@@ -782,8 +1107,8 @@ def run_real_backtest(
         for pos in positions:
             sid = pos["stock_id"]
             row = today_px.get(sid)
-            if row is not None and _is_finite_positive(row.get("open")):
-                mark_price = float(row["open"])
+            if row is not None and _is_finite_positive(row.get("close")):
+                mark_price = float(row["close"])
                 pos["last_price"] = mark_price
                 pos["last_price_date"] = current_date
             else:
@@ -821,6 +1146,12 @@ def run_real_backtest(
         capital_used_by_date[current_date] = capital_used_today
         filtered_by_date[current_date] = n_filtered
         blocked_sell_by_date[current_date] = n_blocked_sells
+        turnover_by_date[current_date] = (
+            (gross_buy_today + gross_sell_today) / (2.0 * pre_trade_equity)
+            if pre_trade_equity > 0 else 0.0
+        )
+        cash_ratio_by_date[current_date] = cash_ratio_current
+        turnover_deferred_by_date[current_date] = n_turnover_deferred
 
     if not equity_by_date:
         raise ValueError("No valid backtest periods generated")
@@ -850,6 +1181,10 @@ def run_real_backtest(
     daily_filtered.name = "filtered_buys"
     daily_blocked_sells = pd.Series(blocked_sell_by_date).sort_index()
     daily_blocked_sells.name = "blocked_sells"
+    daily_turnover = pd.Series(turnover_by_date).sort_index()
+    daily_turnover.name = "turnover"
+    daily_turnover_deferred = pd.Series(turnover_deferred_by_date).sort_index()
+    daily_turnover_deferred.name = "turnover_deferred"
 
     summary = summarize_backtest(returns=daily_returns, periods_per_year=periods_per_year)
     summary["final_nav"] = float(daily_nav.iloc[-1])
@@ -870,6 +1205,10 @@ def run_real_backtest(
     summary["total_filtered"] = int(daily_filtered.sum())
     summary["mean_blocked_sells"] = float(daily_blocked_sells.mean())
     summary["total_blocked_sells"] = int(daily_blocked_sells.sum())
+    summary["mean_turnover"] = float(daily_turnover.mean())
+    summary["max_turnover"] = float(daily_turnover.max())
+    summary["mean_turnover_deferred"] = float(daily_turnover_deferred.mean())
+    summary["total_turnover_deferred"] = int(daily_turnover_deferred.sum())
     summary["skipped_signal_dates"] = int(skipped_signal_dates)
     summary["open_positions_at_end"] = int(len(positions))
 
@@ -897,6 +1236,9 @@ def run_real_backtest(
         "daily_capital_used": daily_capital_used,
         "daily_filtered": daily_filtered,
         "daily_blocked_sells": daily_blocked_sells,
+        "daily_turnover": daily_turnover,
+        "daily_turnover_deferred": daily_turnover_deferred,
+        "daily_cash_ratio": pd.Series(cash_ratio_by_date).sort_index(),
         "daily_positions": trade_log_df[trade_log_df["action"] == "BUY"]
         [["signal_date", "stock_id", "lots", "gross", "entry_date",
           "target_exit_date", "bin", "rank_pct", "score"]]
@@ -939,7 +1281,7 @@ if __name__ == "__main__":
     config = RealBacktestConfig(
         capital=200_000,
         position_sizing="budget",
-        cash_ratio=0.80,
+        cash_ratio=0.98,
         max_stocks=50,
         commission_rate=0.0003,
         stamp_tax_rate=0.0005,

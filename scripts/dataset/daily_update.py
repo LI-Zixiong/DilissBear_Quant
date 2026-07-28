@@ -116,7 +116,7 @@ def update_live_store(
     from src.pipeline.live_factor_engine import compute_live_factor_rows
     from src.pipeline.live_factor_schema import required_tail_rows, state_schema
     from src.pipeline.live_store import LiveStore
-    from temp.tushare_daily_update import pull_one_date, pull_trade_dates
+    from src.pipeline.tushare_client import pull_one_date, pull_trade_dates
 
     store = LiveStore(store_root)
     store.clean_orphans()
@@ -189,8 +189,12 @@ def update_live_store(
         needed_columns_for_factors(factor_cfg.factor_names, factor_cfg)
     )
     # Strip columns not physically stored in base_panel partitions.
+    # adj_factor is always computed from close_adj / close below — never
+    # request it from the store, even if a recent partition happens to have it
+    # (column-check reads tail_dates=1 which may differ from older partitions).
     col_check = store.read("base_panel", tail_dates=1).columns
-    projected_columns = [c for c in projected_columns_all if c in col_check]
+    projected_columns = [c for c in projected_columns_all
+                         if c in col_check and c != "adj_factor"]
     base_tail = store.read(
         "base_panel",
         columns=projected_columns,
@@ -292,11 +296,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--end-date", help="Inclusive YYYYMMDD override")
     parser.add_argument("--dump-schema", type=Path)
+    parser.add_argument("--update-indices", action="store_true",
+                        help="Pull latest ZZ500 + ZZ1000 index daily data")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> dict[str, object] | None:
     args = _parser().parse_args(argv)
+    if args.update_indices:
+        update_indices(end_date=args.end_date)
+        return {"updated": True}
     if args.dump_schema:
         from src.pipeline.live_factor_schema import state_schema
 
@@ -317,6 +326,47 @@ def main(argv: Sequence[str] | None = None) -> dict[str, object] | None:
         dry_run=args.dry_run,
         end_date=args.end_date,
     )
+
+
+def update_indices(store_root: str | Path = "dataset/cache/live",
+                   input_dir: str | Path = "dataset/input",
+                   end_date: str | None = None) -> None:
+    """Pull latest ZZ500 + ZZ1000 index daily data from Tushare and append."""
+    from src.pipeline.tushare_client import pull_index_daily, pull_trade_dates
+
+    indices = {
+        "zz500_daily.parquet": "000905.SH",
+        "zz1000_daily.parquet": "000852.SH",
+    }
+    today = pd.Timestamp.now().strftime("%Y%m%d")
+    end = end_date or today
+    input_dir = Path(input_dir)
+
+    for fname, ts_code in indices.items():
+        path = input_dir / fname
+        if not path.exists():
+            print(f"  {fname}: not found, skipping")
+            continue
+        existing = pd.read_parquet(path)
+        last_date = existing["time"].max()
+        last_str = last_date.strftime("%Y%m%d")
+        if last_str >= end:
+            print(f"  {fname}: up to date ({last_str})")
+            continue
+
+        # Start from next day to avoid re-pulling existing data
+        start_str = (last_date + pd.Timedelta(days=1)).strftime("%Y%m%d")
+        new = pull_index_daily(ts_code, start_str, end)
+        if new is None or new.empty:
+            print(f"  {fname}: no new data ({last_str} → {end})")
+            continue
+
+        # Deduplicate and append
+        combined = pd.concat([existing, new], ignore_index=True)
+        combined = combined.drop_duplicates(["time"], keep="last").sort_values("time")
+        combined.to_parquet(path, index=False)
+        print(f"  {fname}: {last_str} → {combined['time'].max().strftime('%Y-%m-%d')}  "
+              f"(+{len(new)} rows, {len(combined)} total)")
 
 
 if __name__ == "__main__":

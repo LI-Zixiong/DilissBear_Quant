@@ -287,6 +287,12 @@ website/
 # Live store cache (generated data)
 dataset/cache/
 
+# Generated plots
+pics/
+
+# Temp / staging code
+temp/
+
 # Misc
 ind.txt
 *.pt

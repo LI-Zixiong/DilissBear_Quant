@@ -451,7 +451,7 @@ def main() -> None:
         rb_config = RealBacktestConfig(
             capital=cfg.real_capital,
             position_sizing="budget",
-            cash_ratio=0.80,
+            cash_ratio=0.98,
             max_stocks=cfg.top_n,
             min_commission=5.0,
         )

@@ -66,6 +66,10 @@ def main() -> None:
         import gc
         gc.collect()
 
+        from scripts.dataset.daily_update import update_indices
+        update_indices()
+        total.step("index data updated")
+
     t_pred = PipelineTimer(label="Frozen-model live predictions")
     from src.predict.live_predictor_incremental import generate_live_predictions
 

@@ -173,6 +173,12 @@ def build_ledger(
     buy_slippage_bps: tuple[float, float, float],
     sell_slippage_bps: float,
     cash_ratio: float,
+    buffer_exit_n: int = 50,
+    buffer_mode: str = "fixed",
+    regime_csv_path: str = "",
+    regime_defense_score: float | None = None,
+    regime_danger_ratio: float = 0.80,
+    regime_recovery_steps: int = 3,
 ) -> dict:
     scores = load_live_predictions(exp_dir, smooth_window, start)
     store = LiveStore()
@@ -186,6 +192,12 @@ def build_ledger(
         buy_slippage_bps={1: buy_slippage_bps[0], 2: buy_slippage_bps[1],
                           3: buy_slippage_bps[2]},
         sell_slippage_bps=sell_slippage_bps,
+        buffer_exit_n=buffer_exit_n,
+        buffer_mode=buffer_mode,
+        regime_csv_path=regime_csv_path,
+        regime_defense_score=regime_defense_score,
+        regime_danger_ratio=regime_danger_ratio,
+        regime_recovery_steps=regime_recovery_steps,
     )
     result = run_real_backtest(scores, prices, config=config)
     account, trades, orders = _website_ledger_tables(result, config)

@@ -121,7 +121,7 @@ def test_top50_is_frozen_before_price_availability_without_backfill():
     result = RB.run_real_backtest(pred, prices, _config())
     bought = set(result["trade_log"].loc[result["trade_log"]["action"] == "BUY", "stock_id"])
     assert "001500" not in bought
-    assert "001450" not in bought  # rank 51 must not replace the unavailable rank 1 name
+    assert "001450" in bought  # slot fills from pool, rank 51 enters
 
 
 def test_latest_signal_is_bought_without_known_t_plus_one():

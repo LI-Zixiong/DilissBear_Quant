@@ -25,8 +25,11 @@ def main() -> None:
     if not args.skip_regime:
         steps.append(("Market regime", [python, "-m", "src.backtest.market_regime"]))
     steps.extend([
-        ("Real account ledger", [python, "-m", "scripts.evaluation.live_portfolio"]),
-        ("Website assets", [python, str(args.web_script)]),
+        ("Real account ledger (baseline)", [python, "-m", "scripts.evaluation.live_portfolio"]),
+        ("Real account ledger (defend)", [python, "-m", "scripts.evaluation.live_portfolio",
+                                          "--strategy", "defend",
+                                          "--output-dir", "reports/strategy_v1/evidence_s2"]),
+        ("Website assets", [python, str(args.web_script), "--dual"]),
     ])
     for label, command in steps:
         print(f"\n=== {label} ===")
