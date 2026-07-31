@@ -34,10 +34,11 @@ def main() -> None:
     parser.add_argument("--sell-slippage-bps", type=float, default=0.0)
     parser.add_argument("--cash-ratio", type=float, default=0.98)
     parser.add_argument("--strategy", type=str, default="baseline",
-                        choices=("baseline", "defend"),
-                        help="baseline=buf50 no bear (default); defend=buf120 Bear20%%")
+                        choices=("baseline", "defend", "elite"),
+                        help="baseline=buf50 (default); defend=buf120+Bear20%%; elite=tier1-only")
     parser.add_argument("--buffer-exit-n", type=int, default=None)
     parser.add_argument("--buffer-mode", type=str, default=None)
+    parser.add_argument("--tier1-only", action="store_true", default=None)
     parser.add_argument("--regime-csv", type=Path, default=Path("dataset/input/market_regime.csv"))
     parser.add_argument("--regime-defense-score", type=float, default=None)
     parser.add_argument("--regime-danger-ratio", type=float, default=None)
@@ -45,18 +46,27 @@ def main() -> None:
     args = parser.parse_args()
 
     # Strategy presets
-    if args.strategy == "baseline":
+    if args.strategy == "elite":
         buffer_exit_n = args.buffer_exit_n or 50
         buffer_mode = args.buffer_mode or "fixed"
-        defence_score = args.regime_defense_score  # None = disabled
+        tier1_only = True if args.tier1_only is None else args.tier1_only
+        defence_score = args.regime_defense_score  # None
         danger_ratio = args.regime_danger_ratio or 0.80
         recovery_steps = args.regime_recovery_steps or 3
-    else:  # defend
+    elif args.strategy == "defend":
         buffer_exit_n = args.buffer_exit_n or 120
         buffer_mode = args.buffer_mode or "fixed"
+        tier1_only = bool(args.tier1_only)
         defence_score = args.regime_defense_score if args.regime_defense_score is not None else -0.35
         danger_ratio = args.regime_danger_ratio if args.regime_danger_ratio is not None else 0.20
         recovery_steps = args.regime_recovery_steps if args.regime_recovery_steps is not None else 3
+    else:  # baseline
+        buffer_exit_n = args.buffer_exit_n or 50
+        buffer_mode = args.buffer_mode or "fixed"
+        tier1_only = bool(args.tier1_only)
+        defence_score = args.regime_defense_score  # None = disabled
+        danger_ratio = args.regime_danger_ratio or 0.80
+        recovery_steps = args.regime_recovery_steps or 3
 
     result = build_ledger(
         args.exp_dir, args.price_path, args.output_dir, pd.Timestamp(args.start),
@@ -65,6 +75,7 @@ def main() -> None:
         tuple(args.buy_slippage_bps), args.sell_slippage_bps, args.cash_ratio,
         buffer_exit_n=buffer_exit_n,
         buffer_mode=buffer_mode,
+        tier1_only=tier1_only,
         regime_csv_path=str(args.regime_csv) if defence_score is not None else "",
         regime_defense_score=defence_score,
         regime_danger_ratio=danger_ratio,

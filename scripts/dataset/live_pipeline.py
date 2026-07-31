@@ -59,16 +59,22 @@ def main() -> None:
         t = PipelineTimer(label="Transactional market/factor update")
         from scripts.dataset.daily_update import update_live_store
 
-        update_live_store(store_root=store_root)
+        update_result = update_live_store(store_root=store_root)
         t.step("base + factor committed")
         t.done()
 
+        if not update_result.get("updated", False):
+            latest = update_result.get("latest_date")
+            latest_str = latest.date().isoformat() if hasattr(latest, "date") else str(latest)
+            print(
+                f"\nNo new data pulled (committed through {latest_str}). "
+                "Terminating before prediction/postprocess."
+            )
+            total.done()
+            return
+
         import gc
         gc.collect()
-
-        from scripts.dataset.daily_update import update_indices
-        update_indices()
-        total.step("index data updated")
 
     t_pred = PipelineTimer(label="Frozen-model live predictions")
     from src.predict.live_predictor_incremental import generate_live_predictions

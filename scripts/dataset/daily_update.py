@@ -267,6 +267,7 @@ def update_live_store(
         f"{len(new_base_panel):,} base rows, {len(new_factor_rows):,} factor rows"
     )
     t.done()
+    update_indices(store_root=store_root, end_date=end_date)
     return {
         "updated": True,
         "generation": committed.generation,

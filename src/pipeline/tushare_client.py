@@ -181,7 +181,7 @@ def pull_index_daily(ts_code: str, start_date: str, end_date: str) -> pd.DataFra
 
     Requires ≥2000 Tushare points.
     """
-    if start_date >= end_date:
+    if start_date > end_date:
         return None
     df = pro.index_daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
     time.sleep(SLEEP)

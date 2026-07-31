@@ -85,10 +85,14 @@ class RealBacktestConfig:
     max_daily_turnover: float | None = None
     # Strategy: partial adjustment speed. 1.0 = full rebalance; 0.5 = half.
     lambda_weight: float = 1.0
+    # Strategy: only buy top-tier (bin 3) stocks, skip strong/buffer
+    tier1_only: bool = False
     # Strategy: elite budget weight relative to strong (default 2.0 = 2x).
     elite_budget_weight: float = 2.0
     # Strategy: use continuous softmax weights instead of bin weights.
     use_softmax_weights: bool = False
+    # Strategy: single-industry budget cap as fraction of deployed capital (0 = disabled).
+    industry_cap: float = 0.0
     # Strategy: regime-based position defence.
     regime_csv_path: str = ""
     regime_defense_score: float | None = None  # Bear + score < this triggers defence
@@ -152,6 +156,8 @@ class RealBacktestConfig:
             raise ValueError(
                 f"regime_recovery_steps must be non-negative, got {self.regime_recovery_steps}"
             )
+        if self.industry_cap < 0 or self.industry_cap > 1:
+            raise ValueError(f"industry_cap must be in [0, 1], got {self.industry_cap}")
         if self.buy_slippage_bps is None:
             self.buy_slippage_bps = {1: 0, 2: 0, 3: 0}
 
@@ -434,6 +440,7 @@ def _build_buy_targets(
     stock_col: str,
     price_cols: set[str],
     cash_ratio_override: float | None = None,
+    industry_map: dict[str, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], int]:
     """
     Build today's buy targets from signal predictions (before selling).
@@ -577,8 +584,25 @@ def _build_buy_targets(
         eligible = stocks_df.copy()
 
         if config.position_sizing == "budget":
+            if config.tier1_only:
+                eligible = eligible[eligible["bin"] == 3]
             budget_plans, _ = _allocate_by_budget(eligible, deployable, config,
                 cash_ratio_override=(cash_ratio_override if cash_ratio_override is not None else config.cash_ratio))
+            # Industry cap: drop lowest-scored stocks from over-cap industries
+            if config.industry_cap > 0 and industry_map is not None:
+                cap_amount = deployable * (
+                    cash_ratio_override if cash_ratio_override is not None else config.cash_ratio
+                ) * config.industry_cap
+                ind_spent: dict[str, float] = {}
+                kept = []
+                for plan in sorted(budget_plans, key=lambda x: x["score"], reverse=True):
+                    ind = industry_map.get(plan["stock_id"], "UNKNOWN")
+                    current = ind_spent.get(ind, 0.0)
+                    if current + plan["entry_gross"] > cap_amount + 1e-9:
+                        continue
+                    ind_spent[ind] = current + plan["entry_gross"]
+                    kept.append(plan)
+                budget_plans = kept
             for plan in budget_plans:
                 buy_targets[plan["stock_id"]] = {
                     "lots": plan["n_lots"], "shares": plan["shares"],
@@ -622,6 +646,7 @@ def run_real_backtest(
     periods_per_year: int = 252,
     _price_lookup: dict | None = None,
     _price_cols: set[str] | None = None,
+    industry_map: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """
     Account-based real backtest: T signal → T close buy → T+1 close sell.
@@ -832,6 +857,7 @@ def run_real_backtest(
         buy_targets, n_filtered_today = _build_buy_targets(
             current_date, entry_signals, today_px, positions, cash,
             config, stock_col, price_cols, cash_ratio_override=cash_ratio_current,
+            industry_map=industry_map,
         )
         n_filtered += n_filtered_today
 

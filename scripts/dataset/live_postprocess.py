@@ -29,7 +29,10 @@ def main() -> None:
         ("Real account ledger (defend)", [python, "-m", "scripts.evaluation.live_portfolio",
                                           "--strategy", "defend",
                                           "--output-dir", "reports/strategy_v1/evidence_s2"]),
-        ("Website assets", [python, str(args.web_script), "--dual"]),
+        ("Real account ledger (elite)", [python, "-m", "scripts.evaluation.live_portfolio",
+                                         "--strategy", "elite",
+                                         "--output-dir", "reports/strategy_v1/evidence_s3"]),
+        ("Website assets", [python, str(args.web_script), "--triple"]),
     ])
     for label, command in steps:
         print(f"\n=== {label} ===")

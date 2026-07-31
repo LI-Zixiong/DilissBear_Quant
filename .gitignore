@@ -299,3 +299,6 @@ ind.txt
 *.pth
 *.ckpt
 *.model
+
+# Codex agent
+AGENTS.md
