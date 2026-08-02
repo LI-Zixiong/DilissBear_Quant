@@ -60,7 +60,7 @@ class EvalConfig:
     fusion_mode: str = "llr"  # "llr" | "gate"
     run_kind: str = "full"  # "full" | "bayes" | "real" | "live"
     real_capital: float = 200_000.0  # capital for real backtest
-    smooth_window: int = 5
+    smooth_window: int = 10
     top_n: int = 50
     buffer_n: int = 80
     portfolio_strategy: str = "bin_weighted"  # "top_n" | "score_weighted" | "bin_weighted" | "top_n_buffer" | "bin_weighted_buffer"
@@ -83,6 +83,26 @@ class EvalConfig:
 
 
 # ── Data loading ────────────────────────────────────────────
+
+PRICE_COLUMNS = (
+    "time", "stock_id", "close", "pre_close",
+    "up_limit", "high_limit", "limit_up_price", "down_limit", "low_limit",
+    "limit_down_price", "is_paused", "paused", "suspend", "suspended",
+    "is_suspended", "trade_status", "is_st", "st", "risk_warning",
+)
+
+
+def _read_prices(path: Path) -> pd.DataFrame:
+    """Read only price columns from the unified panel (13M+ rows)."""
+    try:
+        import pyarrow.parquet as pq
+
+        available = set(pq.ParquetFile(path).schema.names)
+        columns = [c for c in PRICE_COLUMNS if c in available]
+        return pd.read_parquet(path, columns=columns)
+    except Exception:
+        return pd.read_parquet(path)
+
 
 def _load_prediction_split(cfg: EvalConfig, split: str) -> pd.DataFrame:
     merged = None
@@ -153,15 +173,8 @@ def _load_returns(cfg: EvalConfig) -> pd.DataFrame:
 
 def _load_returns_and_prices(cfg: EvalConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load close-close returns + close/pre_close prices for real backtest."""
-    panel = pd.read_parquet(cfg.returns_path)
-    panel = normalize_keys(panel)
-
-    # Prices from unified daily panel
-    optional = ["up_limit", "high_limit", "limit_up_price", "down_limit", "low_limit",
-                "limit_down_price", "is_paused", "paused", "suspend", "suspended",
-                "is_suspended", "trade_status", "is_st", "st", "risk_warning"]
-    prices = panel[["time", "stock_id", "close", "pre_close"]
-                   + [c for c in optional if c in panel.columns]].copy()
+    prices = _read_prices(cfg.returns_path)
+    prices = normalize_keys(prices)
     prices[["close", "pre_close"]] = prices[["close", "pre_close"]].astype(float)
 
     # Returns from factor panel (close-to-close)
@@ -178,12 +191,7 @@ def _load_industry(cfg: EvalConfig) -> pd.DataFrame:
 
 def _load_prices(cfg: EvalConfig) -> pd.DataFrame:
     """Load close/pre_close for real backtest (close-close execution)."""
-    prices = pd.read_parquet(cfg.returns_path)
-    optional = ["up_limit", "high_limit", "limit_up_price", "down_limit", "low_limit",
-                "limit_down_price", "is_paused", "paused", "suspend", "suspended",
-                "is_suspended", "trade_status", "is_st", "st", "risk_warning"]
-    prices = prices[["time", "stock_id", "close", "pre_close"]
-                    + [c for c in optional if c in prices.columns]]
+    prices = _read_prices(cfg.returns_path)
     prices = normalize_keys(prices)
     prices[["close", "pre_close"]] = prices[["close", "pre_close"]].astype(float)
     return prices

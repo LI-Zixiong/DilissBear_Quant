@@ -78,7 +78,7 @@ def test_top50_uses_80pct_budget_with_two_to_one_units_and_round_lots():
     rows = []
     for i in range(50):
         elite = i < 20
-        rows.append({"stock_id": f"{i:06d}", "open": 10.0,
+        rows.append({"stock_id": f"{i:06d}", "close": 10.0,
                      "score": float(50 - i), "rank_pct": 0.99 if elite else 0.97,
                      "bin": 3 if elite else 2})
     eligible = pd.DataFrame(rows)
@@ -95,7 +95,7 @@ def test_top50_uses_80pct_budget_with_two_to_one_units_and_round_lots():
 
 def test_rounding_overrun_removes_lowest_ranked_names_first():
     eligible = pd.DataFrame([
-        {"stock_id": f"{i:06d}", "open": 53.0, "score": float(50 - i),
+        {"stock_id": f"{i:06d}", "close": 53.0, "score": float(50 - i),
          "rank_pct": 0.99 if i < 20 else 0.97, "bin": 3 if i < 20 else 2}
         for i in range(50)
     ])
@@ -121,7 +121,10 @@ def test_top50_is_frozen_before_price_availability_without_backfill():
     result = RB.run_real_backtest(pred, prices, _config())
     bought = set(result["trade_log"].loc[result["trade_log"]["action"] == "BUY", "stock_id"])
     assert "001500" not in bought
-    assert "001450" in bought  # slot fills from pool, rank 51 enters
+    assert "001499" in bought
+    assert "001450" not in bought  # no backfill: blocked buy stays empty
+    # 49 eligible after blocking; rounding overrun drops the 3 lowest ranks.
+    assert len(bought) == 46
 
 
 def test_latest_signal_is_bought_without_known_t_plus_one():

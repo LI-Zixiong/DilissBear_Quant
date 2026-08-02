@@ -247,33 +247,31 @@ def _compute_valid_cumret(
     unique_dates = pd.DatetimeIndex(df["time"].drop_duplicates()).sort_values()
     next_date_map = {unique_dates[i]: unique_dates[i + 1] for i in range(len(unique_dates) - 1)}
 
-    # Index by (time, stock_id) — ret_daily at each date is the return ending at that date
-    fwd_ret = df.set_index(["time", "stock_id"])[fwd_label]
+    # Top-N by prediction with stable tie handling, then one join for the
+    # next-day returns instead of per-stock loc lookups.
+    ranked = df.sort_values(
+        ["time", "y_pred"], ascending=[True, False], kind="mergesort",
+    )
+    tops = ranked.groupby("time", sort=False).head(top_n).copy()
+    tops["return_date"] = tops["time"].map(next_date_map)
+    tops = tops[tops["return_date"].notna()]
+    fwd_frame = df.set_index(["time", "stock_id"])[fwd_label].rename("_fwd").reset_index()
+    joined = tops[["return_date", "stock_id"]].merge(
+        fwd_frame,
+        left_on=["return_date", "stock_id"],
+        right_on=["time", "stock_id"],
+        how="inner",
+    )
+    joined = joined.drop_duplicates(["return_date", "stock_id"], keep="first")
+    joined = joined[np.isfinite(joined["_fwd"].to_numpy(dtype=float))]
+    daily_rets = joined.groupby("return_date")["_fwd"].apply(
+        lambda values: np.mean(values.to_numpy(dtype=float)),
+    )
 
-    daily_rets = []
-    for signal_date, g in df.groupby("time", sort=True):
-        top = g.nlargest(top_n, "y_pred")
-        return_date = next_date_map.get(pd.Timestamp(signal_date))
-        if return_date is None:
-            continue
-        day_rets = []
-        for sid in top["stock_id"]:
-            try:
-                r = fwd_ret.loc[(return_date, sid)]
-                if isinstance(r, pd.Series):
-                    r = r.iloc[0] if len(r) else np.nan
-                r = float(r)
-                if np.isfinite(r):
-                    day_rets.append(r)
-            except (KeyError, TypeError, ValueError):
-                continue
-        if day_rets:
-            daily_rets.append(float(np.mean(day_rets)))
-
-    if not daily_rets:
+    if daily_rets.empty:
         return {"cumret": np.nan, "sharpe": np.nan, "n_dates": 0}
 
-    rets = pd.Series(daily_rets, dtype=float)
+    rets = pd.Series(daily_rets.to_numpy(), dtype=float)
     cumret = float((1.0 + rets).prod() - 1.0)
     sharpe = float(rets.mean() / rets.std() * np.sqrt(252)) if rets.std() > 0 else 0.0
     return {"cumret": cumret, "sharpe": sharpe, "n_dates": len(rets)}

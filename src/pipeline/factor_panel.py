@@ -2117,12 +2117,14 @@ def winsorize_zscore(
             if not live_mask.any():
                 continue
 
-        lower = work.groupby(dates_col)[raw_col].transform(
-            lambda x: x.quantile(config.winsorize_lower)
+        q_lower = work.groupby(dates_col, sort=False)[raw_col].quantile(
+            config.winsorize_lower,
         )
-        upper = work.groupby(dates_col)[raw_col].transform(
-            lambda x: x.quantile(config.winsorize_upper)
+        q_upper = work.groupby(dates_col, sort=False)[raw_col].quantile(
+            config.winsorize_upper,
         )
+        lower = work[dates_col].map(q_lower)
+        upper = work[dates_col].map(q_upper)
         w_col = f"{name}_w"
         work["_w"] = work[raw_col].clip(lower, upper)
 

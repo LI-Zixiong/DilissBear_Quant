@@ -188,6 +188,14 @@ def generate_live_predictions(
     print("\nPreprocessing factor panel...")
     active_factors = [c for c in config.feature_cols if c in raw.columns]
     inference_df, _ = preprocess_experiment_data(raw, config, active_factors, drop_missing_target=False)
+    torch_history: pd.DataFrame | None = None
+    if any(MODEL_TYPES[m] == "torch" for m in missing_dates):
+        torch_history, _ = preprocess_experiment_data(
+            full_raw, config, active_factors, drop_missing_target=False,
+        )
+        torch_history = torch_history.sort_values(
+            [config.stock_col, config.date_col],
+        ).reset_index(drop=True)
 
     _ind_to_id: dict[int, int] = {}
     _n_industries = 0
@@ -295,9 +303,12 @@ def generate_live_predictions(
             else:
                 seq_len = 20
                 hist_start = d - pd.Timedelta(days=60)
-                hist_raw = full_raw[(full_raw["time"] >= hist_start) & (full_raw["time"] <= d)].copy()
-                hist_df, _ = preprocess_experiment_data(hist_raw, config, active_factors, drop_missing_target=False)
-                hist_df = hist_df.sort_values([config.stock_col, "time"])
+                if torch_history is None:
+                    raise RuntimeError("torch_history was not built for torch model")
+                hist_df = torch_history[
+                    (torch_history["time"] >= hist_start)
+                    & (torch_history["time"] <= d)
+                ].copy()
                 hist_df["_is_target"] = hist_df["time"] == d
                 hist_df = hist_df.groupby(config.stock_col, sort=False).tail(seq_len).copy()
                 hist_df["_live_endpoint"] = hist_df["_is_target"]

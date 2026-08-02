@@ -209,7 +209,7 @@ def build_ledger(
         "total_slippage_cost": float(account["slippage_cost"].sum()),
         "total_friction_cost": float(account["friction_cost"].sum()),
         "execution_assumptions": {
-            "position_sizing": "top50_bin_weighted_budget",
+            "position_sizing": f"top{int(config.max_stocks)}_{config.position_sizing}",
             "bin_budget_weights": {"strong": 1.0, "elite": 2.0},
             "cash_ratio": float(cash_ratio),
             "commission_rate_each_side": float(commission_rate),

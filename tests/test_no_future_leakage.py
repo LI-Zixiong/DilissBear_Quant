@@ -10,7 +10,7 @@ These tests use synthetic panel data to verify:
 import numpy as np
 import pandas as pd
 
-from scripts.run_experiment import build_returns_frame_from_next_target
+from src.experiment.returns import build_returns_frame_from_next_target
 from src.data.dataset_builder import PanelDatasetBuilder
 
 

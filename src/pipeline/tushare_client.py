@@ -4,7 +4,7 @@ Tushare daily data puller — provides pull_trade_dates + pull_one_date.
 Used by scripts.dataset.daily_update for incremental panel extension.
 
 Usage:
-    from temp.tushare_daily_update import pull_trade_dates, pull_one_date
+    from src.pipeline.tushare_client import pull_trade_dates, pull_one_date
 """
 import time
 import os
@@ -21,7 +21,11 @@ def _load_dotenv_token() -> None:
     """Set TUSHARE_TOKEN from .env if not already set."""
     if os.environ.get("TUSHARE_TOKEN"):
         return
-    env_path = Path(__file__).resolve().parents[1] / ".env"
+    module_dir = Path(__file__).resolve()
+    env_path = next(
+        (parent / ".env" for parent in module_dir.parents if (parent / ".env").exists()),
+        module_dir.parents[2] / ".env",
+    )
     if not env_path.exists():
         return
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -148,29 +152,6 @@ def pull_one_date(trade_date: str) -> pd.DataFrame | None:
 
     return out
 
-
-# ---------------------------------------------------------------------------
-# Standalone smoke test
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--smoke", action="store_true", help="Pull 3 recent trade dates")
-    parser.add_argument("--start", type=str, default=None, help="YYYYMMDD")
-    parser.add_argument("--end", type=str, default=None, help="YYYYMMDD")
-    args = parser.parse_args()
-
-    if args.smoke:
-        from datetime import datetime
-        today = datetime.now().strftime("%Y%m%d")
-        all_dates = pull_trade_dates("20260101", today)
-        test_dates = all_dates[-3:]
-    elif args.start and args.end:
-        test_dates = pull_trade_dates(args.start, args.end)
-    else:
-        print("Usage: python -m temp.tushare_daily_update --smoke")
-        print("       python -m temp.tushare_daily_update --start 20260611 --end 20260710")
-        exit()
 
 def pull_index_daily(ts_code: str, start_date: str, end_date: str) -> pd.DataFrame | None:
     """Pull index daily data from Tushare.

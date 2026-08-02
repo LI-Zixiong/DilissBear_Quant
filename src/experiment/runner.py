@@ -20,6 +20,7 @@ backtest engines remain in their own src modules.
 from __future__ import annotations
 
 import warnings
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,38 @@ def _feature_sign_key(
         return ()
     return tuple(
         sorted((str(col), int(sign)) for col, sign in config.model_feature_signs[model_name].items())
+    )
+
+
+def _with_model_param(
+    config: ExperimentConfig,
+    model_name: str,
+    key: str,
+    value: Any,
+) -> ExperimentConfig:
+    """Return a config copy with one extra model param; never mutates input."""
+    merged = dict(config.model_params)
+    merged[model_name] = {**merged.get(model_name, {}), key: value}
+    return replace(config, model_params=merged)
+
+
+def _persist_industry_mapping(
+    output_dir: Path,
+    n_industries: int,
+    ind_rank: int,
+    id_to_code: dict[str, int],
+) -> None:
+    import json
+
+    path = Path(output_dir) / "models" / "dlinear" / "industry_mapping.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"n_industries": n_industries, "ind_rank": ind_rank,
+             "id_to_code": id_to_code},
+            ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -388,9 +421,11 @@ def _run_tabular_models(
 
         live_data = builder.build_tabular_dataset(live_df, require_target=False)
 
-        # Inject categorical_feature indices into model params
-        if _cat_indices and model_name in config.model_params:
-            config.model_params[model_name]["categorical_feature"] = _cat_indices
+        build_config = (
+            _with_model_param(config, model_name, "categorical_feature", _cat_indices)
+            if _cat_indices
+            else config
+        )
 
         # Isolate each model from RNG consumed by any previous model.
         set_seed(config.seed)
@@ -399,7 +434,7 @@ def _run_tabular_models(
             seed=config.seed,
             seq_len=1,
             n_features=len(cols),
-            config=config,
+            config=build_config,
         )
 
         # Reset again so training-time randomness, if any, also starts from the
@@ -581,15 +616,14 @@ def _run_torch_models(
             _n_industries = len(unique_ind) + 1  # +1 for UNKNOWN=0
             print(f"  industry_id: {_n_industries} categories (0=UNKNOWN, 1..{len(unique_ind)}={unique_ind[:5]}...)")
 
-            # Persist mapping alongside model for future inference
-            import json as _json
-            map_path = output_dir / "models" / "dlinear" / "industry_mapping.json"
-            map_path.parent.mkdir(parents=True, exist_ok=True)
-            map_path.write_text(_json.dumps(
-                {"n_industries": _n_industries, "ind_rank": 4,
-                 "id_to_code": {str(v): int(k) for k, v in _ind_to_id.items()}},
-                ensure_ascii=False, indent=2,
-            ), encoding="utf-8")
+            if "dlinear" in names:
+                dlinear_params = get_model_params("dlinear", config)
+                _persist_industry_mapping(
+                    output_dir=output_dir,
+                    n_industries=_n_industries,
+                    ind_rank=int(dlinear_params.get("ind_rank", 0) or 0),
+                    id_to_code={str(v): int(k) for k, v in _ind_to_id.items()},
+                )
 
         builder_meta = list(config.meta_cols)
         if _n_industries > 0:
@@ -653,9 +687,11 @@ def _run_torch_models(
 
             params = get_model_params(model_name, config)
 
-            # Inject n_industries discovered from data into model params
-            if _n_industries > 0 and model_name in config.model_params:
-                config.model_params[model_name]["n_industries"] = _n_industries
+            build_config = (
+                _with_model_param(config, model_name, "n_industries", _n_industries)
+                if _n_industries > 0
+                else config
+            )
 
             # IMPORTANT: reset BEFORE model construction.
             # Otherwise the initial weights depend on RNG consumed by earlier
@@ -666,7 +702,7 @@ def _run_torch_models(
                 seed=config.seed,
                 seq_len=int(params["seq_len"]),
                 n_features=len(expanded_cols),
-                config=config,
+                config=build_config,
             )
 
             # Reset again so training-time randomness (dropout, CUDA kernels,

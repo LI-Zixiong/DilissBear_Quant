@@ -473,6 +473,9 @@ def _build_buy_targets(
         ranked["rank_pct"] = ranked[config.pred_col].rank(pct=True)
         ranked = ranked.sort_values(config.pred_col, ascending=False)
         ranked["ordinal_rank"] = np.arange(1, len(ranked) + 1)
+        pred_lookup = ranked.set_index(stock_col)[
+            [config.pred_col, "rank_pct"]
+        ].to_dict("index")
         held_set = held_ids.copy()
 
         # ── Step 1: determine target membership (who stays, who enters) ──
@@ -526,8 +529,8 @@ def _build_buy_targets(
             if not _is_finite_positive(close_px) or not _is_finite_positive(pre_close):
                 n_filtered += 1
                 continue
-            pred_match = ranked[ranked[stock_col] == sid]
-            if pred_match.empty:
+            pred_row = pred_lookup.get(sid)
+            if pred_row is None:
                 continue
             # Already-held stocks: block_buy only if suspended.  Limit-up on a
             # held stock does NOT change its membership; it just means "can't
@@ -548,8 +551,8 @@ def _build_buy_targets(
                 continue
             rows.append({
                 "stock_id": sid,
-                "score": float(pred_match.iloc[0][config.pred_col]),
-                "rank_pct": float(pred_match.iloc[0]["rank_pct"]),
+                "score": float(pred_row[config.pred_col]),
+                "rank_pct": float(pred_row["rank_pct"]),
                 "close": float(close_px),
                 "pre_close": float(pre_close),
                 "raw_price_row": row,
@@ -688,8 +691,24 @@ def run_real_backtest(
     if regime_active and config.regime_defense_score is not None:
         warmup_dates = sorted(regime_active)
         if config.start_date is not None:
-            start_ts = pd.Timestamp(config.start_date)
-            warmup_dates = [d for d in warmup_dates if d <= start_ts]
+            warmup_cutoff = pd.Timestamp(config.start_date)
+        else:
+            signal_times = pd.to_datetime(pred_df[date_col]).dropna()
+            warmup_cutoff = (
+                pd.Timestamp(signal_times.min()) if len(signal_times) else None
+            )
+        if warmup_cutoff is None:
+            raise ValueError(
+                "Regime defence is enabled but no signal dates are available. "
+                "Pass a non-empty pred_df or an explicit start_date."
+            )
+        warmup_dates = [d for d in warmup_dates if d <= warmup_cutoff]
+        if not warmup_dates:
+            raise ValueError(
+                "Regime defence is enabled but the regime CSV has no dates on or "
+                f"before {warmup_cutoff.date()}. Extend the regime history or "
+                "raise start_date."
+            )
         for d in warmup_dates:
             reg = regime_active.get(d)
             if reg is None:

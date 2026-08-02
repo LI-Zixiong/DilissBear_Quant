@@ -151,13 +151,6 @@ if __name__ == "__main__":
                 "patience":  10,
                 "ind_rank":  8,
             },
-            "xgboost": {
-                "n_estimators":          500,
-                "max_depth":             5,
-                "learning_rate":         0.01,
-                "subsample":             0.8,
-                "early_stopping_rounds": None,
-            },
             "gated_dwtcn": {
                 "seq_len":   20,
                 "epochs":    35,
@@ -168,27 +161,6 @@ if __name__ == "__main__":
                 "dilations": (1, 2, 4),
                 "hidden_dim": 32,
                 "gate_rank": 20,
-            },
-            "itransformer": {
-                "seq_len":   40,
-                "epochs":    10,
-                "lr":        1e-4,
-                "wd":        0.0,
-                "patience":  2,
-            },
-            "tsmixer": {
-                "seq_len":   40,
-                "epochs":    15,
-                "lr":        4e-3,
-                "wd":        0.0,
-                "patience":  2,
-            },
-            "patchtst": {
-                "seq_len":   40,
-                "epochs":    10,
-                "lr":        1e-4,
-                "wd":        0.0,
-                "patience":  2,
             },
         },
 
